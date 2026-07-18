@@ -16,7 +16,7 @@ import urllib.request
 
 from playwright.async_api import async_playwright
 
-USER_DATA_DIR = os.path.join("cache", "browser_profile")
+from weread_session import USER_DATA_DIR, ensure_logged_in, launch_weread_context
 
 CANVAS_HOOK = """
 (function() {
@@ -281,25 +281,11 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
     reached_end = False
     last_cat_title = load_last_catalog_title(catalog_path) if catalog_path else ""
     async with async_playwright() as p:
-        ctx = await p.chromium.launch_persistent_context(
-            USER_DATA_DIR, headless=False, viewport={"width": 1200, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"])
-
-        login_page = await ctx.new_page()
-        await login_page.goto("https://weread.qq.com/web/shelf", timeout=30000)
-        await asyncio.sleep(3)
-        if "login" in login_page.url.lower():
-            print("\n  ⚠️  请扫码登录微信读书")
-            for _ in range(120):
-                await asyncio.sleep(5)
-                if "login" not in login_page.url.lower():
-                    print("  ✅ 登录成功"); break
-            else:
-                await login_page.close(); await ctx.close()
-                return "", "", 0, 0, start_idx, False
-        else:
-            print("  ✅ 已登录")
-        await login_page.close()
+        ctx = await launch_weread_context(
+            p, headless=False, viewport={"width": 1200, "height": 900})
+        if not await ensure_logged_in(ctx):
+            await ctx.close()
+            return "", "", 0, 0, start_idx, False
 
         page = await ctx.new_page()
         await page.add_init_script(CANVAS_HOOK)
