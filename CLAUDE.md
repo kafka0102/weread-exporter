@@ -17,3 +17,17 @@
 - **Issue 关联**：任务直接来自 Issue 时，在 commit 正文尾部追加 `Refs: #<issue-id>`，单独成行。
 
 完整规则、好 / 坏示例与边界说明见 [`docs/standards/git-workflow.md`](docs/standards/git-workflow.md)。
+
+## Agent skills
+
+### Issue tracker
+
+本仓库的 issue 与 spec 以本地 markdown 文件形式存放在 `.scratch/<feature-slug>/` 下（不使用 GitHub Issues）。详见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+使用默认的五个 triage 角色标签（needs-triage / needs-info / ready-for-agent / ready-for-human / wontfix），在本地 markdown 中以 issue 文件顶部的 `Status:` 行记录。详见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+单上下文（single-context）布局：根目录 `CONTEXT.md` + `docs/adr/`，由 `/domain-modeling` 在术语或决策真正落地时惰性创建。详见 `docs/agents/domain.md`。
