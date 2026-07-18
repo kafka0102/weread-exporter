@@ -163,8 +163,10 @@ async def fetch_shelf(*, headless=False, sleep_seconds=3.0, max_no_new=3,
 
         page = await context.new_page()
         print("\n  打开书架页...")
-        await page.goto(SHELF_URL, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
+        # 用 domcontentloaded + 固定等待，避免书架书籍较多时 networkidle 长时间不空闲而超时；
+        # shelf 接口由 context 级 on_response 捕获，不依赖此处等待。
+        await page.goto(SHELF_URL, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3)
 
         dom_books = await extract_dom_books(page)
         prev = _total_unique(dom_books, api_books)
