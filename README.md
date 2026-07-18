@@ -1,6 +1,6 @@
 # weread-exporter
 
-微信读书全本导出工具 — 通过 Playwright + Canvas Hook 提取完整书籍**图文**内容，导出为 Markdown。文字与插图按阅读顺序精确交错。
+微信读书自动化工具集 — 基于 Playwright 持久化登录会话，提供**全书图文导出**（Markdown）与**书架书籍列表抓取**（JSON）等能力。文字与插图按阅读顺序精确交错。
 
 ## 原理
 
@@ -16,11 +16,15 @@
 ## 安装
 
 ```bash
-pip install playwright
+pip install -r requirements.txt
 playwright install chromium
 ```
 
+运行测试（可选）：`python -m unittest discover tests`
+
 ## 使用
+
+> 所有脚本共享同一份缓存登录会话（由 `weread_session.py` 提供）：首次扫码后登录态保存在 `cache/browser_profile/`，后续任何脚本都免重复登录。切换账号需清空该目录。
 
 ### 1. 导出书籍（文字 + 图片 URL）
 
@@ -49,6 +53,26 @@ python download_images.py d31323b0813abaf26g0137c2
 
 > 导出和下载分两步：翻页抓取时若同步下载大图会阻塞翻页，故先记录 URL、翻完后统一并发下载。
 
+### 3. 抓取书架书籍列表
+
+```bash
+# 可见浏览器（首次需扫码登录）
+python fetch_shelf.py
+
+# 复用缓存登录，无头运行
+python fetch_shelf.py --headless
+
+# 调整滚动节奏（默认 sleep 3s，连续 3 次无新书停止）
+python fetch_shelf.py --sleep 5 --max-no-new 4
+```
+
+- 慢滚动触发懒加载，逐屏抓取书架上所有书籍
+- 每本书提取 `id`、`title`、`author`，存为 `data/shelf_books.json`（数组，按 id 去重）
+- 书架页禁用 F12 不影响抓取：`id`/`title` 取自页面 DOM，`author` 取自 Playwright 拦截的书架接口响应（按 `book_id` 合并）
+- 参数：`--headless` 无头（需已缓存登录）、`--sleep` 滚动间隔秒数、`--max-no-new` 连续无新书停止阈值、`--out` 输出路径
+
+> 登录过期时 `--headless` 无法弹扫码页，去掉 `--headless` 重新扫一次即可。
+
 ## 输出
 
 ```
@@ -68,12 +92,51 @@ output/
 
 用 Typora / Obsidian 等打开全本 `.md` 即可看到图文完整的书籍。
 
+书架抓取输出：
+
+```
+data/
+└── shelf_books.json         # 书架书籍列表 [{id, title, author}]
+```
+
+## 扩展：复用登录会话
+
+`weread_session.py` 是全仓唯一的登录入口组件（决策见 `docs/adr/0001-persistent-browser-profile-as-login-cache.md`），新脚本可直接复用，无需重复实现登录逻辑：
+
+```python
+import asyncio
+from playwright.async_api import async_playwright
+from weread_session import open_logged_in_page
+
+async def main():
+    async with async_playwright() as p:
+        # 已登录返回 (context, page)，登录失败返回 (None, None)
+        context, page = await open_logged_in_page(
+            p, url="https://weread.qq.com/web/shelf")
+        if context is None:
+            return
+        # ... 你的抓取逻辑 ...
+        await context.close()
+
+asyncio.run(main())
+```
+
+主要接口：
+
+- `launch_weread_context(playwright, headless=False, viewport=None)` — 启动带持久化登录态的 Chromium context
+- `ensure_logged_in(context)` — 确认已登录，未登录则等待扫码；成功返回 `True`
+- `open_logged_in_page(playwright, url=None)` — 启动 + 登录 + 打开页面，一步到位
+- `is_login_url(url)` — 判断 URL 是否为登录页（纯函数，已覆盖单测）
+
+> 若需要在页面加载前监听网络（如拦截接口），改用 `launch_weread_context` + `ensure_logged_in` 自行管理 context 与 page，以便提前注册 `context.on("response", ...)`。`fetch_shelf.py` 即采用此模式。
+
 ## 限制
 
 - 需要有效的微信读书账号，且对目标书籍有阅读权限（无限卡会员或已购买）
 - 部分出版社限制网页端阅读（显示"去 App 阅读"），此类书籍无法导出
 - 纯图廊章节图片密集时，图注与图的配对偶尔差一位；正文章节里图片相对段落的位置准确
 - 导出速度受翻页等待限制，约每页 1-2 秒
+- 书架抓取的 DOM 选择器为通用推断；若微信读书改版导致 `id`/`title` 抓取为空，仍可依赖接口拦截兜底 `author`，必要时按实际 DOM 调整 `fetch_shelf.py` 中的 `EXTRACT_BOOKS_JS`
 
 ## 工作流程
 
@@ -86,6 +149,11 @@ export_precise.py:
 
 download_images.py:
   读 raw/*.json 图片 URL → 强制 IPv4 + 8 线程并发下载 → images/
+
+fetch_shelf.py:
+  复用缓存登录打开书架 → 慢滚动触发懒加载
+    → DOM 抓 id/title + 拦截书架接口取 author → 按 book_id 合并去重
+    → 写 data/shelf_books.json
 ```
 
 ## 声明
