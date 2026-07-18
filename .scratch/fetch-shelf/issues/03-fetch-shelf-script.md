@@ -1,6 +1,6 @@
 # 03 - fetch-shelf-script
 
-Status: ready-for-agent
+Status: resolved (commits ec44831, 7717366)
 Blocked by: 01
 
 ## 目标

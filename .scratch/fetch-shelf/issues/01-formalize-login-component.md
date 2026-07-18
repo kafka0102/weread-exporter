@@ -1,6 +1,6 @@
 # 01 - formalize-login-component
 
-Status: ready-for-agent
+Status: resolved (commit b03914a)
 Blocked by: (none)
 
 ## 目标

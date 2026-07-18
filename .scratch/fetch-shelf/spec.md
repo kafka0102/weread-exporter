@@ -1,6 +1,6 @@
 # Spec: fetch-shelf
 
-Status: ready-for-agent
+Status: implemented
 
 ## 目标
 

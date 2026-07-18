@@ -1,6 +1,6 @@
 # 02 - refactor-export-precise-login
 
-Status: ready-for-agent
+Status: resolved (commit c9bc585)
 Blocked by: 01
 
 ## 目标
