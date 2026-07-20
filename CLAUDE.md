@@ -31,3 +31,7 @@
 ### Domain docs
 
 单上下文（single-context）布局：根目录 `CONTEXT.md` + `docs/adr/`，由 `/domain-modeling` 在术语或决策真正落地时惰性创建。详见 `docs/agents/domain.md`。
+
+## 运行时配置（sleep）
+
+网页点击/跳转类等待统一由根目录 `.env` + `env_config.py` 配置，规则与变量表见 [`AGENTS.md`](AGENTS.md)。

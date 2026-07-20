@@ -8,6 +8,7 @@ class TestIsLoginUrl(unittest.TestCase):
         self.assertTrue(is_login_url("https://weread.qq.com/web/login"))
         self.assertTrue(is_login_url("https://weread.qq.com/#/login"))
         self.assertTrue(is_login_url("https://weread.qq.com/web/shelf?from=login"))
+        self.assertTrue(is_login_url("https://weread.qq.com/web/shelf#login"))
 
     def test_case_insensitive(self):
         self.assertTrue(is_login_url("HTTPS://WEREAD.QQ.COM/WEB/LOGIN"))

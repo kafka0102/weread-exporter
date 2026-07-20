@@ -16,6 +16,19 @@ import urllib.request
 
 from playwright.async_api import async_playwright
 
+import env_config  # noqa: F401  # 导入即加载 .env
+from env_config import (
+    SLEEP_READER_AFTER_HOOK,
+    SLEEP_READER_AFTER_LOAD,
+    SLEEP_READER_CATALOG_CLICK,
+    SLEEP_READER_CATALOG_CLOSE,
+    SLEEP_READER_CATALOG_OPEN,
+    SLEEP_READER_CATALOG_SCROLL,
+    SLEEP_READER_PAGE_RENDER,
+    SLEEP_READER_PAGE_TURN,
+    SLEEP_READER_REOPEN,
+    SLEEP_READER_STABLE_POLL,
+)
 from weread_session import USER_DATA_DIR, ensure_logged_in, launch_weread_context
 
 CANVAS_HOOK = """
@@ -188,12 +201,14 @@ def render_chapter_md(ch_title, blocks, ch_idx):
 async def wait_stable(page, prev_count, timeout=8):
     """等页面渲染稳定，返回稳定后的字符数"""
     last = -1
-    for _ in range(int(timeout / 0.5)):
+    poll = SLEEP_READER_STABLE_POLL
+    steps = max(1, int(timeout / poll)) if poll > 0 else 1
+    for _ in range(steps):
         c = await page.evaluate("() => window.__wr_count()")
         if c == last:
             return c
         last = c
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(poll)
     return last
 
 
@@ -238,7 +253,7 @@ async def goto_first_chapter(page, catalog_path=None):
     first_title = ""
     try:
         await page.click("button.readerControls_item.catalog", timeout=5000)
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(SLEEP_READER_CATALOG_OPEN)
         titles = await page.evaluate("""() => Array.from(
             document.querySelectorAll('.readerCatalog_list_item')).map(el => el.textContent.trim())""")
         if titles and catalog_path:
@@ -248,16 +263,16 @@ async def goto_first_chapter(page, catalog_path=None):
             const sc = document.querySelector('.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]');
             if (sc) sc.scrollTop = 0;
         }""")
-        await asyncio.sleep(1)
+        await asyncio.sleep(SLEEP_READER_CATALOG_SCROLL)
         item = page.locator(".readerCatalog_list_item").first
         first_title = (await item.text_content() or "").strip()
         await item.click(timeout=4000)
-        await asyncio.sleep(3)
+        await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
         try:
             await page.click("button.readerControls_item.catalog", timeout=2000)
         except Exception:
             await page.keyboard.press("Escape")
-        await asyncio.sleep(2)
+        await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
     except Exception as e:
         print(f"  ⚠️  目录跳转异常: {e}")
     print(f"  ✅ 已跳到全书开头，当前:「{await _title(page)}」(点击首项「{first_title}」)")
@@ -292,7 +307,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         print("\n  打开阅读器...")
         await page.goto(f"https://weread.qq.com/web/reader/{book_id}",
                         wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(5)
+        await asyncio.sleep(SLEEP_READER_AFTER_LOAD)
 
         book_title, book_author = await fetch_book_title(page)
         if goto_first:
@@ -300,7 +315,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             last_cat_title = load_last_catalog_title(catalog_path)
 
         await page.mouse.click(600, 450)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(SLEEP_READER_AFTER_HOOK)
 
         current_chapter = await _title(page)
         print(f"  📖 {book_title} — {book_author}")
@@ -315,7 +330,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
 
         async def capture_current_page():
             """抓当前页的有序块，累加到 ch_blocks；返回是否有新内容"""
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
             chars = await page.evaluate("() => window.__wr_chars")
             rects = await page.evaluate(CANVAS_RECTS_JS)
             imgs = await page.evaluate(VIEWPORT_IMGS_JS)
@@ -338,7 +353,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             await page.evaluate("() => window.__wr_reset()")
             await page.mouse.click(600, 450)
             await page.keyboard.press("ArrowRight")
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(SLEEP_READER_PAGE_TURN)
             await wait_stable(page, 0)
 
             new_chapter = await _title(page)
@@ -456,7 +471,7 @@ async def main(book_id):
             print("\n  ✅ 已到全书最后一章，导出完成。"); break
         if added == 0:
             print("\n  无新章节，导出完成。"); break
-        print("  3 秒后自动重开继续..."); await asyncio.sleep(3)
+        print(f"  {SLEEP_READER_REOPEN} 秒后自动重开继续..."); await asyncio.sleep(SLEEP_READER_REOPEN)
 
     download_all_images(raw_dir, img_dir)
 

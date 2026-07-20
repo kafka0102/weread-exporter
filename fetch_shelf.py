@@ -5,11 +5,14 @@
 DOM 抓取书籍 id/title，同时通过 context 级网络拦截捕获书架接口响应
 取 author（页面禁用 F12 不影响 Playwright 的 CDP 级监听），按 book_id
 合并后写入 data/shelf_books.txt（一行一条，逗号分隔：ID,书名,作者）。
+作者仍为空时再逐本打开阅读器详情补全，相邻两本默认间隔 5s
+（见 .env / AGENTS.md）。
 
 用法：
-    python fetch_shelf.py                 # 可见浏览器，sleep 3s
+    python fetch_shelf.py                 # 可见浏览器
     python fetch_shelf.py --headless      # 无头（需已缓存登录态）
     python fetch_shelf.py --sleep 5 --max-no-new 4
+    python fetch_shelf.py --no-enrich-author
 """
 from __future__ import annotations
 
@@ -21,12 +24,41 @@ import re
 
 from playwright.async_api import async_playwright
 
+import env_config  # noqa: F401  # 导入即加载 .env
+from env_config import (
+    SLEEP_BOOK_DETAIL_CATALOG,
+    SLEEP_BOOK_DETAIL_INTERVAL,
+    SLEEP_BOOK_DETAIL_LOAD,
+    SLEEP_SHELF_AFTER_LOAD,
+    SLEEP_SHELF_SCROLL,
+)
 from weread_session import SHELF_URL, ensure_logged_in, launch_weread_context
 
 DATA_DIR = "data"
 DEFAULT_OUT = os.path.join(DATA_DIR, "shelf_books.txt")
+READER_URL_TMPL = "https://weread.qq.com/web/reader/{book_id}"
 
 _READER_ID_RE = re.compile(r"/reader/([A-Za-z0-9]+)")
+
+# 阅读器页提取作者：先看书信息区，再尝试目录面板常见节点。
+EXTRACT_AUTHOR_JS = r"""
+() => {
+    const sels = [
+        '.readerCatalog_bookInfo_author',
+        '.bookInfo_author a',
+        '.bookInfo_author',
+        '.readerBookInfo_author',
+        '[class*="bookInfo"][class*="author"]',
+        '[class*="bookInfo_author"]',
+    ];
+    for (const s of sels) {
+        const el = document.querySelector(s);
+        const t = (el?.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t) return t;
+    }
+    return '';
+}
+"""
 
 
 def extract_book_id_from_href(href):
@@ -88,6 +120,12 @@ def merge_books(dom_books, api_books):
                        "author": (api.get("author") or "").strip()})
     return merged
 
+
+def books_missing_author(books):
+    """返回 author 为空（或缺省）的书籍列表，保持原顺序。"""
+    return [b for b in books if not (b.get("author") or "").strip()]
+
+
 def sanitize_csv_field(value):
     """将字段中的逗号替换为空格，避免破坏逗号分隔格式。"""
     return (value or "").replace(",", " ")
@@ -102,11 +140,66 @@ def format_book_line(book):
     ])
 
 
-def write_shelf_books(books, path):
-    """将书籍列表写入 path，一行一条逗号分隔。"""
+def write_shelf_books(path, books):
+    """将书籍列表写入 path，一行一条逗号分隔：ID,书名,作者。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for book in books:
             f.write(format_book_line(book) + "\n")
+
+
+def parse_shelf_line(line):
+    """解析一行 ID,书名,作者；字段不足时右侧补空。"""
+    parts = (line or "").rstrip("\n\r").split(",", 2)
+    while len(parts) < 3:
+        parts.append("")
+    return {
+        "id": parts[0].strip(),
+        "title": parts[1].strip(),
+        "author": parts[2].strip(),
+    }
+
+
+def load_shelf_books(path):
+    """读取 shelf txt，返回 list[{id, title, author}]。文件不存在或失败返回 []。"""
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    except Exception:
+        return []
+    books = []
+    for line in lines:
+        book = parse_shelf_line(line)
+        if book["id"]:
+            books.append(book)
+    return books
+
+
+def load_existing_authors(path):
+    """读取已有 shelf 文件，返回 {id: author}（仅非空 author）。文件不存在则 {}。"""
+    out = {}
+    for b in load_shelf_books(path):
+        bid = b.get("id")
+        author = (b.get("author") or "").strip()
+        if bid and author:
+            out[str(bid)] = author
+    return out
+
+
+def apply_existing_authors(books, existing):
+    """列表抓取 author 为空时，回填历史文件中已有的 author（避免重跑冲掉补全结果）。"""
+    if not existing:
+        return books
+    for b in books:
+        if not (b.get("author") or "").strip():
+            prev = existing.get(b.get("id") or "")
+            if prev:
+                b["author"] = prev
+    return books
+
+
 
 
 # 从当前页面 DOM 提取书籍列表 [{id, title, author}]。
@@ -153,9 +246,130 @@ def _total_unique(dom_books, api_books):
     return len(ids)
 
 
-async def fetch_shelf(*, headless=False, sleep_seconds=3.0, max_no_new=3,
-                      out_path=DEFAULT_OUT):
+def _author_from_api_payload(data, book_id):
+    """从接口 JSON 中按 book_id 取 author；找不到返回空串。"""
+    found = {}
+    collect_books_from_json(data, found)
+    info = found.get(str(book_id)) or {}
+    return (info.get("author") or "").strip()
+
+
+async def fetch_author_from_reader(page, book_id, *, load_wait=None, catalog_wait=None):
+    """打开阅读器页补全作者。优先接口字段，其次 DOM（必要时点开目录）。
+
+    返回 author 字符串（可能为空）。
+    """
+    load_wait = SLEEP_BOOK_DETAIL_LOAD if load_wait is None else load_wait
+    catalog_wait = SLEEP_BOOK_DETAIL_CATALOG if catalog_wait is None else catalog_wait
+    author_box = {"author": ""}
+
+    async def on_response(response):
+        try:
+            if response.request.resource_type not in ("xhr", "fetch"):
+                return
+            if "weread.qq.com" not in (response.url or ""):
+                return
+            if "json" not in (response.headers.get("content-type") or ""):
+                return
+            data = await response.json()
+        except Exception:
+            return
+        got = _author_from_api_payload(data, book_id)
+        if got and not author_box["author"]:
+            author_box["author"] = got
+
+    page.on("response", on_response)
+    try:
+        await page.goto(
+            READER_URL_TMPL.format(book_id=book_id),
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        await asyncio.sleep(load_wait)
+
+        if not author_box["author"]:
+            author_box["author"] = (await page.evaluate(EXTRACT_AUTHOR_JS) or "").strip()
+
+        if not author_box["author"]:
+            try:
+                await page.click("button.readerControls_item.catalog", timeout=5000)
+                await asyncio.sleep(catalog_wait)
+                author_box["author"] = (
+                    await page.evaluate(EXTRACT_AUTHOR_JS) or ""
+                ).strip()
+            except Exception:
+                pass
+    finally:
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
+
+    return author_box["author"]
+
+
+async def enrich_missing_authors(
+    page,
+    books,
+    *,
+    out_path=None,
+    interval=None,
+    load_wait=None,
+    catalog_wait=None,
+):
+    """对 author 为空的书逐本打开详情补全；已有作者的跳过。
+
+    每补全一本（无论成败后的状态）若提供 out_path 则落盘，便于长任务断点续跑观感。
+    相邻两本之间 sleep ``interval``（默认 SLEEP_BOOK_DETAIL_INTERVAL=5）。
+    返回补全成功本数。
+    """
+    interval = SLEEP_BOOK_DETAIL_INTERVAL if interval is None else interval
+    missing = books_missing_author(books)
+    if not missing:
+        print("  作者已齐，无需打开详情")
+        return 0
+
+    print(f"  需打开详情补全作者: {len(missing)}/{len(books)} 本"
+          f"（间隔 {interval}s）")
+    filled = 0
+    for i, book in enumerate(missing):
+        if i > 0:
+            await asyncio.sleep(interval)
+        bid = book["id"]
+        title = book.get("title") or bid
+        print(f"  [{i + 1}/{len(missing)}] 打开《{title}》...")
+        try:
+            author = await fetch_author_from_reader(
+                page, bid, load_wait=load_wait, catalog_wait=catalog_wait)
+        except Exception as e:
+            print(f"    ⚠️  失败: {e}")
+            author = ""
+        if author:
+            book["author"] = author
+            filled += 1
+            print(f"    -> {author}")
+        else:
+            print("    -> (未取到作者)")
+        if out_path:
+            write_shelf_books(out_path, books)
+    return filled
+
+
+async def fetch_shelf(
+    *,
+    headless=False,
+    sleep_seconds=None,
+    max_no_new=3,
+    out_path=DEFAULT_OUT,
+    enrich_author=True,
+    author_interval=None,
+):
     """抓取书架书籍列表并写入 out_path，返回合并后的书籍列表。"""
+    if sleep_seconds is None:
+        sleep_seconds = SLEEP_SHELF_SCROLL
+    if author_interval is None:
+        author_interval = SLEEP_BOOK_DETAIL_INTERVAL
+
     api_books = {}
 
     async with async_playwright() as p:
@@ -163,6 +377,8 @@ async def fetch_shelf(*, headless=False, sleep_seconds=3.0, max_no_new=3,
 
         async def on_response(response):
             try:
+                if response.request.resource_type not in ("xhr", "fetch"):
+                    return
                 if "weread.qq.com" not in (response.url or ""):
                     return
                 if "json" not in (response.headers.get("content-type") or ""):
@@ -186,7 +402,7 @@ async def fetch_shelf(*, headless=False, sleep_seconds=3.0, max_no_new=3,
         # 用 domcontentloaded + 固定等待，避免书架书籍较多时 networkidle 长时间不空闲而超时；
         # shelf 接口由 context 级 on_response 捕获，不依赖此处等待。
         await page.goto(SHELF_URL, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(3)
+        await asyncio.sleep(SLEEP_SHELF_AFTER_LOAD)
 
         dom_books = await extract_dom_books(page)
         prev = _total_unique(dom_books, api_books)
@@ -209,29 +425,110 @@ async def fetch_shelf(*, headless=False, sleep_seconds=3.0, max_no_new=3,
             no_new = 0 if grew > 0 else no_new + 1
             prev = cur
 
-        await context.close()
+        merged = merge_books(dom_books, api_books)
+        apply_existing_authors(merged, load_existing_authors(out_path))
+        write_shelf_books(out_path, merged)
+        with_author = sum(1 for b in merged if b["author"])
+        print(f"\n  列表阶段完成: {len(merged)} 本（有作者 {with_author}/{len(merged)}）"
+              f" -> {out_path}")
 
-    merged = merge_books(dom_books, api_books)
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    write_shelf_books(merged, out_path)
+        if enrich_author:
+            await enrich_missing_authors(
+                page,
+                merged,
+                out_path=out_path,
+                interval=author_interval,
+            )
+
+        await context.close()
 
     with_author = sum(1 for b in merged if b["author"])
     print(f"\n  ✅ 共 {len(merged)} 本（有作者 {with_author}/{len(merged)}）-> {out_path}")
     return merged
 
 
+async def enrich_authors_from_file(
+    *,
+    headless=False,
+    out_path=DEFAULT_OUT,
+    author_interval=None,
+):
+    """仅对已有 shelf 文件中 author 为空的书打开详情补全（不重新滚书架）。"""
+    if author_interval is None:
+        author_interval = SLEEP_BOOK_DETAIL_INTERVAL
+    if not os.path.isfile(out_path):
+        print(f"  ❌ 找不到 {out_path}，请先完整抓取书架")
+        return []
+    books = load_shelf_books(out_path)
+    if not books:
+        print(f"  ❌ {out_path} 为空或无法解析")
+        return []
+
+    async with async_playwright() as p:
+        context = await launch_weread_context(p, headless=headless)
+        if not await ensure_logged_in(context):
+            print("  ❌ 登录失败，退出")
+            await context.close()
+            return books
+        page = await context.new_page()
+        await enrich_missing_authors(
+            page,
+            books,
+            out_path=out_path,
+            interval=author_interval,
+        )
+        await context.close()
+
+    with_author = sum(1 for b in books if (b.get("author") or "").strip())
+    print(f"\n  ✅ 共 {len(books)} 本（有作者 {with_author}/{len(books)}）-> {out_path}")
+    return books
+
+
 def main():
     parser = argparse.ArgumentParser(description="抓取微信读书书架书籍列表")
     parser.add_argument("--headless", action="store_true",
                         help="无头模式（需已缓存登录态）")
-    parser.add_argument("--sleep", type=float, default=3.0,
-                        help="每次滚动后暂停秒数（默认 3）")
+    parser.add_argument(
+        "--sleep", type=float, default=None,
+        help=f"每次滚动后暂停秒数（默认 .env SLEEP_SHELF_SCROLL={SLEEP_SHELF_SCROLL})",
+    )
     parser.add_argument("--max-no-new", type=int, default=3,
                         help="连续无新书停止阈值（默认 3）")
     parser.add_argument("--out", default=DEFAULT_OUT, help="输出 txt 路径（一行一条：ID,书名,作者）")
+    parser.add_argument(
+        "--no-enrich-author", action="store_true",
+        help="跳过「作者为空时打开详情补全」步骤",
+    )
+    parser.add_argument(
+        "--enrich-only", action="store_true",
+        help="不重新滚书架，仅对已有文件中空作者打开详情补全",
+    )
+    parser.add_argument(
+        "--author-interval", type=float, default=None,
+        help=("打开下一本缺作者详情前的间隔秒数"
+              f"（默认 .env SLEEP_BOOK_DETAIL_INTERVAL={SLEEP_BOOK_DETAIL_INTERVAL}）"),
+    )
     args = parser.parse_args()
-    asyncio.run(fetch_shelf(headless=args.headless, sleep_seconds=args.sleep,
-                            max_no_new=args.max_no_new, out_path=args.out))
+    sleep_seconds = args.sleep if args.sleep is not None else SLEEP_SHELF_SCROLL
+    author_interval = (
+        args.author_interval if args.author_interval is not None
+        else SLEEP_BOOK_DETAIL_INTERVAL
+    )
+    if args.enrich_only:
+        asyncio.run(enrich_authors_from_file(
+            headless=args.headless,
+            out_path=args.out,
+            author_interval=author_interval,
+        ))
+    else:
+        asyncio.run(fetch_shelf(
+            headless=args.headless,
+            sleep_seconds=sleep_seconds,
+            max_no_new=args.max_no_new,
+            out_path=args.out,
+            enrich_author=not args.no_enrich_author,
+            author_interval=author_interval,
+        ))
 
 
 if __name__ == "__main__":

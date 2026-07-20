@@ -9,10 +9,21 @@ import asyncio
 import os
 from typing import Any, Optional
 
+import env_config  # noqa: F401  # 导入即加载 .env
+from env_config import (
+    SLEEP_LOGIN_AFTER_GOTO,
+    SLEEP_LOGIN_POLL,
+    SLEEP_LOGIN_SWITCH_PC,
+)
+
 USER_DATA_DIR = os.path.join("cache", "browser_profile")
 SHELF_URL = "https://weread.qq.com/web/shelf"
 DEFAULT_VIEWPORT = {"width": 1200, "height": 900}
 DEFAULT_ARGS = ["--disable-blink-features=AutomationControlled"]
+
+# 未登录时书架页导航栏上的「登录」按钮；点击后打开扫码弹层，URL 变为 ...#login
+LOGIN_BUTTON_SELECTOR = "button.navBar_link_Login"
+LOGIN_DIALOG_SELECTOR = ".login_dialog_container, .login_dialog_qrcode_img_main"
 
 
 def ensure_profile_dir(user_data_dir: str = USER_DATA_DIR) -> str:
@@ -49,36 +60,81 @@ def is_login_url(url: str) -> bool:
     return "login" in (url or "").lower()
 
 
+async def page_needs_login(page) -> bool:
+    """判断当前页面是否仍需登录。
+
+    微信读书未登录时打开 /web/shelf 不会跳转到登录 URL，只会显示导航栏
+    「登录」按钮；仅靠 URL 会误判为已登录。
+    """
+    if is_login_url(page.url):
+        return True
+    try:
+        return await page.locator(LOGIN_BUTTON_SELECTOR).count() > 0
+    except Exception:
+        return False
+
+
+async def open_login_dialog(page) -> bool:
+    """打开扫码登录弹层。已打开或成功点击返回 True，找不到按钮返回 False。"""
+    try:
+        if await page.locator(LOGIN_DIALOG_SELECTOR).count() > 0:
+            return True
+        btn = page.locator(LOGIN_BUTTON_SELECTOR).first
+        if await btn.count() == 0:
+            return False
+        await btn.click(timeout=5000)
+        await asyncio.sleep(SLEEP_LOGIN_SWITCH_PC)
+        return True
+    except Exception:
+        return False
+
+
 async def ensure_logged_in(
     context,
     *,
     shelf_url: str = SHELF_URL,
     timeout_ms: int = 30000,
-    poll_seconds: float = 5.0,
+    poll_seconds: float | None = None,
     max_wait_seconds: float = 600.0,
     close_check_page: bool = True,
 ) -> bool:
     """确认当前 context 已登录微信读书。
 
     - 已登录：打印提示并返回 True
-    - 需扫码：等待用户完成登录，成功返回 True，超时返回 False
+    - 需扫码：自动点开登录弹层，等待用户扫码；成功返回 True，超时返回 False
     """
+    if poll_seconds is None:
+        poll_seconds = SLEEP_LOGIN_POLL
     page = await context.new_page()
     try:
         await page.goto(shelf_url, timeout=timeout_ms)
-        await asyncio.sleep(3)
-        if not is_login_url(page.url):
+        try:
+            await page.wait_for_selector(
+                f"{LOGIN_BUTTON_SELECTOR}, a[href*='reader'], [data-book-id]",
+                timeout=10000,
+            )
+        except Exception:
+            await asyncio.sleep(SLEEP_LOGIN_AFTER_GOTO)
+
+        if not await page_needs_login(page):
             print("  ✅ 已登录（复用缓存会话）")
             return True
 
-        print("\n  ⚠️  请扫码登录微信读书（会话将缓存，后续无需重复登录）")
+        opened = await open_login_dialog(page)
+        if opened:
+            print("\n  ⚠️  已打开登录弹层，请用微信扫码登录（会话将缓存，后续无需重复登录）")
+        else:
+            print("\n  ⚠️  未检测到登录弹层，请在浏览器中手动点击「登录」并扫码")
+
         waited = 0.0
         while waited < max_wait_seconds:
             await asyncio.sleep(poll_seconds)
             waited += poll_seconds
-            if not is_login_url(page.url):
+            if not await page_needs_login(page):
                 print("  ✅ 登录成功")
                 return True
+            remaining = max(0, int(max_wait_seconds - waited))
+            print(f"  … 等待扫码中（剩余约 {remaining}s）")
         print("  ❌ 登录超时")
         return False
     finally:

@@ -1,6 +1,8 @@
 import unittest
 
 from fetch_shelf import (
+    apply_existing_authors,
+    books_missing_author,
     collect_books_from_json,
     extract_book_id_from_href,
     format_book_line,
@@ -103,6 +105,43 @@ class TestMergeBooks(unittest.TestCase):
 
 
 
+
+class TestBooksMissingAuthor(unittest.TestCase):
+    def test_filters_empty_and_whitespace(self):
+        books = [
+            {"id": "1", "title": "A", "author": "甲"},
+            {"id": "2", "title": "B", "author": ""},
+            {"id": "3", "title": "C", "author": "  "},
+            {"id": "4", "title": "D"},
+        ]
+        missing = books_missing_author(books)
+        self.assertEqual([b["id"] for b in missing], ["2", "3", "4"])
+
+    def test_preserves_order_and_identity(self):
+        books = [
+            {"id": "1", "title": "A", "author": ""},
+            {"id": "2", "title": "B", "author": "乙"},
+            {"id": "3", "title": "C", "author": ""},
+        ]
+        missing = books_missing_author(books)
+        self.assertIs(missing[0], books[0])
+        self.assertIs(missing[1], books[2])
+
+
+
+
+class TestApplyExistingAuthors(unittest.TestCase):
+    def test_fills_only_empty(self):
+        books = [
+            {"id": "1", "title": "A", "author": ""},
+            {"id": "2", "title": "B", "author": "新"},
+        ]
+        apply_existing_authors(books, {"1": "旧甲", "2": "旧乙"})
+        self.assertEqual(books[0]["author"], "旧甲")
+        self.assertEqual(books[1]["author"], "新")
+
+
+
 class TestShelfTxtFormat(unittest.TestCase):
     def test_sanitize_replaces_commas(self):
         self.assertEqual(sanitize_csv_field("甲,乙"), "甲 乙")
@@ -126,7 +165,7 @@ class TestShelfTxtFormat(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "shelf_books.txt")
-            write_shelf_books(books, path)
+            write_shelf_books(path, books)
             with open(path, encoding="utf-8") as f:
                 content = f.read()
         self.assertEqual(content, "1,A B,C\n2,D,E F\n")

@@ -4,3 +4,7 @@ cache/
 output/
 *.log
 .DS_Store
+
+.env
+!.env.example
+data/
