@@ -50,6 +50,16 @@
 - 模板：`.env.example`
 - 本地覆盖：`.env`（gitignore）
 
+## Skills（Claude Code / Codex 共用）
+
+仓库内置的 skill 放在 `.claude/skills/<name>/SKILL.md`。Claude Code 会自动发现；**Codex 不会自动扫描该目录**，需按下表手动读取对应文件后照做。
+
+| 触发场景 | skill 文件 |
+|----------|-----------|
+| 书架书去重：判断 `data/shelf_books.txt` 的书是否已在 `data/ebook-info.json`，分别落到 `data/dup_books.txt` / `data/new_books.txt` | `.claude/skills/dedupe-shelf-books/SKILL.md` |
+
+当用户说"书架去重 / 找重复书 / 找新书 / 生成 dup_books、new_books"等，读 `.claude/skills/dedupe-shelf-books/SKILL.md` 并按其流程执行。
+
 ## 其它
 
 - Git 提交规范见 `CLAUDE.md` 与 `docs/standards/git-workflow.md`。

@@ -11,6 +11,8 @@
 - **作者补全（author enrich）**：公版书等字母数字 book_id 在 shelf API/列表 DOM 常无 author；列表合并后对空 author 逐本打开 reader 详情补全，已有作者跳过，相邻间隔由 `SLEEP_BOOK_DETAIL_INTERVAL` 控制。
 - **网页操作 sleep（.env）**：所有点击/跳转等待经 `env_config.py` 从 `.env` 读取，清单见 `AGENTS.md`。
 - **页面禁用开发者模式**：weread 网页对**手动 F12** 做了反调试（debugger / 检测 devtools）；不影响 Playwright 的 CDP 级注入与网络监听。
+- **电子书库（ebook-info）**：外部电子书数据 `data/ebook-info.json`，JSON 数组，每条含 `id`（电子书体系整数 id）、`bookName`、`authorName` 等。其 `id` 与 weread `book_id` **不可互通**，比对只能靠书名 + 作者。
+- **去重（dedupe / dup / new）**：把书架书 `data/shelf_books.txt` 与电子书库比对——同一作品且作者至少一人相同判为 `dup`（已存在，落 `data/dup_books.txt`），否则 `new`（落 `data/new_books.txt`）。以 weread book ID 为去重 key，可重复运行，只追加不覆盖。skill 见 `.claude/skills/dedupe-shelf-books/SKILL.md`。
 
 ## 关键决策
 
