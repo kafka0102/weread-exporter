@@ -4,7 +4,7 @@
 复用 weread_session 的缓存登录会话打开书架页，慢滚动触发懒加载，
 DOM 抓取书籍 id/title，同时通过 context 级网络拦截捕获书架接口响应
 取 author（页面禁用 F12 不影响 Playwright 的 CDP 级监听），按 book_id
-合并后写入 data/shelf_books.json。
+合并后写入 data/shelf_books.txt（一行一条，逗号分隔：ID,书名,作者）。
 
 用法：
     python fetch_shelf.py                 # 可见浏览器，sleep 3s
@@ -24,7 +24,7 @@ from playwright.async_api import async_playwright
 from weread_session import SHELF_URL, ensure_logged_in, launch_weread_context
 
 DATA_DIR = "data"
-DEFAULT_OUT = os.path.join(DATA_DIR, "shelf_books.json")
+DEFAULT_OUT = os.path.join(DATA_DIR, "shelf_books.txt")
 
 _READER_ID_RE = re.compile(r"/reader/([A-Za-z0-9]+)")
 
@@ -87,6 +87,26 @@ def merge_books(dom_books, api_books):
                        "title": (api.get("title") or "").strip(),
                        "author": (api.get("author") or "").strip()})
     return merged
+
+def sanitize_csv_field(value):
+    """将字段中的逗号替换为空格，避免破坏逗号分隔格式。"""
+    return (value or "").replace(",", " ")
+
+
+def format_book_line(book):
+    """格式化为一行：ID,书名,作者。"""
+    return ",".join([
+        book.get("id") or "",
+        sanitize_csv_field(book.get("title")),
+        sanitize_csv_field(book.get("author")),
+    ])
+
+
+def write_shelf_books(books, path):
+    """将书籍列表写入 path，一行一条逗号分隔。"""
+    with open(path, "w", encoding="utf-8") as f:
+        for book in books:
+            f.write(format_book_line(book) + "\n")
 
 
 # 从当前页面 DOM 提取书籍列表 [{id, title, author}]。
@@ -193,8 +213,7 @@ async def fetch_shelf(*, headless=False, sleep_seconds=3.0, max_no_new=3,
 
     merged = merge_books(dom_books, api_books)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
+    write_shelf_books(merged, out_path)
 
     with_author = sum(1 for b in merged if b["author"])
     print(f"\n  ✅ 共 {len(merged)} 本（有作者 {with_author}/{len(merged)}）-> {out_path}")
@@ -209,7 +228,7 @@ def main():
                         help="每次滚动后暂停秒数（默认 3）")
     parser.add_argument("--max-no-new", type=int, default=3,
                         help="连续无新书停止阈值（默认 3）")
-    parser.add_argument("--out", default=DEFAULT_OUT, help="输出 JSON 路径")
+    parser.add_argument("--out", default=DEFAULT_OUT, help="输出 txt 路径（一行一条：ID,书名,作者）")
     args = parser.parse_args()
     asyncio.run(fetch_shelf(headless=args.headless, sleep_seconds=args.sleep,
                             max_no_new=args.max_no_new, out_path=args.out))

@@ -1,6 +1,13 @@
 import unittest
 
-from fetch_shelf import collect_books_from_json, extract_book_id_from_href, merge_books
+from fetch_shelf import (
+    collect_books_from_json,
+    extract_book_id_from_href,
+    format_book_line,
+    merge_books,
+    sanitize_csv_field,
+    write_shelf_books,
+)
 
 
 class TestExtractBookIdFromHref(unittest.TestCase):
@@ -93,6 +100,37 @@ class TestMergeBooks(unittest.TestCase):
     def test_skips_dom_without_id(self):
         dom = [{"id": "", "title": "x"}, {"title": "y"}]
         self.assertEqual(merge_books(dom, {}), [])
+
+
+
+class TestShelfTxtFormat(unittest.TestCase):
+    def test_sanitize_replaces_commas(self):
+        self.assertEqual(sanitize_csv_field("甲,乙"), "甲 乙")
+        self.assertEqual(sanitize_csv_field(""), "")
+        self.assertEqual(sanitize_csv_field(None), "")
+
+    def test_format_book_line(self):
+        line = format_book_line({
+            "id": "1",
+            "title": "书,名",
+            "author": "作,者",
+        })
+        self.assertEqual(line, "1,书 名,作 者")
+
+    def test_write_shelf_books(self):
+        import tempfile
+        import os
+        books = [
+            {"id": "1", "title": "A,B", "author": "C"},
+            {"id": "2", "title": "D", "author": "E,F"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "shelf_books.txt")
+            write_shelf_books(books, path)
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+        self.assertEqual(content, "1,A B,C\n2,D,E F\n")
+
 
 
 if __name__ == "__main__":

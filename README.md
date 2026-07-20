@@ -67,7 +67,7 @@ python fetch_shelf.py --sleep 5 --max-no-new 4
 ```
 
 - 慢滚动触发懒加载，逐屏抓取书架上所有书籍
-- 每本书提取 `id`、`title`、`author`，存为 `data/shelf_books.json`（数组，按 id 去重）
+- 每本书提取 `id`、`title`、`author`，存为 `data/shelf_books.txt`（一行一条，逗号分隔：ID,书名,作者；书名/作者中的逗号替换为空格）
 - 书架页禁用 F12 不影响抓取：`id`/`title` 取自页面 DOM，`author` 取自 Playwright 拦截的书架接口响应（按 `book_id` 合并）
 - 参数：`--headless` 无头（需已缓存登录）、`--sleep` 滚动间隔秒数、`--max-no-new` 连续无新书停止阈值、`--out` 输出路径
 
@@ -96,7 +96,7 @@ output/
 
 ```
 data/
-└── shelf_books.json         # 书架书籍列表 [{id, title, author}]
+└── shelf_books.txt          # 书架书籍列表（一行一条：ID,书名,作者）
 ```
 
 ## 扩展：复用登录会话
@@ -153,7 +153,7 @@ download_images.py:
 fetch_shelf.py:
   复用缓存登录打开书架 → 慢滚动触发懒加载
     → DOM 抓 id/title + 拦截书架接口取 author → 按 book_id 合并去重
-    → 写 data/shelf_books.json
+    → 写 data/shelf_books.txt
 ```
 
 ## 声明
