@@ -33,14 +33,14 @@ playwright install chromium
 python export_precise.py https://weread.qq.com/web/reader/d31323b0813abaf26g0137c2
 python export_precise.py d31323b0813abaf26g0137c2
 
-# 单本强制重导（默认若 data/books 已有同 id 的 json 则跳过）
+# 单本强制重导（默认若 ~/data/weixin/books 已有同 id 的 json 则跳过）
 python export_precise.py d31323b0813abaf26g0137c2 --force
 
 # 需要插图时再下载（默认不下载图片）
 python export_precise.py d31323b0813abaf26g0137c2 --download-images
 
-# 指定 JSON 输出目录（默认 data/books）
-python export_precise.py d31323b0813abaf26g0137c2 --out-dir data/books
+# 指定 JSON 输出目录（默认 ~/data/weixin/books，可用 BOOKS_DIR 或 --out-dir 覆盖）
+python export_precise.py d31323b0813abaf26g0137c2 --out-dir ~/data/weixin/books
 
 # 批量：不传 book_id，读取 data/new_books.txt 中尚未导出的书
 # 书与书默认间隔 60s（SLEEP_BOOK_INTERVAL）；任一本失败则停止
@@ -51,7 +51,7 @@ python export_precise.py --list data/new_books.txt
 - 首次运行会弹出浏览器要求扫码登录，会话自动保存在 `cache/browser_profile/`，后续复用
 - 自动跳到全书开头（原生点击目录首项），逐页翻到全书末尾自动停止
 - **自动续传**：中途卡住会重开浏览器，从上次章节继续；中间产物在 `output/<book_id>/`
-- **全书成功后**才写入 `data/books/<book_id>_<书名>.json`（字段对齐 dedao/json：纯文本 content、`has_content`、空元数据键）
+- **全书成功后**才写入 `~/data/weixin/books/<book_id>_<书名>.json`（字段对齐 dedao/json：纯文本 content、`has_content`、空元数据键；可用 `BOOKS_DIR` / `--out-dir` 覆盖）
 - 章切换后按该章字数动态等待：`ceil(字数/1000)*SLEEP_CHAPTER_PER_1K_CHARS`，夹在 `SLEEP_CHAPTER_MIN`–`SLEEP_CHAPTER_MAX`（默认 2–15 秒）
 - 默认不下载图片；需要时加 `--download-images`。正文 md 中间产物仍可含 `images/` 相对路径引用
 
@@ -114,16 +114,17 @@ output/
 
 data/
 ├── shelf_books.txt          # 书架书籍列表（一行一条：ID,书名,作者）
-├── new_books.txt            # 去重后的新书清单（批量导出输入）
-└── books/
-    └── <book_id>_<书名>.json  # 兼容 dedao/json 的最终书稿
+└── new_books.txt            # 去重后的新书清单（批量导出输入）
+
+~/data/weixin/books/
+└── <book_id>_<书名>.json    # 兼容 dedao/json 的最终书稿（默认；BOOKS_DIR/--out-dir 可改）
 ```
 
 JSON 顶层字段：`id, title, author, press, publication_date, isbn, word_count, body`；
 `body[]` 为 `chapter_name, chapter_id(ch_0001…), content(纯文本), has_content`。
 拿不到的出版社/出版日/ISBN 写空串；`word_count` 为各章纯文本字数之和。
 
-用 Typora / Obsidian 等打开全本 `.md` 可预览；导入下游请用 `data/books/*.json`。
+用 Typora / Obsidian 等打开全本 `.md` 可预览；导入下游请用 `~/data/weixin/books/*.json`。
 
 书架抓取输出：
 

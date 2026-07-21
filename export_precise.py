@@ -29,6 +29,7 @@ from book_json import (
     write_book_json,
 )
 from env_config import (
+    BOOKS_DIR,
     SLEEP_BOOK_INTERVAL,
     SLEEP_CHAPTER_MAX,
     SLEEP_CHAPTER_MIN,
@@ -46,7 +47,7 @@ from env_config import (
 )
 from weread_session import USER_DATA_DIR, ensure_logged_in, launch_weread_context
 
-DEFAULT_BOOKS_DIR = Path("data") / "books"
+DEFAULT_BOOKS_DIR = BOOKS_DIR
 DEFAULT_NEW_BOOKS = Path("data") / "new_books.txt"
 
 CANVAS_HOOK = """
@@ -625,7 +626,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--force",
         action="store_true",
-        help="即使 data/books 已存在同 id 的 JSON 也强制重导",
+        help="即使默认 books 目录已存在同 id 的 JSON 也强制重导",
     )
     parser.add_argument(
         "--download-images",

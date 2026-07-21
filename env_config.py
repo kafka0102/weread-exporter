@@ -67,9 +67,22 @@ def env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_path(name: str, default: str | Path) -> Path:
+    """读取路径环境变量；支持 ~ 展开；缺失或空白时回退 default。"""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        raw = default
+    return Path(str(raw)).expanduser()
+
+
 # 模块导入即加载项目根 .env（已存在的环境变量优先）
 load_dotenv()
 
+
+# --- 导出路径 ---
+# 兼容 JSON 书稿默认输出目录（export_precise.py --out-dir 可覆盖）
+DEFAULT_BOOKS_DIR_RAW = "~/data/weixin/books"
+BOOKS_DIR = env_path("BOOKS_DIR", DEFAULT_BOOKS_DIR_RAW)
 
 # --- 网页操作 sleep（秒）---
 # 命名约定：SLEEP_<场景>_<动作>

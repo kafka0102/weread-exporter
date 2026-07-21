@@ -27,6 +27,9 @@ class TestExportPreciseCli(unittest.TestCase):
         args = export_precise.parse_args([])
         self.assertIsNone(args.book)
         self.assertEqual(args.list_path, str(export_precise.DEFAULT_NEW_BOOKS))
+        self.assertEqual(args.out_dir, str(export_precise.DEFAULT_BOOKS_DIR))
+        import env_config
+        self.assertEqual(export_precise.DEFAULT_BOOKS_DIR, env_config.BOOKS_DIR)
 
     def test_resolve_book_id_from_url(self):
         self.assertEqual(

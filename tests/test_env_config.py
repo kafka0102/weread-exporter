@@ -65,5 +65,18 @@ class TestEnvConfig(unittest.TestCase):
         self.assertEqual(env_config.SLEEP_CHAPTER_MAX, 15.0)
 
 
+    def test_env_path_and_books_dir(self):
+        os.environ.pop("BOOKS_DIR_TEST", None)
+        p = env_config.env_path("BOOKS_DIR_TEST", "~/data/weixin/books")
+        self.assertEqual(p, Path.home() / "data" / "weixin" / "books")
+        os.environ["BOOKS_DIR_TEST"] = "~/tmp/custom-books"
+        p2 = env_config.env_path("BOOKS_DIR_TEST", "~/data/weixin/books")
+        self.assertEqual(p2, Path.home() / "tmp" / "custom-books")
+        os.environ.pop("BOOKS_DIR_TEST", None)
+        # 模块级默认（允许 .env 覆盖，仅校验类型与展开）
+        self.assertIsInstance(env_config.BOOKS_DIR, Path)
+        self.assertFalse(str(env_config.BOOKS_DIR).startswith("~"))
+
+
 if __name__ == "__main__":
     unittest.main()
