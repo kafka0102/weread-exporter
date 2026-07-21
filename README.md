@@ -26,20 +26,34 @@ playwright install chromium
 
 > 所有脚本共享同一份缓存登录会话（由 `weread_session.py` 提供）：首次扫码后登录态保存在 `cache/browser_profile/`，后续任何脚本都免重复登录。切换账号需清空该目录。
 
-### 1. 导出书籍（文字 + 图片 URL）
+### 1. 导出书籍（兼容 JSON + md 中间产物）
 
 ```bash
-# 传入 reader URL（推荐）
+# 单本：传入 reader URL（推荐）或 book_id
 python export_precise.py https://weread.qq.com/web/reader/d31323b0813abaf26g0137c2
-
-# 或直接传 book_id
 python export_precise.py d31323b0813abaf26g0137c2
+
+# 单本强制重导（默认若 data/books 已有同 id 的 json 则跳过）
+python export_precise.py d31323b0813abaf26g0137c2 --force
+
+# 需要插图时再下载（默认不下载图片）
+python export_precise.py d31323b0813abaf26g0137c2 --download-images
+
+# 指定 JSON 输出目录（默认 data/books）
+python export_precise.py d31323b0813abaf26g0137c2 --out-dir data/books
+
+# 批量：不传 book_id，读取 data/new_books.txt 中尚未导出的书
+# 书与书默认间隔 60s（SLEEP_BOOK_INTERVAL）；任一本失败则停止
+python export_precise.py
+python export_precise.py --list data/new_books.txt
 ```
 
 - 首次运行会弹出浏览器要求扫码登录，会话自动保存在 `cache/browser_profile/`，后续复用
 - 自动跳到全书开头（原生点击目录首项），逐页翻到全书末尾自动停止
-- **自动续传**：中途卡住会重开浏览器，从上次章节继续
-- 图片此阶段只记录 URL，正文 md 用相对路径 `images/chXXXX_imgNN.jpg` 内嵌引用
+- **自动续传**：中途卡住会重开浏览器，从上次章节继续；中间产物在 `output/<book_id>/`
+- **全书成功后**才写入 `data/books/<book_id>_<书名>.json`（字段对齐 dedao/json：纯文本 content、`has_content`、空元数据键）
+- 章切换后按该章字数动态等待：`ceil(字数/1000)*SLEEP_CHAPTER_PER_1K_CHARS`，夹在 `SLEEP_CHAPTER_MIN`–`SLEEP_CHAPTER_MAX`（默认 2–15 秒）
+- 默认不下载图片；需要时加 `--download-images`。正文 md 中间产物仍可含 `images/` 相对路径引用
 
 ### 2. 下载图片
 
@@ -87,20 +101,29 @@ python fetch_shelf.py --author-interval 8
 
 ```
 output/
-├── <book_id>/
+├── <book_id>/               # 中间产物（续传用）
 │   ├── _catalog.json        # 目录章节标题列表（用于判定全书末尾）
-│   ├── chapters/            # 每章独立 Markdown（图文交错）
+│   ├── chapters/            # 每章独立 Markdown
 │   │   ├── 0001.md
-│   │   ├── 0002.md
 │   │   └── ...
-│   ├── images/              # 下载的插图 chXXXX_imgNN.jpg
+│   ├── images/              # 仅在 --download-images 时填充
 │   └── raw/                 # 每章的图片 URL 记录 + 字数
 │       ├── 0001.json
 │       └── ...
-└── 书名.md                  # 合并后的全本文件（图片用 images/ 相对路径）
+└── 书名.md                  # 合并后的全本预览
+
+data/
+├── shelf_books.txt          # 书架书籍列表（一行一条：ID,书名,作者）
+├── new_books.txt            # 去重后的新书清单（批量导出输入）
+└── books/
+    └── <book_id>_<书名>.json  # 兼容 dedao/json 的最终书稿
 ```
 
-用 Typora / Obsidian 等打开全本 `.md` 即可看到图文完整的书籍。
+JSON 顶层字段：`id, title, author, press, publication_date, isbn, word_count, body`；
+`body[]` 为 `chapter_name, chapter_id(ch_0001…), content(纯文本), has_content`。
+拿不到的出版社/出版日/ISBN 写空串；`word_count` 为各章纯文本字数之和。
+
+用 Typora / Obsidian 等打开全本 `.md` 可预览；导入下游请用 `data/books/*.json`。
 
 书架抓取输出：
 
