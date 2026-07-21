@@ -69,6 +69,20 @@ def extract_book_id_from_href(href):
     return m.group(1) if m else ""
 
 
+def is_reader_book_id(book_id):
+    """判断是否为可用于 web/reader URL 的真实 book_id。
+
+    微信读书 reader 末段为字母数字串（常见 23–24 位，含字母）。
+    纯数字短 id（如 3300215708）常见于 shelf API 的冗余字段，无法打开阅读器。
+    """
+    bid = str(book_id or "").strip()
+    if not bid or not bid.isalnum():
+        return False
+    if bid.isdigit():
+        return False
+    return len(bid) >= 16
+
+
 def collect_books_from_json(obj, out=None):
     """递归遍历 shelf API 的 JSON，收集含 bookId 的对象到 out[id] = {title, author}。
 
@@ -99,25 +113,56 @@ def merge_books(dom_books, api_books):
     api_books: dict[id -> {title, author}]（shelf API 拦截）
     返回 list[{id, title, author}]：DOM 顺序优先，API-only 追加其后。
     title / author 均优先取 API（更干净），缺失再回退 DOM。
+
+    纯数字短 id 等无效 reader book_id 会被丢弃，但其 title/author 仍可按
+    书名回填到对应的合法 id（shelf API 常同时返回两套 id）。
     """
+    meta_by_title = {}
+    for source in (api_books or {}).values():
+        title = (source.get("title") or "").strip()
+        if not title:
+            continue
+        entry = meta_by_title.setdefault(title, {"title": title, "author": ""})
+        author = (source.get("author") or "").strip()
+        if author and not entry["author"]:
+            entry["author"] = author
+    for b in dom_books or []:
+        title = (b.get("title") or "").strip()
+        if not title:
+            continue
+        entry = meta_by_title.setdefault(title, {"title": title, "author": ""})
+        author = (b.get("author") or "").strip()
+        if author and not entry["author"]:
+            entry["author"] = author
+
     merged = []
     seen = set()
-    for b in dom_books:
-        bid = b.get("id")
-        if not bid or bid in seen:
+    for b in dom_books or []:
+        bid = str(b.get("id") or "").strip()
+        if not bid or bid in seen or not is_reader_book_id(bid):
             continue
         seen.add(bid)
-        api = api_books.get(bid, {})
+        api = (api_books or {}).get(bid, {})
         title = (api.get("title") or b.get("title") or "").strip()
         author = (api.get("author") or b.get("author") or "").strip()
+        if title:
+            meta = meta_by_title.get(title) or {}
+            title = (title or meta.get("title") or "").strip()
+            if not author:
+                author = (meta.get("author") or "").strip()
         merged.append({"id": bid, "title": title, "author": author})
-    for bid, api in api_books.items():
-        if bid in seen:
+    for bid, api in (api_books or {}).items():
+        bid = str(bid or "").strip()
+        if not bid or bid in seen or not is_reader_book_id(bid):
             continue
         seen.add(bid)
-        merged.append({"id": bid,
-                       "title": (api.get("title") or "").strip(),
-                       "author": (api.get("author") or "").strip()})
+        title = (api.get("title") or "").strip()
+        author = (api.get("author") or "").strip()
+        if title:
+            meta = meta_by_title.get(title) or {}
+            if not author:
+                author = (meta.get("author") or "").strip()
+        merged.append({"id": bid, "title": title, "author": author})
     return merged
 
 
@@ -210,6 +255,8 @@ EXTRACT_BOOKS_JS = r"""
     const seen = new Set();
     const push = (id, title, author) => {
         if (!id || seen.has(id)) return;
+        // 纯数字 id 无法作为 web/reader 路径打开，跳过
+        if (/^\d+$/.test(id)) return;
         seen.add(id);
         out.push({id, title: (title || '').trim(), author: (author || '').trim()});
     };
@@ -241,8 +288,8 @@ async def extract_dom_books(page):
 
 
 def _total_unique(dom_books, api_books):
-    ids = {b["id"] for b in dom_books if b.get("id")}
-    ids |= set(api_books.keys())
+    ids = {b["id"] for b in dom_books if is_reader_book_id(b.get("id"))}
+    ids |= {bid for bid in api_books.keys() if is_reader_book_id(bid)}
     return len(ids)
 
 

@@ -6,6 +6,7 @@ from fetch_shelf import (
     collect_books_from_json,
     extract_book_id_from_href,
     format_book_line,
+    is_reader_book_id,
     merge_books,
     sanitize_csv_field,
     write_shelf_books,
@@ -69,32 +70,70 @@ class TestCollectBooksFromJson(unittest.TestCase):
         self.assertEqual(collect_books_from_json([]), {})
 
 
+class TestIsReaderBookId(unittest.TestCase):
+    def test_accepts_long_alphanumeric_ids(self):
+        self.assertTrue(is_reader_book_id("6b632d60813abb28bg015b4f"))
+        self.assertTrue(is_reader_book_id("4f3328d0813abbac2g0186d4"))
+        self.assertTrue(is_reader_book_id("d31323b0813abaf26g0137c2"))
+
+    def test_rejects_pure_numeric_ids(self):
+        self.assertFalse(is_reader_book_id("3300215708"))
+        self.assertFalse(is_reader_book_id("937571"))
+        self.assertFalse(is_reader_book_id("1"))
+
+    def test_rejects_empty_or_short(self):
+        self.assertFalse(is_reader_book_id(""))
+        self.assertFalse(is_reader_book_id(None))
+        self.assertFalse(is_reader_book_id("abc123"))  # too short
+
+
 class TestMergeBooks(unittest.TestCase):
     def test_api_preferred_for_title_and_author(self):
-        dom = [{"id": "1", "title": "DOM脏标题", "author": ""}]
-        api = {"1": {"title": "干净标题", "author": "作者甲"}}
+        bid = "6b632d60813abb28bg015b4f"
+        dom = [{"id": bid, "title": "DOM脏标题", "author": ""}]
+        api = {bid: {"title": "干净标题", "author": "作者甲"}}
         self.assertEqual(merge_books(dom, api),
-                         [{"id": "1", "title": "干净标题", "author": "作者甲"}])
+                         [{"id": bid, "title": "干净标题", "author": "作者甲"}])
 
     def test_dom_fallback_when_no_api(self):
-        dom = [{"id": "1", "title": "DOM标题", "author": ""}]
+        bid = "6b632d60813abb28bg015b4f"
+        dom = [{"id": bid, "title": "DOM标题", "author": ""}]
         self.assertEqual(merge_books(dom, {}),
-                         [{"id": "1", "title": "DOM标题", "author": ""}])
+                         [{"id": bid, "title": "DOM标题", "author": ""}])
 
     def test_api_only_books_appended(self):
-        dom = [{"id": "1", "title": "A", "author": ""}]
-        api = {"1": {"title": "A", "author": "甲"},
-               "2": {"title": "B", "author": "乙"}}
+        bid1 = "6b632d60813abb28bg015b4f"
+        bid2 = "4f3328d0813abbac2g0186d4"
+        dom = [{"id": bid1, "title": "A", "author": ""}]
+        api = {bid1: {"title": "A", "author": "甲"},
+               bid2: {"title": "B", "author": "乙"}}
         merged = merge_books(dom, api)
         self.assertEqual(len(merged), 2)
-        self.assertEqual(merged[0]["id"], "1")
-        self.assertEqual(merged[1], {"id": "2", "title": "B", "author": "乙"})
+        self.assertEqual(merged[0]["id"], bid1)
+        self.assertEqual(merged[1], {"id": bid2, "title": "B", "author": "乙"})
 
     def test_dedup_dom_duplicates(self):
-        dom = [{"id": "1", "title": "A", "author": ""},
-               {"id": "1", "title": "A", "author": ""}]
+        bid = "6b632d60813abb28bg015b4f"
+        dom = [{"id": bid, "title": "A", "author": ""},
+               {"id": bid, "title": "A", "author": ""}]
         self.assertEqual(merge_books(dom, {}),
-                         [{"id": "1", "title": "A", "author": ""}])
+                         [{"id": bid, "title": "A", "author": ""}])
+
+    def test_drops_pure_numeric_ids(self):
+        real = "6b632d60813abb28bg015b4f"
+        dom = [{"id": real, "title": "静心诗词", "author": ""}]
+        api = {
+            real: {"title": "静心诗词", "author": ""},
+            "3300215708": {"title": "静心诗词", "author": "拾木文化"},
+        }
+        merged = merge_books(dom, api)
+        self.assertEqual(merged, [
+            {"id": real, "title": "静心诗词", "author": "拾木文化"},
+        ])
+
+    def test_numeric_only_api_book_not_kept(self):
+        api = {"3300215708": {"title": "静心诗词", "author": "拾木文化"}}
+        self.assertEqual(merge_books([], api), [])
 
     def test_empty_inputs(self):
         self.assertEqual(merge_books([], {}), [])
