@@ -115,6 +115,88 @@ CANVAS_RECTS_JS = """
 
 MEASURE_RE = re.compile(r'^[a-zA-Z0-9`~!@#$%^&*()\-_=+\[\]{}|;:\',<.>/?\\"\s]+$')
 SENTENCE_END = set("。！？；：」）】》…—")
+# canvas 软折行合并阈值：短于此长度的行（词牌/作者名等）不与邻行粘连
+SOFT_WRAP_MIN_LEN = 16
+# 标题前缀后若接这些成分，视为正文提及而非新章起始
+_NOT_CHAPTER_START_REST = re.compile(
+    r"^(的|与|和|在|是|了|也|都|就|还|曾|并|便|则|却|又|已|将|会|能|要|"
+    r"把|被|让|从|向|对|比|因|而|但|曾经|这首|早在|不过|与他|便是)"
+)
+
+
+def is_title_like_line(line: str) -> bool:
+    """短标题行（词牌、作者小标题、【赏析】等）不应参与软折行粘连。"""
+    s = (line or "").strip()
+    if not s:
+        return False
+    if s.startswith("【") and s.endswith("】"):
+        return True
+    if len(s) <= 10 and not any(ch in SENTENCE_END or ch in "，、,." for ch in s):
+        return True
+    return False
+
+
+def should_merge_soft_wrap(prev: str, cur: str) -> bool:
+    """是否把 cur 接到 prev 末尾（canvas 软折行）。"""
+    if not prev or not cur:
+        return False
+    if is_title_like_line(prev) or is_title_like_line(cur):
+        return False
+    if prev[-1] in SENTENCE_END:
+        return False
+    # 仅当上一行足够长，才更像折行而非独立短行/标题
+    return len(prev) >= SOFT_WRAP_MIN_LEN
+
+
+def is_chapter_start_text(text: str, chapter_title: str) -> bool:
+    """判断一行文字是否为下一章起始（目录标题行或标题+词牌粘连）。"""
+    t = (text or "").strip()
+    title = (chapter_title or "").strip()
+    if not t or not title:
+        return False
+    if t == title:
+        return True
+    if not t.startswith(title):
+        return False
+    rest = t[len(title):]
+    if not rest:
+        return True
+    if rest[0] in "，、,;；。！？":
+        return False
+    if _NOT_CHAPTER_START_REST.match(rest):
+        return False
+    # 软折行误切：作者名出现在段中换行处，后接散文动词/虚词已在上面过滤；
+    # 其余允许「张志和渔父…」「范仲淹苏幕遮…」这类标题+词牌同行。
+    return True
+
+
+def split_blocks_at_chapter_start(blocks, chapter_title: str):
+    """在 blocks 中按 chapter_title 章首切分为 (before, after)。
+
+    after 为空表示未找到章首；before 可能为空（整页已属新章）。
+    """
+    title = (chapter_title or "").strip()
+    if not title or not blocks:
+        return list(blocks or []), []
+    for i, b in enumerate(blocks):
+        if b.get("type") != "text":
+            continue
+        if is_chapter_start_text(b.get("text") or "", title):
+            return blocks[:i], blocks[i:]
+    return list(blocks), []
+
+
+def next_catalog_title(catalog_titles, current_title: str):
+    """返回目录中 current_title 的下一章标题；找不到则 None。"""
+    if not catalog_titles or not current_title:
+        return None
+    try:
+        idx = catalog_titles.index(current_title)
+    except ValueError:
+        return None
+    if idx + 1 >= len(catalog_titles):
+        return None
+    return catalog_titles[idx + 1]
 
 
 def split_spread(chars):
@@ -209,12 +291,12 @@ def render_chapter_md(ch_title, blocks, ch_idx):
         nonlocal para
         if not para:
             return
-        # 合并 canvas 断行为自然段：上一行不以句末标点结尾则接续
+        # 合并 canvas 软折行；词牌/短标题/【赏析】等保持独立段落
         merged = []
         for line in para:
             if line == ch_title:
                 continue
-            if merged and merged[-1] and merged[-1][-1] not in SENTENCE_END:
+            if merged and should_merge_soft_wrap(merged[-1], line):
                 merged[-1] += line
             else:
                 merged.append(line)
@@ -264,13 +346,19 @@ def get_last_chapter_title(md_dir):
     return title, idx
 
 
-def load_last_catalog_title(catalog_path):
+def load_catalog_titles(catalog_path):
+    """读取目录标题列表；失败返回 []。"""
     try:
         with open(catalog_path) as f:
             titles = json.load(f)
-        return titles[-1] if titles else ""
+        return titles if isinstance(titles, list) else []
     except Exception:
-        return ""
+        return []
+
+
+def load_last_catalog_title(catalog_path):
+    titles = load_catalog_titles(catalog_path)
+    return titles[-1] if titles else ""
 
 
 async def _title(page):
@@ -334,7 +422,8 @@ def save_chapter(ch_title, blocks, ch_idx, md_dir, raw_dir):
 async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                       goto_first=False, catalog_path=None, headless=False):
     reached_end = False
-    last_cat_title = load_last_catalog_title(catalog_path) if catalog_path else ""
+    catalog_titles = load_catalog_titles(catalog_path) if catalog_path else []
+    last_cat_title = catalog_titles[-1] if catalog_titles else ""
     async with async_playwright() as p:
         ctx = await launch_weread_context(
             p, headless=headless, viewport={"width": 1200, "height": 900})
@@ -364,7 +453,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         book_title, book_author = await fetch_book_title(page)
         if goto_first:
             await goto_first_chapter(page, catalog_path)
-            last_cat_title = load_last_catalog_title(catalog_path)
+            catalog_titles = load_catalog_titles(catalog_path) if catalog_path else catalog_titles
+            last_cat_title = catalog_titles[-1] if catalog_titles else ""
 
         await page.mouse.click(600, 450)
         await asyncio.sleep(SLEEP_READER_AFTER_HOOK)
@@ -382,6 +472,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
 
         async def capture_current_page():
             """抓当前页的有序块，累加到 ch_blocks；返回是否有新内容"""
+            nonlocal ch_blocks
             await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
             chars = await page.evaluate("() => window.__wr_chars")
             rects = await page.evaluate(CANVAS_RECTS_JS)
@@ -396,12 +487,69 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 ch_blocks.append(b)
             return len(ch_blocks) > before
 
+        async def commit_chapter(title, blocks, *, note_suffix=""):
+            """落盘一章并累计统计；返回 (text_len, imgs)。"""
+            nonlocal total_chars, total_imgs, chapters_this_session
+            n, imgs = save_chapter(title, blocks, ch_idx, md_dir, raw_dir)
+            total_chars += n
+            total_imgs += len(imgs)
+            note = f" +{len(imgs)}图" if imgs else ""
+            note += note_suffix
+            print(f"  [{ch_idx:4d}] {title[:32]:32s} {n:6d}字 ({page_num}页){note}")
+            chapters_this_session += 1
+            return n, imgs
+
+        async def sleep_between_chapters(n_chars):
+            wait_s = chapter_sleep_seconds(
+                n_chars,
+                per_1k=SLEEP_CHAPTER_PER_1K_CHARS,
+                min_seconds=SLEEP_CHAPTER_MIN,
+                max_seconds=SLEEP_CHAPTER_MAX,
+            )
+            print(f"    … 章间等待 {wait_s:.1f}s（按 {n_chars} 字）")
+            await asyncio.sleep(wait_s)
+
+        async def split_if_next_chapter_started():
+            """目录下一章标题已出现在正文块中时，提前切章（修复标题栏滞后导致的窜章）。
+
+            返回 True 表示发生了切章。
+            """
+            nonlocal ch_blocks, current_chapter, ch_idx, page_num, stale, reached_end
+            nxt = next_catalog_title(catalog_titles, current_chapter)
+            if not nxt:
+                return False
+            before, after = split_blocks_at_chapter_start(ch_blocks, nxt)
+            if not after:
+                return False
+            is_last = bool(last_cat_title and current_chapter == last_cat_title)
+            if before:
+                n, _imgs = await commit_chapter(
+                    current_chapter, before, note_suffix=" [内容切章]")
+                ch_idx += 1
+                if is_last:
+                    ch_blocks = after
+                    current_chapter = nxt
+                    page_num = 0
+                    stale = 0
+                    reached_end = True
+                    return True
+                await sleep_between_chapters(n)
+            # before 为空：上一章已落盘，仅把块归属切到目录下一章
+            ch_blocks = after
+            current_chapter = nxt
+            page_num = 0
+            stale = 0
+            return True
+
         # 首页
         await page.evaluate("() => window.__wr_reset()")
         await wait_stable(page, 0)
         await capture_current_page()
+        while await split_if_next_chapter_started():
+            if reached_end:
+                break
 
-        while True:
+        while not reached_end:
             await page.evaluate("() => window.__wr_reset()")
             await page.mouse.click(600, 450)
             await page.keyboard.press("ArrowRight")
@@ -410,44 +558,47 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
 
             new_chapter = await _title(page)
             if new_chapter and new_chapter != current_chapter:
-                # 章节切换：保存上一章
-                n, imgs = save_chapter(current_chapter, ch_blocks, ch_idx, md_dir, raw_dir)
-                total_chars += n; total_imgs += len(imgs)
-                note = f" +{len(imgs)}图" if imgs else ""
-                print(f"  [{ch_idx:4d}] {current_chapter[:32]:32s} {n:6d}字 ({page_num}页){note}")
+                # 标题栏切换：先把已窜入上一章末尾的新章内容剥回
+                before, after = split_blocks_at_chapter_start(ch_blocks, new_chapter)
+                if after:
+                    ch_blocks = before
                 is_last = bool(last_cat_title and current_chapter == last_cat_title)
+                n, _imgs = await commit_chapter(current_chapter, ch_blocks)
                 ch_idx += 1
-                chapters_this_session += 1
-                ch_blocks = []
+                ch_blocks = after
                 current_chapter = new_chapter
                 page_num = 0
                 stale = 0
                 if not is_last:
-                    wait_s = chapter_sleep_seconds(
-                        n,
-                        per_1k=SLEEP_CHAPTER_PER_1K_CHARS,
-                        min_seconds=SLEEP_CHAPTER_MIN,
-                        max_seconds=SLEEP_CHAPTER_MAX,
-                    )
-                    print(f"    … 章间等待 {wait_s:.1f}s（按 {n} 字）")
-                    await asyncio.sleep(wait_s)
+                    await sleep_between_chapters(n)
                 await capture_current_page()
+                # 当前页也可能继续跨到再下一章
+                while await split_if_next_chapter_started():
+                    if reached_end:
+                        break
                 if is_last:
                     reached_end = True
-                    # 再存这最后一章
                     break
                 continue
 
             got_new = await capture_current_page()
+            split = False
+            while await split_if_next_chapter_started():
+                split = True
+                if reached_end:
+                    break
+            if reached_end:
+                break
+            if split:
+                continue
             if not got_new:
                 stale += 1
                 if stale >= 10:
-                    n, imgs = save_chapter(current_chapter, ch_blocks, ch_idx, md_dir, raw_dir)
-                    total_chars += n; total_imgs += len(imgs)
-                    note = f" +{len(imgs)}图" if imgs else ""
+                    note = ""
                     if last_cat_title and current_chapter == last_cat_title:
-                        reached_end = True; note += " [全书末尾]"
-                    print(f"  [{ch_idx:4d}] {current_chapter[:32]:32s} {n:6d}字 ({page_num}页){note}")
+                        reached_end = True
+                        note = " [全书末尾]"
+                    await commit_chapter(current_chapter, ch_blocks, note_suffix=note)
                     break
             else:
                 stale = 0
