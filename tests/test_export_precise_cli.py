@@ -18,12 +18,30 @@ class TestExportPreciseCli(unittest.TestCase):
             "--out-dir",
             "tmp/books",
             "--headless",
+            "--reader-width",
+            "1280",
+            "--reader-height",
+            "900",
+            "--force-single-page",
         ])
         self.assertEqual(args.book, "abc123")
         self.assertTrue(args.force)
         self.assertTrue(args.download_images)
         self.assertEqual(args.out_dir, "tmp/books")
         self.assertTrue(args.headless)
+        self.assertEqual(args.reader_width, 1280)
+        self.assertEqual(args.reader_height, 900)
+        self.assertTrue(args.force_single_page)
+
+    def test_parse_args_reader_layout_defaults(self):
+        args = export_precise.parse_args([])
+        self.assertIsNone(args.reader_width)
+        self.assertIsNone(args.reader_height)
+        self.assertIsNone(args.force_single_page)
+
+    def test_parse_args_can_disable_force_single_page(self):
+        args = export_precise.parse_args(["abc123", "--no-force-single-page"])
+        self.assertFalse(args.force_single_page)
 
     def test_parse_args_headless_default_false(self):
         args = export_precise.parse_args([])
@@ -140,15 +158,34 @@ class TestExportPreciseCli(unittest.TestCase):
                 self.assertEqual(sleeps, [])
         asyncio.run(run())
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_reader_viewport_helper(self):
         vp = export_precise.reader_viewport()
         self.assertIn("width", vp)
         self.assertIn("height", vp)
-        self.assertLessEqual(vp["width"], 1000)  # 默认应偏窄，避免双页
+        self.assertGreaterEqual(vp["width"], 1000)
         x, y = export_precise.viewport_focus_point(vp)
         self.assertGreater(x, 0)
         self.assertGreater(y, 0)
+
+    def test_reader_viewport_overrides(self):
+        vp = export_precise.reader_viewport(1280, 720)
+        self.assertEqual(vp, {"width": 1280, "height": 720})
+
+    def test_reader_layout_keeps_desktop_width_unless_forced(self):
+        async def run():
+            page = mock.AsyncMock()
+            page.evaluate.return_value = 2
+            vp = {"width": 1200, "height": 900}
+
+            actual = await export_precise.ensure_reader_layout(
+                page, vp, force_single_page=False)
+
+            self.assertEqual(actual, vp)
+            page.set_viewport_size.assert_not_called()
+            page.reload.assert_not_called()
+
+        asyncio.run(run())
+
+
+if __name__ == "__main__":
+    unittest.main()

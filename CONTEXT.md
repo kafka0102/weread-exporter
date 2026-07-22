@@ -6,7 +6,7 @@
 - **缓存登录会话（cached login session）**：首次扫码登录后，登录态落盘到 browser_profile；后续脚本复用该 profile 即免重复登录。`weread_session.py` 是全仓唯一登录入口组件。
 - **书架（shelf）**：微信读书网页版 `https://weread.qq.com/web/shelf`，展示用户收藏/购买的书籍列表，长列表懒加载，需滚动触发后续内容。
 - **reader**：书籍阅读器页 `https://weread.qq.com/web/reader/<book_id>`，Canvas 渲染文字（非 DOM 文本），插图是 DOM `<img>`。
-- **单页/双页布局**：web 阅读器视口较宽时并排两个 canvas（双页）；导出默认用窄视口（`READER_VIEWPORT_WIDTH`，默认 800）强制单页，避免左右页字坐标交错。
+- **单页/双页布局**：web 阅读器视口较宽时并排两个 canvas（双页）；导出默认用桌面视口（`READER_VIEWPORT_WIDTH`，默认 1200）贴近手动浏览器排版，并按 canvas 位置拆页。需要旧版窄视口时，用 `READER_FORCE_SINGLE_PAGE=1` 或 CLI `--force-single-page`。
 - **book_id**：书籍唯一标识，出现在 reader URL 末段、书架链接 href、书架接口响应中。可用 reader id 为字母数字长串（常见 23–24 位）；shelf API 偶发的纯数字短 id（如 `3300215708`）不能打开阅读器，抓取时应丢弃。
 - **shelf API**：书架页加载时浏览器请求的接口，返回书籍列表 JSON（含 bookId / title / author / cover）。页面禁用 F12 开发者模式，但 Playwright 通过 CDP 的 `page.evaluate` / `page.on("response")` 不受影响——是作者字段的可靠来源。
 - **作者补全（author enrich）**：公版书等字母数字 book_id 在 shelf API/列表 DOM 常无 author；列表合并后对空 author 逐本打开 reader 详情补全，已有作者跳过，相邻间隔由 `SLEEP_BOOK_DETAIL_INTERVAL` 控制。

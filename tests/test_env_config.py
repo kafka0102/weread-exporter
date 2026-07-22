@@ -77,13 +77,14 @@ class TestEnvConfig(unittest.TestCase):
         self.assertIsInstance(env_config.BOOKS_DIR, Path)
         self.assertFalse(str(env_config.BOOKS_DIR).startswith("~"))
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_reader_viewport_defaults(self):
         self.assertGreaterEqual(env_config.READER_VIEWPORT_WIDTH, 360)
         self.assertGreaterEqual(env_config.READER_VIEWPORT_HEIGHT, 480)
-        # 代码默认偏窄以强制单页
-        self.assertEqual(env_config.env_int("READER_VIEWPORT_WIDTH_UNSET_X", 800), 800)
+        self.assertFalse(env_config.READER_FORCE_SINGLE_PAGE)
+        # 代码默认使用桌面宽度，避免微信读书进入窄屏排版
+        self.assertEqual(env_config.env_int("READER_VIEWPORT_WIDTH_UNSET_X", 1200), 1200)
         self.assertEqual(env_config.env_int("READER_VIEWPORT_HEIGHT_UNSET_X", 900), 900)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -31,6 +31,7 @@ from book_json import (
 )
 from env_config import (
     BOOKS_DIR,
+    READER_FORCE_SINGLE_PAGE,
     READER_VIEWPORT_HEIGHT,
     READER_VIEWPORT_WIDTH,
     SLEEP_BOOK_INTERVAL,
@@ -74,10 +75,10 @@ def format_elapsed(seconds):
 DEFAULT_NEW_BOOKS = Path("data") / "new_books.txt"
 
 
-def reader_viewport():
-    """导出用阅读器视口。默认偏窄以强制单页（避免双页左右 canvas）。"""
-    w = max(360, int(READER_VIEWPORT_WIDTH or 800))
-    h = max(480, int(READER_VIEWPORT_HEIGHT or 900))
+def reader_viewport(width=None, height=None):
+    """导出用阅读器视口。默认使用桌面宽度，避免微信读书进入窄屏排版。"""
+    w = max(360, int(width if width is not None else (READER_VIEWPORT_WIDTH or 1200)))
+    h = max(480, int(height if height is not None else (READER_VIEWPORT_HEIGHT or 900)))
     return {"width": w, "height": h}
 
 
@@ -96,8 +97,8 @@ async def count_reader_canvases(page):
     )
 
 
-async def ensure_single_page_reader(page, viewport):
-    """若检测到双页布局，逐步收窄视口并刷新，尽量落到单页。
+async def ensure_reader_layout(page, viewport, *, force_single_page=False):
+    """记录阅读器布局；必要时逐步收窄视口，尽量落到单页。
 
     微信读书 web 在宽视口下会并排渲染左右两页（两个 canvas）。
     返回实际采用的 viewport。
@@ -107,6 +108,10 @@ async def ensure_single_page_reader(page, viewport):
     if n <= 1:
         if n == 1:
             print("  📄 阅读布局: 单页")
+        return vp
+
+    if not force_single_page:
+        print(f"  📖 阅读布局: 双页（canvas={n}），保持桌面排版并按 canvas 拆页")
         return vp
 
     print(f"  ⚠️  检测到双页布局（canvas={n}），尝试收窄视口强制单页…")
@@ -559,12 +564,14 @@ def save_chapter(ch_title, blocks, ch_idx, md_dir, raw_dir):
 
 
 async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
-                      goto_first=False, catalog_path=None, headless=False):
+                      goto_first=False, catalog_path=None, headless=False,
+                      reader_width=None, reader_height=None,
+                      force_single_page=None):
     reached_end = False
     catalog_titles = load_catalog_titles(catalog_path) if catalog_path else []
     last_cat_title = catalog_titles[-1] if catalog_titles else ""
     async with async_playwright() as p:
-        viewport = reader_viewport()
+        viewport = reader_viewport(reader_width, reader_height)
         ctx = await launch_weread_context(
             p, headless=headless, viewport=viewport)
         if not await ensure_logged_in(
@@ -590,7 +597,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 "请去掉 --headless 扫码登录后再试。"
             )
 
-        viewport = await ensure_single_page_reader(page, viewport)
+        if force_single_page is None:
+            force_single_page = READER_FORCE_SINGLE_PAGE
+        viewport = await ensure_reader_layout(
+            page, viewport, force_single_page=force_single_page)
         fx, fy = viewport_focus_point(viewport)
 
         book_title, book_author = await fetch_book_title(page)
@@ -812,6 +822,9 @@ async def export_one_book(
     shelf_title="",
     shelf_author="",
     headless=False,
+    reader_width=None,
+    reader_height=None,
+    force_single_page=None,
 ):
     """导出单本：中间产物写 output/<id>，成功后写 out_dir JSON。
 
@@ -854,7 +867,9 @@ async def export_one_book(
         goto_first = (session == 1 and last_idx == 0)
         title, author, added, chars_added, end_idx, reached_end = await run_session(
             book_id, md_dir, raw_dir, start_idx, seen_imgs,
-            goto_first=goto_first, catalog_path=catalog_path, headless=headless)
+            goto_first=goto_first, catalog_path=catalog_path, headless=headless,
+            reader_width=reader_width, reader_height=reader_height,
+            force_single_page=force_single_page)
         if title:
             book_title = title
         if author:
@@ -915,6 +930,9 @@ async def export_batch(
     download_images=False,
     book_interval=None,
     headless=False,
+    reader_width=None,
+    reader_height=None,
+    force_single_page=None,
 ):
     """批量导出 new_books：跳过已存在；失败即停。"""
     out_dir = Path(out_dir)
@@ -940,6 +958,9 @@ async def export_batch(
             shelf_title=title,
             shelf_author=author,
             headless=headless,
+            reader_width=reader_width,
+            reader_height=reader_height,
+            force_single_page=force_single_page,
         )
         if status == "ok" and i < len(pending) - 1:
             print(f"  书间等待 {interval:.0f}s ...")
@@ -983,6 +1004,27 @@ def parse_args(argv=None):
         action="store_true",
         help="无头模式（仅当 cache/browser_profile 已有登录信息时生效；否则回退有头）",
     )
+    parser.add_argument(
+        "--reader-width",
+        type=int,
+        default=None,
+        help=f"临时覆盖阅读器视口宽度（默认 .env READER_VIEWPORT_WIDTH={READER_VIEWPORT_WIDTH}）",
+    )
+    parser.add_argument(
+        "--reader-height",
+        type=int,
+        default=None,
+        help=f"临时覆盖阅读器视口高度（默认 .env READER_VIEWPORT_HEIGHT={READER_VIEWPORT_HEIGHT}）",
+    )
+    parser.add_argument(
+        "--force-single-page",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "双页布局时是否收窄视口强制单页；默认读取 "
+            f".env READER_FORCE_SINGLE_PAGE={int(bool(READER_FORCE_SINGLE_PAGE))}"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1000,6 +1042,11 @@ async def async_main(argv=None):
     headless = resolve_headless(args.headless)
     if args.headless and headless:
         print("  🕶️  无头模式已启用（检测到 cache 登录信息）")
+    force_single_page = (
+        READER_FORCE_SINGLE_PAGE
+        if args.force_single_page is None
+        else bool(args.force_single_page)
+    )
     if args.book:
         book_id = resolve_book_id(args.book)
         print(f"  Book ID: {book_id}")
@@ -1009,6 +1056,9 @@ async def async_main(argv=None):
             force=args.force,
             download_images=args.download_images,
             headless=headless,
+            reader_width=args.reader_width,
+            reader_height=args.reader_height,
+            force_single_page=force_single_page,
         )
         if status == "skipped":
             return 0
@@ -1020,6 +1070,9 @@ async def async_main(argv=None):
         force=args.force,
         download_images=args.download_images,
         headless=headless,
+        reader_width=args.reader_width,
+        reader_height=args.reader_height,
+        force_single_page=force_single_page,
     )
     return 0
 

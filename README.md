@@ -8,7 +8,7 @@
 
 1. **Playwright 自动化** — 启动 Chromium，持久化登录会话（扫码一次，后续自动复用）
 2. **Canvas fillText Hook** — 注入钩子拦截所有 `CanvasRenderingContext2D.fillText()` 调用，捕获每个字符的 (x, y) 坐标
-3. **强制单页** — 阅读器默认用较窄视口（`READER_VIEWPORT_WIDTH=800`）打开，避免宽屏双页（左右两个 canvas）；若仍检出双页会继续收窄并刷新
+3. **桌面排版优先** — 阅读器默认用桌面视口（`READER_VIEWPORT_WIDTH=1200`）打开，尽量贴近手动浏览器的章节边界；如需旧版单页策略，可开启 `READER_FORCE_SINGLE_PAGE=1` 或使用 `--force-single-page`
 4. **Canvas 按页归组** — `fillText` 坐标是 canvas 局部坐标；若仍出现多 canvas，按屏幕 left 拆页后再分行，防止左右页同 y 交错乱码
 5. **视口图片捕获** — 每页只取当前视口内可见的 `img[class*="wr_readerImage"]`（用 `getBoundingClientRect` 过滤掉预加载的下一页/下一章图片），解决图片归属偏移
 6. **图文交错** — 把文字行和图片按屏幕 y 坐标排序，图片精确落在对应段落之间、正确章节里
@@ -37,6 +37,12 @@ python export_precise.py d31323b0813abaf26g0137c2
 # 单本强制重导（默认若 ~/data/weixin/books 已有同 id 的 json 则跳过）
 python export_precise.py d31323b0813abaf26g0137c2 --force
 
+# 临时调整阅读器视口；默认从 .env 读取 READER_VIEWPORT_WIDTH/HEIGHT
+python export_precise.py d31323b0813abaf26g0137c2 --reader-width 1280 --reader-height 900
+
+# 需要强制单页时才收窄视口（也可在 .env 设置 READER_FORCE_SINGLE_PAGE=1）
+python export_precise.py d31323b0813abaf26g0137c2 --force-single-page
+
 # 需要插图时再下载（默认不下载图片）
 python export_precise.py d31323b0813abaf26g0137c2 --download-images
 
@@ -54,6 +60,7 @@ python export_precise.py d31323b0813abaf26g0137c2 --headless
 
 - 首次运行会弹出浏览器要求扫码登录，会话自动保存在 `cache/browser_profile/`，后续复用
 - `--headless`：cache 有登录痕迹才启用无头；无头下若出现登录页会报错并立即终止（需去掉 `--headless` 重新扫码）
+- 阅读器默认使用桌面宽度，检测到双页时按 canvas 拆页抓取；`--force-single-page` / `--no-force-single-page` 可临时覆盖 `.env` 的 `READER_FORCE_SINGLE_PAGE`
 - 自动跳到全书开头（原生点击目录首项），逐页翻到全书末尾自动停止
 - **自动续传**：中途卡住会重开浏览器，从上次章节继续；中间产物在 `output/<book_id>/`
 - **全书成功后**才写入 `~/data/weixin/books/<book_id>_<书名>.json`（字段对齐 dedao/json：纯文本 content、`has_content`、空元数据键；可用 `BOOKS_DIR` / `--out-dir` 覆盖）
@@ -180,7 +187,7 @@ asyncio.run(main())
 export_precise.py:
   浏览器登录 → 原生点击目录首项跳到开头 → 键盘 ArrowRight 逐页翻
     → 每页: Canvas Hook 捕获文字 + 视口内图片 URL
-    → 单页优先（窄视口）→ 按 canvas 分行/拆页 → 文字/图片按 y 交错 → 按章节切分输出 md
+    → 桌面排版优先（可选强制单页）→ 按 canvas 分行/拆页 → 文字/图片按 y 交错 → 按章节切分输出 md
     → 翻到目录最后一章自动停止
 
 download_images.py:

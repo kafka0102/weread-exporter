@@ -48,14 +48,15 @@
 - 相邻两本详情之间必须间隔 `SLEEP_BOOK_DETAIL_INTERVAL`（默认 5 秒），避免过快连点。
 - 用户可用 `python fetch_shelf.py --no-enrich-author` 跳过补全；用 `--author-interval` 临时覆盖间隔。
 
-### 阅读器视口（强制单页）
+### 阅读器视口
 
 | 变量 | 默认 | 使用位置 | 含义 |
 |------|------|----------|------|
-| `READER_VIEWPORT_WIDTH` | **800** | `export_precise.py` | 阅读器视口宽；过宽会触发双页 |
+| `READER_VIEWPORT_WIDTH` | **1200** | `export_precise.py` | 阅读器视口宽；默认贴近桌面浏览器排版 |
 | `READER_VIEWPORT_HEIGHT` | 900 | `export_precise.py` | 阅读器视口高 |
+| `READER_FORCE_SINGLE_PAGE` | 0 | `export_precise.py` | 检测到双页时是否自动收窄视口强制单页 |
 
-导出打开阅读器后若仍检测到 ≥2 个正文 canvas，会逐步把宽度收到 720/640/560/480 并刷新，尽量落到单页。
+默认保持桌面宽度；若检测到 ≥2 个正文 canvas，按 canvas 位置拆页抓取。只有 `READER_FORCE_SINGLE_PAGE=1` 或 CLI `--force-single-page` 时，才会逐步把宽度收到 720/640/560/480 并刷新，尽量落到单页。
 
 ### 实现入口
 

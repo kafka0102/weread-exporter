@@ -84,10 +84,11 @@ load_dotenv()
 DEFAULT_BOOKS_DIR_RAW = "~/data/weixin/books"
 BOOKS_DIR = env_path("BOOKS_DIR", DEFAULT_BOOKS_DIR_RAW)
 
-# 阅读器视口：过宽会触发微信读书「双页」布局（左右各一 canvas）。
-# 导出默认收窄为单页，避免双页交错；可用环境变量覆盖。
-READER_VIEWPORT_WIDTH = env_int("READER_VIEWPORT_WIDTH", 800)
+# 阅读器视口：默认使用桌面宽度，尽量贴近手动浏览器排版。
+# 若需要旧版单页策略，可开启 READER_FORCE_SINGLE_PAGE。
+READER_VIEWPORT_WIDTH = env_int("READER_VIEWPORT_WIDTH", 1200)
 READER_VIEWPORT_HEIGHT = env_int("READER_VIEWPORT_HEIGHT", 900)
+READER_FORCE_SINGLE_PAGE = env_bool("READER_FORCE_SINGLE_PAGE", False)
 
 # --- 网页操作 sleep（秒）---
 # 命名约定：SLEEP_<场景>_<动作>
@@ -126,4 +127,3 @@ SLEEP_BOOK_INTERVAL = env_float("SLEEP_BOOK_INTERVAL", 60.0)
 SLEEP_CHAPTER_PER_1K_CHARS = env_float("SLEEP_CHAPTER_PER_1K_CHARS", 1.0)
 SLEEP_CHAPTER_MIN = env_float("SLEEP_CHAPTER_MIN", 1.0)
 SLEEP_CHAPTER_MAX = env_float("SLEEP_CHAPTER_MAX", 3.0)
-
