@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+from pathlib import Path
 from typing import Any, Optional
 
 import env_config  # noqa: F401  # 导入即加载 .env
@@ -32,6 +34,44 @@ def ensure_profile_dir(user_data_dir: str = USER_DATA_DIR) -> str:
     return user_data_dir
 
 
+# Chromium 崩溃后可能残留；有头模式 + 损坏的 Sync Data 会直接 SIGTRAP。
+_PROFILE_SINGLETON_NAMES = (
+    "SingletonLock",
+    "SingletonCookie",
+    "SingletonSocket",
+    "RunningChromeVersion",
+)
+
+
+def prepare_browser_profile(user_data_dir: str = USER_DATA_DIR) -> str:
+    """启动前清理 profile 中会导致 Chromium 立刻崩溃/锁死的残留。
+
+    - 清除 Singleton* / RunningChromeVersion（上次异常退出残留）
+    - 移除 Default/Sync Data（本仓库自动化 profile 不需要 Chrome Sync；
+      损坏时会在 headful launch_persistent_context 时 SIGTRAP）
+    """
+    root = Path(ensure_profile_dir(user_data_dir))
+    for name in _PROFILE_SINGLETON_NAMES:
+        path = root / name
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+    sync_data = root / "Default" / "Sync Data"
+    try:
+        if sync_data.is_dir():
+            shutil.rmtree(sync_data, ignore_errors=True)
+        elif sync_data.exists() or sync_data.is_symlink():
+            sync_data.unlink()
+    except OSError:
+        pass
+    return str(root)
+
+
 async def launch_weread_context(
     playwright: Any,
     *,
@@ -44,7 +84,7 @@ async def launch_weread_context(
 
     调用方负责关闭 context，并管理 async_playwright 生命周期。
     """
-    ensure_profile_dir(user_data_dir)
+    prepare_browser_profile(user_data_dir)
     launch_kwargs = {
         "headless": headless,
         "viewport": viewport or DEFAULT_VIEWPORT,

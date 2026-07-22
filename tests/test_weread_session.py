@@ -6,6 +6,7 @@ from unittest import mock
 from weread_session import (
     has_cached_login_profile,
     is_login_url,
+    prepare_browser_profile,
     resolve_headless,
 )
 
@@ -73,6 +74,32 @@ class TestResolveHeadless(unittest.TestCase):
             cookies.parent.mkdir(parents=True)
             cookies.write_bytes(b"x")
             self.assertTrue(resolve_headless(True, user_data_dir=td, announce=False))
+
+
+
+class TestPrepareBrowserProfile(unittest.TestCase):
+    def test_creates_dir_and_clears_singleton_and_sync(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "SingletonLock").symlink_to("dead-pid")
+            (root / "RunningChromeVersion").write_text("x")
+            sync = root / "Default" / "Sync Data"
+            sync.mkdir(parents=True)
+            (sync / "LevelDB").write_text("junk")
+
+            out = prepare_browser_profile(str(root))
+            self.assertEqual(out, str(root))
+            self.assertTrue(root.is_dir())
+            self.assertFalse((root / "SingletonLock").exists())
+            self.assertFalse((root / "RunningChromeVersion").exists())
+            self.assertFalse(sync.exists())
+
+    def test_missing_optional_paths_ok(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = prepare_browser_profile(td)
+            self.assertEqual(out, td)
+            self.assertTrue(Path(td).is_dir())
+
 
 
 if __name__ == "__main__":
