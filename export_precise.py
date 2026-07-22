@@ -31,6 +31,8 @@ from book_json import (
 )
 from env_config import (
     BOOKS_DIR,
+    READER_VIEWPORT_HEIGHT,
+    READER_VIEWPORT_WIDTH,
     SLEEP_BOOK_INTERVAL,
     SLEEP_CHAPTER_MAX,
     SLEEP_CHAPTER_MIN,
@@ -70,6 +72,63 @@ def format_elapsed(seconds):
     return f"{minutes:.1f} 分钟"
 
 DEFAULT_NEW_BOOKS = Path("data") / "new_books.txt"
+
+
+def reader_viewport():
+    """导出用阅读器视口。默认偏窄以强制单页（避免双页左右 canvas）。"""
+    w = max(360, int(READER_VIEWPORT_WIDTH or 800))
+    h = max(480, int(READER_VIEWPORT_HEIGHT or 900))
+    return {"width": w, "height": h}
+
+
+def viewport_focus_point(viewport=None):
+    """点击聚焦阅读器内容区的坐标（视口中心略偏上）。"""
+    vp = viewport or reader_viewport()
+    return int(vp["width"] * 0.5), int(vp["height"] * 0.45)
+
+
+async def count_reader_canvases(page):
+    """可见正文 canvas 数量（高度足够的才算阅读页）。"""
+    return await page.evaluate(
+        """() => Array.from(document.querySelectorAll('canvas'))
+            .map(c => c.getBoundingClientRect())
+            .filter(r => r.height > 300 && r.width > 100).length"""
+    )
+
+
+async def ensure_single_page_reader(page, viewport):
+    """若检测到双页布局，逐步收窄视口并刷新，尽量落到单页。
+
+    微信读书 web 在宽视口下会并排渲染左右两页（两个 canvas）。
+    返回实际采用的 viewport。
+    """
+    vp = dict(viewport)
+    n = await count_reader_canvases(page)
+    if n <= 1:
+        if n == 1:
+            print("  📄 阅读布局: 单页")
+        return vp
+
+    print(f"  ⚠️  检测到双页布局（canvas={n}），尝试收窄视口强制单页…")
+    for w in (720, 640, 560, 480):
+        if w >= int(vp.get("width") or 0):
+            continue
+        vp = {"width": w, "height": int(vp.get("height") or 900)}
+        await page.set_viewport_size(vp)
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            print(f"    reload 异常: {e}")
+        await asyncio.sleep(SLEEP_READER_AFTER_LOAD)
+        n = await count_reader_canvases(page)
+        print(f"    视口 {w}x{vp['height']} → canvas={n}")
+        if n <= 1:
+            print("  📄 阅读布局: 单页")
+            return vp
+
+    print(f"  ⚠️  仍为双页（canvas={n}），将依赖按 canvas 拆页兜底")
+    return vp
+
 
 CANVAS_HOOK = r"""
 (function() {
@@ -505,8 +564,9 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
     catalog_titles = load_catalog_titles(catalog_path) if catalog_path else []
     last_cat_title = catalog_titles[-1] if catalog_titles else ""
     async with async_playwright() as p:
+        viewport = reader_viewport()
         ctx = await launch_weread_context(
-            p, headless=headless, viewport={"width": 1200, "height": 900})
+            p, headless=headless, viewport=viewport)
         if not await ensure_logged_in(
                 ctx, allow_interactive_login=not headless):
             await ctx.close()
@@ -530,13 +590,16 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 "请去掉 --headless 扫码登录后再试。"
             )
 
+        viewport = await ensure_single_page_reader(page, viewport)
+        fx, fy = viewport_focus_point(viewport)
+
         book_title, book_author = await fetch_book_title(page)
         if goto_first:
             await goto_first_chapter(page, catalog_path)
             catalog_titles = load_catalog_titles(catalog_path) if catalog_path else catalog_titles
             last_cat_title = catalog_titles[-1] if catalog_titles else ""
 
-        await page.mouse.click(600, 450)
+        await page.mouse.click(fx, fy)
         await asyncio.sleep(SLEEP_READER_AFTER_HOOK)
 
         current_chapter = await _title(page)
@@ -631,7 +694,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
 
         while not reached_end:
             await page.evaluate("() => window.__wr_reset()")
-            await page.mouse.click(600, 450)
+            await page.mouse.click(fx, fy)
             await page.keyboard.press("ArrowRight")
             await asyncio.sleep(SLEEP_READER_PAGE_TURN)
             await wait_stable(page, 0)

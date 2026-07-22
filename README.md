@@ -8,10 +8,11 @@
 
 1. **Playwright 自动化** — 启动 Chromium，持久化登录会话（扫码一次，后续自动复用）
 2. **Canvas fillText Hook** — 注入钩子拦截所有 `CanvasRenderingContext2D.fillText()` 调用，捕获每个字符的 (x, y) 坐标
-3. **双页拆分** — 微信读书在同一 Canvas 同时渲染当前页与下一页，通过检测 y 坐标重置点分离两页
-4. **视口图片捕获** — 每页只取当前视口内可见的 `img[class*="wr_readerImage"]`（用 `getBoundingClientRect` 过滤掉预加载的下一页/下一章图片），解决图片归属偏移
-5. **图文交错** — 把文字行和图片按屏幕 y 坐标排序，图片精确落在对应段落之间、正确章节里
-6. **格式清理** — 合并 Canvas 渲染断行，还原自然段落
+3. **强制单页** — 阅读器默认用较窄视口（`READER_VIEWPORT_WIDTH=800`）打开，避免宽屏双页（左右两个 canvas）；若仍检出双页会继续收窄并刷新
+4. **Canvas 按页归组** — `fillText` 坐标是 canvas 局部坐标；若仍出现多 canvas，按屏幕 left 拆页后再分行，防止左右页同 y 交错乱码
+5. **视口图片捕获** — 每页只取当前视口内可见的 `img[class*="wr_readerImage"]`（用 `getBoundingClientRect` 过滤掉预加载的下一页/下一章图片），解决图片归属偏移
+6. **图文交错** — 把文字行和图片按屏幕 y 坐标排序，图片精确落在对应段落之间、正确章节里
+7. **格式清理** — 合并 Canvas 渲染断行，还原自然段落；词牌/短标题不与正文粘连
 
 ## 安装
 
@@ -179,7 +180,7 @@ asyncio.run(main())
 export_precise.py:
   浏览器登录 → 原生点击目录首项跳到开头 → 键盘 ArrowRight 逐页翻
     → 每页: Canvas Hook 捕获文字 + 视口内图片 URL
-    → 双页拆分 → 文字/图片按 y 坐标交错 → 按章节切分输出 md
+    → 单页优先（窄视口）→ 按 canvas 分行/拆页 → 文字/图片按 y 交错 → 按章节切分输出 md
     → 翻到目录最后一章自动停止
 
 download_images.py:

@@ -84,6 +84,11 @@ load_dotenv()
 DEFAULT_BOOKS_DIR_RAW = "~/data/weixin/books"
 BOOKS_DIR = env_path("BOOKS_DIR", DEFAULT_BOOKS_DIR_RAW)
 
+# 阅读器视口：过宽会触发微信读书「双页」布局（左右各一 canvas）。
+# 导出默认收窄为单页，避免双页交错；可用环境变量覆盖。
+READER_VIEWPORT_WIDTH = env_int("READER_VIEWPORT_WIDTH", 800)
+READER_VIEWPORT_HEIGHT = env_int("READER_VIEWPORT_HEIGHT", 900)
+
 # --- 网页操作 sleep（秒）---
 # 命名约定：SLEEP_<场景>_<动作>
 

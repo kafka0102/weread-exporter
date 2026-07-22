@@ -143,3 +143,12 @@ class TestExportPreciseCli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_reader_viewport_helper(self):
+        vp = export_precise.reader_viewport()
+        self.assertIn("width", vp)
+        self.assertIn("height", vp)
+        self.assertLessEqual(vp["width"], 1000)  # 默认应偏窄，避免双页
+        x, y = export_precise.viewport_focus_point(vp)
+        self.assertGreater(x, 0)
+        self.assertGreater(y, 0)

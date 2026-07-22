@@ -80,3 +80,10 @@ class TestEnvConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_reader_viewport_defaults(self):
+        self.assertGreaterEqual(env_config.READER_VIEWPORT_WIDTH, 360)
+        self.assertGreaterEqual(env_config.READER_VIEWPORT_HEIGHT, 480)
+        # 代码默认偏窄以强制单页
+        self.assertEqual(env_config.env_int("READER_VIEWPORT_WIDTH_UNSET_X", 800), 800)
+        self.assertEqual(env_config.env_int("READER_VIEWPORT_HEIGHT_UNSET_X", 900), 900)
