@@ -183,6 +183,52 @@ class TestExportPreciseCli(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_turn_reader_page_focuses_without_clicking_content(self):
+        async def run():
+            page = mock.AsyncMock()
+
+            await export_precise.turn_reader_page(page)
+
+            page.evaluate.assert_awaited_once()
+            page.keyboard.press.assert_awaited_once_with("ArrowRight")
+            page.mouse.click.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_close_reader_catalog_does_nothing_when_already_hidden(self):
+        async def run():
+            page = mock.Mock()
+            page.keyboard.press = mock.AsyncMock()
+            page.click = mock.AsyncMock()
+            catalog = mock.Mock()
+            catalog.is_visible = mock.AsyncMock(return_value=False)
+            page.locator.return_value = catalog
+
+            closed = await export_precise.close_reader_catalog(page)
+
+            self.assertFalse(closed)
+            page.keyboard.press.assert_not_called()
+            page.click.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_close_reader_catalog_uses_escape_when_still_visible(self):
+        async def run():
+            page = mock.Mock()
+            page.keyboard.press = mock.AsyncMock()
+            page.click = mock.AsyncMock()
+            catalog = mock.Mock()
+            catalog.is_visible = mock.AsyncMock(return_value=True)
+            page.locator.return_value = catalog
+
+            closed = await export_precise.close_reader_catalog(page)
+
+            self.assertTrue(closed)
+            page.keyboard.press.assert_awaited_once_with("Escape")
+            page.click.assert_not_called()
+
+        asyncio.run(run())
+
     def test_reader_layout_keeps_desktop_width_unless_forced(self):
         async def run():
             page = mock.AsyncMock()

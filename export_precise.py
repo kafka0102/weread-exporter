@@ -104,6 +104,30 @@ async def page_viewport(page, fallback=None):
     return fb
 
 
+async def focus_reader_for_keyboard(page):
+    """把键盘焦点交给页面主体，不点击正文或图片。"""
+    return await page.evaluate(
+        """() => {
+            const active = document.activeElement;
+            if (active && active !== document.body && typeof active.blur === 'function') {
+                active.blur();
+            }
+            if (!document.body) return '';
+            const hadTabIndex = document.body.hasAttribute('tabindex');
+            if (!hadTabIndex) document.body.setAttribute('tabindex', '-1');
+            document.body.focus({preventScroll: true});
+            if (!hadTabIndex) document.body.removeAttribute('tabindex');
+            return document.activeElement?.tagName || '';
+        }"""
+    )
+
+
+async def turn_reader_page(page):
+    """聚焦阅读器并发送翻页键，全程不点击正文内容。"""
+    await focus_reader_for_keyboard(page)
+    await page.keyboard.press("ArrowRight")
+
+
 async def count_reader_canvases(page):
     """可见正文 canvas 数量（高度足够的才算阅读页）。"""
     return await page.evaluate(
@@ -537,6 +561,15 @@ async def fetch_book_title(page):
     return info.get("title", "未知"), info.get("author", "")
 
 
+async def close_reader_catalog(page):
+    """仅在目录仍可见时关闭，避免选章后再次把目录打开。"""
+    catalog = page.locator(".readerCatalog")
+    if not await catalog.is_visible():
+        return False
+    await page.keyboard.press("Escape")
+    return True
+
+
 async def goto_first_chapter(page, catalog_path=None):
     first_title = ""
     try:
@@ -556,10 +589,7 @@ async def goto_first_chapter(page, catalog_path=None):
         first_title = (await item.text_content() or "").strip()
         await item.click(timeout=4000)
         await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
-        try:
-            await page.click("button.readerControls_item.catalog", timeout=2000)
-        except Exception:
-            await page.keyboard.press("Escape")
+        await close_reader_catalog(page)
         await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
     except Exception as e:
         print(f"  ⚠️  目录跳转异常: {e}")
@@ -624,7 +654,6 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             force_single_page = READER_FORCE_SINGLE_PAGE
         viewport = await ensure_reader_layout(
             page, viewport, force_single_page=force_single_page)
-        fx, fy = viewport_focus_point(viewport)
 
         book_title, book_author = await fetch_book_title(page)
         if goto_first:
@@ -632,7 +661,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             catalog_titles = load_catalog_titles(catalog_path) if catalog_path else catalog_titles
             last_cat_title = catalog_titles[-1] if catalog_titles else ""
 
-        await page.mouse.click(fx, fy)
+        await focus_reader_for_keyboard(page)
         await asyncio.sleep(SLEEP_READER_AFTER_HOOK)
 
         current_chapter = await _title(page)
@@ -727,8 +756,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
 
         while not reached_end:
             await page.evaluate("() => window.__wr_reset()")
-            await page.mouse.click(fx, fy)
-            await page.keyboard.press("ArrowRight")
+            await turn_reader_page(page)
             await asyncio.sleep(SLEEP_READER_PAGE_TURN)
             await wait_stable(page, 0)
 
