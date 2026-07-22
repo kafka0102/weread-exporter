@@ -43,7 +43,7 @@ python export_precise.py d31323b0813abaf26g0137c2 --download-images
 python export_precise.py d31323b0813abaf26g0137c2 --out-dir ~/data/weixin/books
 
 # 批量：不传 book_id，读取 data/new_books.txt 中尚未导出的书
-# 书与书默认间隔 60s（SLEEP_BOOK_INTERVAL）；任一本失败则停止
+# 书与书默认间隔 180s / 3 分钟（SLEEP_BOOK_INTERVAL）；任一本失败则停止
 python export_precise.py
 python export_precise.py --list data/new_books.txt
 ```

@@ -38,6 +38,17 @@ class TestExportPreciseCli(unittest.TestCase):
         )
         self.assertEqual(export_precise.resolve_book_id("xyz"), "xyz")
 
+
+    def test_format_elapsed(self):
+        self.assertEqual(export_precise.format_elapsed(0), "0 秒")
+        self.assertEqual(export_precise.format_elapsed(45), "45 秒")
+        self.assertEqual(export_precise.format_elapsed(45.2), "45.2 秒")
+        self.assertEqual(export_precise.format_elapsed(59.9), "59.9 秒")
+        self.assertEqual(export_precise.format_elapsed(60), "1 分钟")
+        self.assertEqual(export_precise.format_elapsed(90), "1.5 分钟")
+        self.assertEqual(export_precise.format_elapsed(180), "3 分钟")
+        self.assertEqual(export_precise.format_elapsed(125), "2.1 分钟")
+
     def test_export_one_skips_existing_without_force(self):
         async def run():
             with tempfile.TemporaryDirectory() as td:

@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -48,6 +49,20 @@ from env_config import (
 from weread_session import USER_DATA_DIR, ensure_logged_in, launch_weread_context
 
 DEFAULT_BOOKS_DIR = BOOKS_DIR
+
+
+def format_elapsed(seconds):
+    """把耗时格式化为秒或分钟（>=60 秒用分钟）。"""
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        if abs(seconds - round(seconds)) < 0.05:
+            return f"{int(round(seconds))} 秒"
+        return f"{seconds:.1f} 秒"
+    minutes = seconds / 60.0
+    if abs(minutes - round(minutes)) < 0.05:
+        return f"{int(round(minutes))} 分钟"
+    return f"{minutes:.1f} 分钟"
+
 DEFAULT_NEW_BOOKS = Path("data") / "new_books.txt"
 
 CANVAS_HOOK = """
@@ -498,6 +513,7 @@ async def export_one_book(
     print("=" * 60)
     print("  weread-exporter — 精确图文导出 v3 + JSON")
     print("=" * 60)
+    started_at = time.monotonic()
     os.makedirs(USER_DATA_DIR, exist_ok=True)
     book_dir = os.path.join("output", book_id)
     md_dir = os.path.join(book_dir, "chapters")
@@ -566,9 +582,12 @@ async def export_one_book(
     json_path, book = finalize_book_json(
         book_id, book_title, book_author, book_dir, out_dir)
     img_count = len([f for f in os.listdir(img_dir) if not f.startswith(".")]) if os.path.isdir(img_dir) else 0
+    elapsed = time.monotonic() - started_at
+    word_count = int(book.get("word_count") or 0)
     print(f"\n{'=' * 60}")
     print(f"  ✅ 全书导出完成!  📖 {book_title} — {book_author}")
-    print(f"  📄 {len(total_files)} 章, word_count={book['word_count']},  🖼 {img_count} 张图")
+    print(f"  📄 {len(total_files)} 章, word_count={word_count},  🖼 {img_count} 张图")
+    print(f"  📝 共 {word_count:,} 字，耗时 {format_elapsed(elapsed)}")
     print(f"  📦 md: {merged}")
     print(f"  📦 json: {json_path}")
     print(f"{'=' * 60}")

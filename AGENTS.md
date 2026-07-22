@@ -36,7 +36,7 @@
 | `SLEEP_READER_PAGE_RENDER` | 0.3 | `export_precise.py` | 抓取当前页前的短等待 |
 | `SLEEP_READER_REOPEN` | 3 | `export_precise.py` | 会话重开前等待 |
 | `SLEEP_READER_STABLE_POLL` | 0.5 | `export_precise.py` | 等待 Canvas 渲染稳定的轮询间隔 |
-| `SLEEP_BOOK_INTERVAL` | **60** | `export_precise.py` | 批量导出相邻两本书之间的间隔 |
+| `SLEEP_BOOK_INTERVAL` | **180** | `export_precise.py` | 批量导出相邻两本书之间的间隔 |
 | `SLEEP_CHAPTER_PER_1K_CHARS` | 2 | `export_precise.py` | 章完成后每千字等待秒数 |
 | `SLEEP_CHAPTER_MIN` | 2 | `export_precise.py` | 章间动态等待下限 |
 | `SLEEP_CHAPTER_MAX` | 15 | `export_precise.py` | 章间动态等待上限 |
