@@ -60,7 +60,7 @@ class TestEnvConfig(unittest.TestCase):
         # 代码默认值（不依赖当前 .env 是否被改过）
         self.assertEqual(env_config.env_float("SLEEP_BOOK_DETAIL_INTERVAL_UNSET_X", 5.0), 5.0)
         self.assertEqual(env_config.SLEEP_BOOK_INTERVAL, 60.0)
-        self.assertEqual(env_config.SLEEP_CHAPTER_PER_1K_CHARS, 2.0)
+        self.assertEqual(env_config.SLEEP_CHAPTER_PER_1K_CHARS, 1.0)
         self.assertEqual(env_config.SLEEP_CHAPTER_MIN, 1.0)
         self.assertEqual(env_config.SLEEP_CHAPTER_MAX, 8.0)
 
