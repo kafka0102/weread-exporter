@@ -52,7 +52,7 @@ python export_precise.py --list data/new_books.txt
 - 自动跳到全书开头（原生点击目录首项），逐页翻到全书末尾自动停止
 - **自动续传**：中途卡住会重开浏览器，从上次章节继续；中间产物在 `output/<book_id>/`
 - **全书成功后**才写入 `~/data/weixin/books/<book_id>_<书名>.json`（字段对齐 dedao/json：纯文本 content、`has_content`、空元数据键；可用 `BOOKS_DIR` / `--out-dir` 覆盖）
-- 章切换后按该章字数动态等待：`ceil(字数/1000)*SLEEP_CHAPTER_PER_1K_CHARS`，夹在 `SLEEP_CHAPTER_MIN`–`SLEEP_CHAPTER_MAX`（默认 1–8 秒）
+- 章切换后按该章字数动态等待：`ceil(字数/1000)*SLEEP_CHAPTER_PER_1K_CHARS`，夹在 `SLEEP_CHAPTER_MIN`–`SLEEP_CHAPTER_MAX`（默认 1–3 秒）
 - 默认不下载图片；需要时加 `--download-images`。正文 md 中间产物仍可含 `images/` 相对路径引用
 
 ### 2. 下载图片

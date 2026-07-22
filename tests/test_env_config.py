@@ -62,7 +62,7 @@ class TestEnvConfig(unittest.TestCase):
         self.assertEqual(env_config.SLEEP_BOOK_INTERVAL, 60.0)
         self.assertEqual(env_config.SLEEP_CHAPTER_PER_1K_CHARS, 1.0)
         self.assertEqual(env_config.SLEEP_CHAPTER_MIN, 1.0)
-        self.assertEqual(env_config.SLEEP_CHAPTER_MAX, 8.0)
+        self.assertEqual(env_config.SLEEP_CHAPTER_MAX, 3.0)
 
 
     def test_env_path_and_books_dir(self):
