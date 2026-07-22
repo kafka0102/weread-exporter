@@ -70,10 +70,7 @@ python download_images.py d31323b0813abaf26g0137c2
 ### 3. 抓取书架书籍列表
 
 ```bash
-# 首次：复制环境变量模板（网页操作 sleep 均可在此调整）
-cp .env.example .env
-
-# 可见浏览器（首次需扫码登录）
+# 可见浏览器（首次需扫码登录）；网页操作 sleep 见根目录 .env
 python fetch_shelf.py
 
 # 复用缓存登录，无头运行
@@ -93,7 +90,7 @@ python fetch_shelf.py --author-interval 8
 - 每本书提取 `id`、`title`、`author`，存为 `data/shelf_books.txt`（一行一条，逗号分隔：ID,书名,作者；书名/作者中的逗号替换为空格）
 - 书架页禁用 F12 不影响抓取：`id`/`title` 取自页面 DOM，`author` 优先取自拦截的书架接口；**仍为空时再打开阅读器详情补全**（已有作者的书不打开；相邻两本默认间隔 5s）
 - 参数：`--headless`、`--sleep` 滚动间隔、`--max-no-new`、`--out`、`--no-enrich-author`、`--author-interval`
-- 所有点击/跳转类等待见 `.env` / `.env.example` / `AGENTS.md`（`SLEEP_*`）
+- 所有点击/跳转类等待见 `.env` / `AGENTS.md`（`SLEEP_*`）
 
 > 登录过期时 `--headless` 无法弹扫码页，去掉 `--headless` 重新扫一次即可。
 

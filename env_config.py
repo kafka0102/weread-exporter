@@ -2,7 +2,7 @@
 """从本地 .env / 进程环境变量读取运行时配置。
 
 网页操作相关的 sleep 间隔统一经本模块读取，便于在 .env 中调整节奏、
-降低被风控的风险。变量清单见 AGENTS.md 与 .env.example。
+降低被风控的风险。变量清单见 AGENTS.md 与 .env。
 """
 from __future__ import annotations
 
