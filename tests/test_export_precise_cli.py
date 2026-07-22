@@ -171,6 +171,11 @@ class TestExportPreciseCli(unittest.TestCase):
         vp = export_precise.reader_viewport(1280, 720)
         self.assertEqual(vp, {"width": 1280, "height": 720})
 
+    def test_chapter_saved_requires_text_or_images(self):
+        self.assertFalse(export_precise.chapter_saved(0, []))
+        self.assertTrue(export_precise.chapter_saved(1, []))
+        self.assertTrue(export_precise.chapter_saved(0, [{"file": "cover.jpg"}]))
+
     def test_page_viewport_uses_browser_inner_size(self):
         async def run():
             page = mock.AsyncMock()

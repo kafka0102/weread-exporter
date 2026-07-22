@@ -609,6 +609,11 @@ def save_chapter(ch_title, blocks, ch_idx, md_dir, raw_dir):
     return text_len, img_records
 
 
+def chapter_saved(text_len, images):
+    """章节只有实际写入文字或图片时才算本次新增。"""
+    return bool(text_len or images)
+
+
 async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                       goto_first=False, catalog_path=None, headless=False,
                       reader_width=None, reader_height=None,
@@ -696,6 +701,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             """落盘一章并累计统计；返回 (text_len, imgs)。"""
             nonlocal total_chars, total_imgs, chapters_this_session
             n, imgs = save_chapter(title, blocks, ch_idx, md_dir, raw_dir)
+            if not chapter_saved(n, imgs):
+                return n, imgs
             total_chars += n
             total_imgs += len(imgs)
             note = f" +{len(imgs)}图" if imgs else ""
