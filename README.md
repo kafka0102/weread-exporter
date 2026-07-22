@@ -46,9 +46,13 @@ python export_precise.py d31323b0813abaf26g0137c2 --out-dir ~/data/weixin/books
 # 书与书默认间隔 60s（SLEEP_BOOK_INTERVAL）；任一本失败则停止
 python export_precise.py
 python export_precise.py --list data/new_books.txt
+
+# 无头导出（仅当 cache/browser_profile 已有登录信息时真正生效；否则回退有头）
+python export_precise.py d31323b0813abaf26g0137c2 --headless
 ```
 
 - 首次运行会弹出浏览器要求扫码登录，会话自动保存在 `cache/browser_profile/`，后续复用
+- `--headless`：cache 有登录痕迹才启用无头；无头下若出现登录页会报错并立即终止（需去掉 `--headless` 重新扫码）
 - 自动跳到全书开头（原生点击目录首项），逐页翻到全书末尾自动停止
 - **自动续传**：中途卡住会重开浏览器，从上次章节继续；中间产物在 `output/<book_id>/`
 - **全书成功后**才写入 `~/data/weixin/books/<book_id>_<书名>.json`（字段对齐 dedao/json：纯文本 content、`has_content`、空元数据键；可用 `BOOKS_DIR` / `--out-dir` 覆盖）

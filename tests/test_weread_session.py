@@ -1,6 +1,13 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
-from weread_session import is_login_url
+from weread_session import (
+    has_cached_login_profile,
+    is_login_url,
+    resolve_headless,
+)
 
 
 class TestIsLoginUrl(unittest.TestCase):
@@ -20,6 +27,52 @@ class TestIsLoginUrl(unittest.TestCase):
     def test_empty_and_none(self):
         self.assertFalse(is_login_url(""))
         self.assertFalse(is_login_url(None))
+
+
+class TestHasCachedLoginProfile(unittest.TestCase):
+    def test_empty_dir_false(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(has_cached_login_profile(td))
+
+    def test_cookies_nonzero_true(self):
+        with tempfile.TemporaryDirectory() as td:
+            cookies = Path(td) / "Default" / "Cookies"
+            cookies.parent.mkdir(parents=True)
+            cookies.write_bytes(b"cookie-data")
+            self.assertTrue(has_cached_login_profile(td))
+
+    def test_network_cookies_true(self):
+        with tempfile.TemporaryDirectory() as td:
+            cookies = Path(td) / "Default" / "Network" / "Cookies"
+            cookies.parent.mkdir(parents=True)
+            cookies.write_bytes(b"cookie-data")
+            self.assertTrue(has_cached_login_profile(td))
+
+    def test_empty_cookies_false(self):
+        with tempfile.TemporaryDirectory() as td:
+            cookies = Path(td) / "Default" / "Cookies"
+            cookies.parent.mkdir(parents=True)
+            cookies.write_bytes(b"")
+            self.assertFalse(has_cached_login_profile(td))
+
+
+class TestResolveHeadless(unittest.TestCase):
+    def test_not_requested(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(resolve_headless(False, user_data_dir=td, announce=False))
+
+    def test_requested_without_cache_falls_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("builtins.print") as pr:
+                self.assertFalse(resolve_headless(True, user_data_dir=td, announce=True))
+                self.assertTrue(pr.called)
+
+    def test_requested_with_cache_enabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            cookies = Path(td) / "Default" / "Cookies"
+            cookies.parent.mkdir(parents=True)
+            cookies.write_bytes(b"x")
+            self.assertTrue(resolve_headless(True, user_data_dir=td, announce=False))
 
 
 if __name__ == "__main__":

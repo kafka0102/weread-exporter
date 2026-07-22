@@ -17,11 +17,17 @@ class TestExportPreciseCli(unittest.TestCase):
             "--download-images",
             "--out-dir",
             "tmp/books",
+            "--headless",
         ])
         self.assertEqual(args.book, "abc123")
         self.assertTrue(args.force)
         self.assertTrue(args.download_images)
         self.assertEqual(args.out_dir, "tmp/books")
+        self.assertTrue(args.headless)
+
+    def test_parse_args_headless_default_false(self):
+        args = export_precise.parse_args([])
+        self.assertFalse(args.headless)
 
     def test_parse_args_batch_default(self):
         args = export_precise.parse_args([])

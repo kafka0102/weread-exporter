@@ -46,7 +46,13 @@ from env_config import (
     SLEEP_READER_REOPEN,
     SLEEP_READER_STABLE_POLL,
 )
-from weread_session import USER_DATA_DIR, ensure_logged_in, launch_weread_context
+from weread_session import (
+    USER_DATA_DIR,
+    ensure_logged_in,
+    launch_weread_context,
+    page_needs_login,
+    resolve_headless,
+)
 
 DEFAULT_BOOKS_DIR = BOOKS_DIR
 
@@ -326,14 +332,20 @@ def save_chapter(ch_title, blocks, ch_idx, md_dir, raw_dir):
 
 
 async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
-                      goto_first=False, catalog_path=None):
+                      goto_first=False, catalog_path=None, headless=False):
     reached_end = False
     last_cat_title = load_last_catalog_title(catalog_path) if catalog_path else ""
     async with async_playwright() as p:
         ctx = await launch_weread_context(
-            p, headless=False, viewport={"width": 1200, "height": 900})
-        if not await ensure_logged_in(ctx):
+            p, headless=headless, viewport={"width": 1200, "height": 900})
+        if not await ensure_logged_in(
+                ctx, allow_interactive_login=not headless):
             await ctx.close()
+            if headless:
+                raise RuntimeError(
+                    "无头模式下检测到未登录/登录页，已终止。"
+                    "请去掉 --headless 扫码登录，或确认 cache/browser_profile 登录态有效后重试。"
+                )
             return "", "", 0, 0, start_idx, False
 
         page = await ctx.new_page()
@@ -342,6 +354,12 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         await page.goto(f"https://weread.qq.com/web/reader/{book_id}",
                         wait_until="networkidle", timeout=30000)
         await asyncio.sleep(SLEEP_READER_AFTER_LOAD)
+        if headless and await page_needs_login(page):
+            await ctx.close()
+            raise RuntimeError(
+                "无头模式下打开阅读器后出现登录页，已终止。"
+                "请去掉 --headless 扫码登录后再试。"
+            )
 
         book_title, book_author = await fetch_book_title(page)
         if goto_first:
@@ -499,6 +517,7 @@ async def export_one_book(
     download_images=False,
     shelf_title="",
     shelf_author="",
+    headless=False,
 ):
     """导出单本：中间产物写 output/<id>，成功后写 out_dir JSON。
 
@@ -541,7 +560,7 @@ async def export_one_book(
         goto_first = (session == 1 and last_idx == 0)
         title, author, added, chars_added, end_idx, reached_end = await run_session(
             book_id, md_dir, raw_dir, start_idx, seen_imgs,
-            goto_first=goto_first, catalog_path=catalog_path)
+            goto_first=goto_first, catalog_path=catalog_path, headless=headless)
         if title:
             book_title = title
         if author:
@@ -601,6 +620,7 @@ async def export_batch(
     force=False,
     download_images=False,
     book_interval=None,
+    headless=False,
 ):
     """批量导出 new_books：跳过已存在；失败即停。"""
     out_dir = Path(out_dir)
@@ -625,6 +645,7 @@ async def export_batch(
             download_images=download_images,
             shelf_title=title,
             shelf_author=author,
+            headless=headless,
         )
         if status == "ok" and i < len(pending) - 1:
             print(f"  书间等待 {interval:.0f}s ...")
@@ -663,6 +684,11 @@ def parse_args(argv=None):
         default=str(DEFAULT_NEW_BOOKS),
         help=f"批量清单路径（默认 {DEFAULT_NEW_BOOKS}）",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="无头模式（仅当 cache/browser_profile 已有登录信息时生效；否则回退有头）",
+    )
     return parser.parse_args(argv)
 
 
@@ -677,6 +703,9 @@ def resolve_book_id(raw: str) -> str:
 
 async def async_main(argv=None):
     args = parse_args(argv)
+    headless = resolve_headless(args.headless)
+    if args.headless and headless:
+        print("  🕶️  无头模式已启用（检测到 cache 登录信息）")
     if args.book:
         book_id = resolve_book_id(args.book)
         print(f"  Book ID: {book_id}")
@@ -685,6 +714,7 @@ async def async_main(argv=None):
             out_dir=args.out_dir,
             force=args.force,
             download_images=args.download_images,
+            headless=headless,
         )
         if status == "skipped":
             return 0
@@ -695,6 +725,7 @@ async def async_main(argv=None):
         out_dir=args.out_dir,
         force=args.force,
         download_images=args.download_images,
+        headless=headless,
     )
     return 0
 

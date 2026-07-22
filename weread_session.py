@@ -89,6 +89,54 @@ async def open_login_dialog(page) -> bool:
         return False
 
 
+def has_cached_login_profile(user_data_dir: str = USER_DATA_DIR) -> bool:
+    """判断 browser profile 是否像已有登录痕迹。
+
+    依据 Cookies / Local Storage 等落盘文件是否非空，不保证会话仍有效；
+    仅用于决定「请求 --headless 时是否允许真正无头启动」。
+    """
+    default_dir = os.path.join(user_data_dir, "Default")
+    cookie_candidates = (
+        os.path.join(default_dir, "Cookies"),
+        os.path.join(default_dir, "Network", "Cookies"),
+    )
+    for path in cookie_candidates:
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                return True
+        except OSError:
+            continue
+
+    local_storage = os.path.join(default_dir, "Local Storage", "leveldb")
+    try:
+        if os.path.isdir(local_storage):
+            for entry in os.scandir(local_storage):
+                if entry.is_file() and entry.name not in (".", "..") and entry.stat().st_size > 0:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def resolve_headless(
+    requested: bool,
+    *,
+    user_data_dir: str = USER_DATA_DIR,
+    announce: bool = True,
+) -> bool:
+    """解析最终是否使用无头：仅当请求无头且缓存像有登录态时生效。"""
+    if not requested:
+        return False
+    if has_cached_login_profile(user_data_dir):
+        return True
+    if announce:
+        print(
+            "  ⚠️  已指定 --headless，但未检测到 cache 登录信息，"
+            "改为有头模式以便扫码登录"
+        )
+    return False
+
+
 async def ensure_logged_in(
     context,
     *,
@@ -97,11 +145,13 @@ async def ensure_logged_in(
     poll_seconds: float | None = None,
     max_wait_seconds: float = 600.0,
     close_check_page: bool = True,
+    allow_interactive_login: bool = True,
 ) -> bool:
     """确认当前 context 已登录微信读书。
 
     - 已登录：打印提示并返回 True
-    - 需扫码：自动点开登录弹层，等待用户扫码；成功返回 True，超时返回 False
+    - 需扫码且 allow_interactive_login=True：自动点开登录弹层，等待用户扫码
+    - 需扫码且 allow_interactive_login=False（典型无头模式）：打印错误并立即返回 False
     """
     if poll_seconds is None:
         poll_seconds = SLEEP_LOGIN_POLL
@@ -119,6 +169,13 @@ async def ensure_logged_in(
         if not await page_needs_login(page):
             print("  ✅ 已登录（复用缓存会话）")
             return True
+
+        if not allow_interactive_login:
+            print(
+                "  ❌ 无头模式下检测到未登录/登录页，无法扫码。"
+                "请去掉 --headless 重新登录，或确认 cache/browser_profile 登录态有效后重试。"
+            )
+            return False
 
         opened = await open_login_dialog(page)
         if opened:
@@ -160,7 +217,8 @@ async def open_logged_in_page(
         headless=headless,
         **context_kwargs,
     )
-    ok = await ensure_logged_in(context)
+    ok = await ensure_logged_in(
+        context, allow_interactive_login=not headless)
     if not ok:
         await context.close()
         return None, None
