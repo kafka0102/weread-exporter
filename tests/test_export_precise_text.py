@@ -92,6 +92,72 @@ class TestSplitBlocksAtChapterStart(unittest.TestCase):
         self.assertEqual(export_precise.next_catalog_title(catalog, "不存在"), None)
 
 
+
+
+class TestCatalogTitleCleaning(unittest.TestCase):
+    def test_normalize_strips_progress_suffix(self):
+        self.assertEqual(
+            export_precise.normalize_catalog_title("王国维当前读到 99%"),
+            "王国维",
+        )
+        self.assertEqual(export_precise.normalize_catalog_title("#"), "")
+
+    def test_clean_catalog_titles_dedupes(self):
+        titles = export_precise.clean_catalog_titles(
+            ["版权信息", "版权信息", "导言", "王国维当前读到 99%", ""]
+        )
+        self.assertEqual(titles, ["版权信息", "导言", "王国维"])
+
+    def test_catalog_index_fuzzy(self):
+        catalog = ["导言", "李白", "张志和"]
+        self.assertEqual(export_precise.catalog_index(catalog, "李白"), 1)
+        self.assertEqual(export_precise.catalog_index(catalog, "不存在"), None)
+
+    def test_display_chapter_title_fallback(self):
+        self.assertEqual(export_precise.display_chapter_title("", 3), "0003")
+        self.assertEqual(export_precise.display_chapter_title("李白", 3), "李白")
+
+
+class TestFindChapterSplit(unittest.TestCase):
+    def test_empty_current_finds_first_catalog_title_in_order(self):
+        blocks = [
+            {"type": "text", "text": "版权页正文"},
+            {"type": "text", "text": "作者简介"},
+            {"type": "text", "text": "陈引驰"},
+            {"type": "text", "text": "导言"},
+        ]
+        catalog = ["版权信息", "作者简介", "导言", "李白"]
+        found = export_precise.find_chapter_split(blocks, catalog, "")
+        self.assertIsNotNone(found)
+        nxt, before, after = found
+        self.assertEqual(nxt, "作者简介")
+        self.assertEqual(before[0]["text"], "版权页正文")
+        self.assertEqual(after[0]["text"], "作者简介")
+
+    def test_known_current_only_matches_immediate_next(self):
+        blocks = [
+            {"type": "text", "text": "导言正文"},
+            {"type": "text", "text": "李白"},
+            {"type": "text", "text": "菩萨蛮"},
+        ]
+        catalog = ["导言", "李白", "张志和"]
+        found = export_precise.find_chapter_split(blocks, catalog, "导言")
+        self.assertEqual(found[0], "李白")
+        self.assertEqual(found[1][0]["text"], "导言正文")
+
+    def test_infer_title_for_before_when_current_empty(self):
+        catalog = ["版权信息", "作者简介", "导言"]
+        self.assertEqual(
+            export_precise.infer_title_for_blocks_before("作者简介", catalog, ""),
+            "版权信息",
+        )
+
+    def test_is_last_catalog_chapter(self):
+        catalog = ["导言", "李白", "秋瑾"]
+        self.assertTrue(export_precise.is_last_catalog_chapter("秋瑾", catalog))
+        self.assertFalse(export_precise.is_last_catalog_chapter("李白", catalog))
+
+
 class TestDualCanvasSplit(unittest.TestCase):
     """双页 canvas 局部坐标不得按 y 交错合并。"""
 

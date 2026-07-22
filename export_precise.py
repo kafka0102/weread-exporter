@@ -311,17 +311,151 @@ def split_blocks_at_chapter_start(blocks, chapter_title: str):
     return list(blocks), []
 
 
+# 目录项 textContent 偶发粘上阅读进度，如「王国维当前读到 99%」
+_CATALOG_PROGRESS_RE = re.compile(
+    r"(当前读到|已读到|读到)\s*\d+\s*%?\s*$"
+)
+_CATALOG_PERCENT_RE = re.compile(r"\s*\d+\s*%\s*$")
+
+
+def normalize_catalog_title(text: str) -> str:
+    """清洗目录/顶栏章名：去进度文案与首尾空白。"""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    s = _CATALOG_PROGRESS_RE.sub("", s).strip()
+    s = _CATALOG_PERCENT_RE.sub("", s).strip()
+    # 仅剩 # 之类无意义标记时视为空
+    if s in {"#", "·", "-", "—"}:
+        return ""
+    return s
+
+
+def clean_catalog_titles(titles) -> list[str]:
+    """清洗目录列表：去进度污染、去空、保序去重。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in titles or []:
+        title = normalize_catalog_title(str(raw or ""))
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        out.append(title)
+    return out
+
+
+def catalog_index(catalog_titles, title: str):
+    """在目录中定位章名；支持清洗后的模糊相等。找不到返回 None。"""
+    if not catalog_titles:
+        return None
+    raw = (title or "").strip()
+    norm = normalize_catalog_title(raw)
+    if not raw and not norm:
+        return None
+    # 精确
+    try:
+        return list(catalog_titles).index(raw)
+    except ValueError:
+        pass
+    if norm:
+        try:
+            return list(catalog_titles).index(norm)
+        except ValueError:
+            pass
+        for i, c in enumerate(catalog_titles):
+            cn = normalize_catalog_title(c)
+            if not cn:
+                continue
+            if cn == norm:
+                return i
+            # 顶栏偶发更短/更长（少了卷名前缀等）
+            if len(norm) >= 2 and len(cn) >= 2 and (norm == cn or norm in cn or cn in norm):
+                # 避免极短误匹配：较短一方至少 2 字且长度差不大
+                if min(len(norm), len(cn)) >= 2 and abs(len(norm) - len(cn)) <= 8:
+                    return i
+    return None
+
+
 def next_catalog_title(catalog_titles, current_title: str):
     """返回目录中 current_title 的下一章标题；找不到则 None。"""
-    if not catalog_titles or not current_title:
+    if not catalog_titles:
         return None
-    try:
-        idx = catalog_titles.index(current_title)
-    except ValueError:
+    idx = catalog_index(catalog_titles, current_title)
+    if idx is None:
         return None
     if idx + 1 >= len(catalog_titles):
         return None
     return catalog_titles[idx + 1]
+
+
+def is_last_catalog_chapter(current_title: str, catalog_titles) -> bool:
+    """当前章是否为目录最后一项。"""
+    if not catalog_titles:
+        return False
+    idx = catalog_index(catalog_titles, current_title)
+    return idx is not None and idx == len(catalog_titles) - 1
+
+
+def resolve_chapter_title(raw_title: str, catalog_titles) -> str:
+    """把顶栏/目录原始文本规范到目录章名；无法对齐则返回清洗后的原文。"""
+    cleaned = normalize_catalog_title(raw_title)
+    if not cleaned:
+        return ""
+    if not catalog_titles:
+        return cleaned
+    idx = catalog_index(catalog_titles, cleaned)
+    if idx is not None:
+        return catalog_titles[idx]
+    return cleaned
+
+
+def display_chapter_title(title: str, ch_idx: int) -> str:
+    """落盘用章名；空标题回退为编号，避免 md 首行变成「# 」。"""
+    t = normalize_catalog_title(title)
+    if t:
+        return t
+    return f"{int(ch_idx):04d}"
+
+
+def find_chapter_split(blocks, catalog_titles, current_title: str):
+    """在正文块中查找应切到的下一章。
+
+    返回 (next_title, before, after)；找不到则 None。
+
+    - 当前章能在目录定位时：只匹配「下一章」标题（降低正文提及误切）。
+    - 当前章未知（顶栏为空）时：按目录顺序找第一个作为章首出现的标题。
+    """
+    if not blocks or not catalog_titles:
+        return None
+    cur = normalize_catalog_title(current_title)
+    if cur:
+        nxt = next_catalog_title(catalog_titles, cur)
+        if not nxt:
+            return None
+        before, after = split_blocks_at_chapter_start(blocks, nxt)
+        if not after:
+            return None
+        return nxt, before, after
+
+    # 顶栏空：按目录顺序找第一个章首
+    for title in catalog_titles:
+        before, after = split_blocks_at_chapter_start(blocks, title)
+        if after:
+            return title, before, after
+    return None
+
+
+def infer_title_for_blocks_before(next_title: str, catalog_titles, current_title: str) -> str:
+    """内容切章时，before 段应归属的章名。"""
+    cur = resolve_chapter_title(current_title, catalog_titles)
+    if cur:
+        return cur
+    idx = catalog_index(catalog_titles, next_title)
+    if idx is not None and idx > 0:
+        return catalog_titles[idx - 1]
+    if catalog_titles:
+        return catalog_titles[0]
+    return ""
 
 
 def group_chars_by_canvas(chars):
@@ -467,7 +601,7 @@ def img_filename(url, ch_idx, seq):
 
 def render_chapter_md(ch_title, blocks, ch_idx):
     """把有序块渲染成 Markdown：文字行合并成段落，图片就地插入"""
-    out = [f"# {ch_title}\n"]
+    out = [f"# {display_chapter_title(ch_title, ch_idx)}\n"]
     para = []
     img_records = []
     img_seq = 0
@@ -525,17 +659,32 @@ def get_last_chapter_title(md_dir):
     if not files:
         return None, 0
     idx = int(files[-1].replace(".md", ""))
-    with open(os.path.join(md_dir, files[-1])) as f:
-        title = f.readline().strip().replace("# ", "")
-    return title, idx
+    # 优先 raw json 的 title（避免空标题 md 首行变成「#」）
+    raw_path = os.path.join(os.path.dirname(md_dir), "raw", files[-1].replace(".md", ".json"))
+    title = ""
+    if os.path.isfile(raw_path):
+        try:
+            with open(raw_path, encoding="utf-8") as rf:
+                meta = json.load(rf)
+            title = normalize_catalog_title(str(meta.get("title") or ""))
+        except Exception:
+            title = ""
+    if not title:
+        with open(os.path.join(md_dir, files[-1]), encoding="utf-8") as f:
+            line = f.readline().strip()
+        if line.startswith("#"):
+            title = normalize_catalog_title(line.lstrip("#").strip())
+        else:
+            title = normalize_catalog_title(line)
+    return title or None, idx
 
 
 def load_catalog_titles(catalog_path):
-    """读取目录标题列表；失败返回 []。"""
+    """读取目录标题列表；失败返回 []。读取时清洗进度污染。"""
     try:
-        with open(catalog_path) as f:
+        with open(catalog_path, encoding="utf-8") as f:
             titles = json.load(f)
-        return titles if isinstance(titles, list) else []
+        return clean_catalog_titles(titles if isinstance(titles, list) else [])
     except Exception:
         return []
 
@@ -546,8 +695,45 @@ def load_last_catalog_title(catalog_path):
 
 
 async def _title(page):
+    """读取阅读器当前章名。
+
+    优先顶栏/页信息；最近有头模式改用真实窗口后，单一 class 偶发读空，
+    因此多选择器兜底。仍可能为空——调用方需再用目录项兜底。
+    """
     return await page.evaluate(
-        "() => document.querySelector('.renderTargetPageInfo_header_chapterTitle')?.textContent?.trim() || ''")
+        """() => {
+            const sels = [
+                '.renderTargetPageInfo_header_chapterTitle',
+                '.readerTopBar_title_chapter',
+                '.readerTopBar_title',
+                '[class*="header_chapterTitle"]',
+                '[class*="chapterTitle"]',
+            ];
+            for (const s of sels) {
+                const el = document.querySelector(s);
+                const t = (el?.textContent || '').trim();
+                if (t) return t;
+            }
+            // 目录仍打开时，取选中项
+            const active = document.querySelector(
+                '.readerCatalog_list_item_selected, .readerCatalog_list_item.selected, .readerCatalog_list_item.isActive, [class*="readerCatalog_list_item"][class*="selected"], [class*="readerCatalog_list_item"][class*="active"]'
+            );
+            const at = (active?.textContent || '').trim();
+            return at || '';
+        }"""
+    )
+
+
+async def read_chapter_title(page, catalog_titles=None, *, fallback: str = "") -> str:
+    """读取并规范当前章名；顶栏为空时用 fallback / 目录推断。"""
+    raw = await _title(page)
+    resolved = resolve_chapter_title(raw, catalog_titles or [])
+    if resolved:
+        return resolved
+    fb = resolve_chapter_title(fallback, catalog_titles or [])
+    if fb:
+        return fb
+    return ""
 
 
 async def fetch_book_title(page):
@@ -570,41 +756,103 @@ async def close_reader_catalog(page):
     return True
 
 
+async def scrape_catalog_titles(page) -> list[str]:
+    """打开目录后尽量滚完整表，抓取并清洗全部章名。"""
+    raw_titles: list[str] = []
+    seen: set[str] = set()
+
+    async def harvest():
+        batch = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('.readerCatalog_list_item')).map(el => {
+                const titleEl = el.querySelector(
+                    '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
+                );
+                return ((titleEl && titleEl.textContent) || el.textContent || '').trim();
+            })"""
+        )
+        for t in batch or []:
+            nt = normalize_catalog_title(t)
+            if nt and nt not in seen:
+                seen.add(nt)
+                raw_titles.append(nt)
+
+    await harvest()
+    # 虚拟列表：向下滚几次尽量收全
+    for _ in range(40):
+        moved = await page.evaluate(
+            """() => {
+                const sc = document.querySelector(
+                    '.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]'
+                );
+                if (!sc) return false;
+                const before = sc.scrollTop;
+                const max = Math.max(0, sc.scrollHeight - sc.clientHeight);
+                if (before >= max - 1) return false;
+                sc.scrollTop = Math.min(max, before + Math.max(sc.clientHeight * 0.9, 120));
+                return sc.scrollTop > before;
+            }"""
+        )
+        if not moved:
+            break
+        await asyncio.sleep(max(0.05, float(SLEEP_READER_CATALOG_SCROLL) * 0.15))
+        await harvest()
+
+    # 滚回顶部，便于点首项
+    await page.evaluate(
+        """() => {
+            const sc = document.querySelector(
+                '.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]'
+            );
+            if (sc) sc.scrollTop = 0;
+        }"""
+    )
+    await asyncio.sleep(SLEEP_READER_CATALOG_SCROLL)
+    return clean_catalog_titles(raw_titles)
+
+
 async def goto_first_chapter(page, catalog_path=None):
+    """打开目录、保存章名列表、点击第一项；返回清洗后的首章标题。"""
     first_title = ""
     try:
         await page.click("button.readerControls_item.catalog", timeout=5000)
         await asyncio.sleep(SLEEP_READER_CATALOG_OPEN)
-        titles = await page.evaluate("""() => Array.from(
-            document.querySelectorAll('.readerCatalog_list_item')).map(el => el.textContent.trim())""")
+        titles = await scrape_catalog_titles(page)
         if titles and catalog_path:
-            with open(catalog_path, "w") as f:
+            with open(catalog_path, "w", encoding="utf-8") as f:
                 json.dump(titles, f, ensure_ascii=False)
-        await page.evaluate("""() => {
-            const sc = document.querySelector('.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]');
-            if (sc) sc.scrollTop = 0;
-        }""")
-        await asyncio.sleep(SLEEP_READER_CATALOG_SCROLL)
         item = page.locator(".readerCatalog_list_item").first
-        first_title = (await item.text_content() or "").strip()
+        first_raw = (await item.text_content() or "").strip()
+        first_title = normalize_catalog_title(first_raw) or (titles[0] if titles else "")
         await item.click(timeout=4000)
         await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
         await close_reader_catalog(page)
         await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
     except Exception as e:
         print(f"  ⚠️  目录跳转异常: {e}")
-    print(f"  ✅ 已跳到全书开头，当前:「{await _title(page)}」(点击首项「{first_title}」)")
+    # 顶栏可能滞后/读空：多读几次，仍空则用目录首项
+    header = ""
+    for _ in range(5):
+        header = await read_chapter_title(page, load_catalog_titles(catalog_path) if catalog_path else None,
+                                          fallback=first_title)
+        if header:
+            break
+        await asyncio.sleep(0.3)
+    if not header:
+        header = first_title
+    print(f"  ✅ 已跳到全书开头，当前:「{header}」(点击首项「{first_title}」)")
+    return header
 
 
 def save_chapter(ch_title, blocks, ch_idx, md_dir, raw_dir):
-    body, img_records = render_chapter_md(ch_title, blocks, ch_idx)
+    title = display_chapter_title(ch_title, ch_idx)
+    body, img_records = render_chapter_md(title, blocks, ch_idx)
     text_len = sum(len(b["text"]) for b in blocks if b["type"] == "text")
     if text_len == 0 and not img_records:
         return 0, []
-    with open(os.path.join(md_dir, f"{ch_idx:04d}.md"), "w") as f:
+    with open(os.path.join(md_dir, f"{ch_idx:04d}.md"), "w", encoding="utf-8") as f:
         f.write(body)
-    with open(os.path.join(raw_dir, f"{ch_idx:04d}.json"), "w") as f:
-        json.dump({"title": ch_title, "images": img_records, "text_len": text_len},
+    with open(os.path.join(raw_dir, f"{ch_idx:04d}.json"), "w", encoding="utf-8") as f:
+        json.dump({"title": title, "images": img_records, "text_len": text_len},
                   f, ensure_ascii=False)
     return text_len, img_records
 
@@ -661,15 +909,23 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             page, viewport, force_single_page=force_single_page)
 
         book_title, book_author = await fetch_book_title(page)
+        bootstrap_title = ""
         if goto_first:
-            await goto_first_chapter(page, catalog_path)
+            bootstrap_title = await goto_first_chapter(page, catalog_path) or ""
             catalog_titles = load_catalog_titles(catalog_path) if catalog_path else catalog_titles
+            last_cat_title = catalog_titles[-1] if catalog_titles else ""
+        elif catalog_path and not catalog_titles:
+            catalog_titles = load_catalog_titles(catalog_path)
             last_cat_title = catalog_titles[-1] if catalog_titles else ""
 
         await focus_reader_for_keyboard(page)
         await asyncio.sleep(SLEEP_READER_AFTER_HOOK)
 
-        current_chapter = await _title(page)
+        current_chapter = await read_chapter_title(
+            page, catalog_titles, fallback=bootstrap_title)
+        # 顶栏仍空且是全书开头：用目录首项，保证后续能按目录顺序切章
+        if not current_chapter and catalog_titles and (goto_first or start_idx <= 1):
+            current_chapter = catalog_titles[0]
         print(f"  📖 {book_title} — {book_author}")
         print(f"  会话开始:「{current_chapter}」\n")
 
@@ -722,21 +978,21 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             await asyncio.sleep(wait_s)
 
         async def split_if_next_chapter_started():
-            """目录下一章标题已出现在正文块中时，提前切章（修复标题栏滞后导致的窜章）。
+            """目录下一章标题已出现在正文块中时，提前切章（修复标题栏滞后/读空导致的窜章）。
 
             返回 True 表示发生了切章。
             """
             nonlocal ch_blocks, current_chapter, ch_idx, page_num, stale, reached_end
-            nxt = next_catalog_title(catalog_titles, current_chapter)
-            if not nxt:
+            found = find_chapter_split(ch_blocks, catalog_titles, current_chapter)
+            if not found:
                 return False
-            before, after = split_blocks_at_chapter_start(ch_blocks, nxt)
-            if not after:
-                return False
-            is_last = bool(last_cat_title and current_chapter == last_cat_title)
+            nxt, before, after = found
+            title_to_save = infer_title_for_blocks_before(
+                nxt, catalog_titles, current_chapter)
+            is_last = is_last_catalog_chapter(title_to_save, catalog_titles)
             if before:
                 n, _imgs = await commit_chapter(
-                    current_chapter, before, note_suffix=" [内容切章]")
+                    title_to_save, before, note_suffix=" [内容切章]")
                 ch_idx += 1
                 if is_last:
                     ch_blocks = after
@@ -746,7 +1002,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     reached_end = True
                     return True
                 await sleep_between_chapters(n)
-            # before 为空：上一章已落盘，仅把块归属切到目录下一章
+            # before 为空：上一章已落盘或本页已属新章，仅把块归属切到下一章
             ch_blocks = after
             current_chapter = nxt
             page_num = 0
@@ -767,13 +1023,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             await asyncio.sleep(SLEEP_READER_PAGE_TURN)
             await wait_stable(page, 0)
 
-            new_chapter = await _title(page)
+            new_chapter = await read_chapter_title(page, catalog_titles)
             if new_chapter and new_chapter != current_chapter:
                 # 标题栏切换：先把已窜入上一章末尾的新章内容剥回
                 before, after = split_blocks_at_chapter_start(ch_blocks, new_chapter)
                 if after:
                     ch_blocks = before
-                is_last = bool(last_cat_title and current_chapter == last_cat_title)
+                is_last = is_last_catalog_chapter(current_chapter, catalog_titles)
                 n, _imgs = await commit_chapter(current_chapter, ch_blocks)
                 ch_idx += 1
                 ch_blocks = after
@@ -806,9 +1062,17 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 stale += 1
                 if stale >= 10:
                     note = ""
-                    if last_cat_title and current_chapter == last_cat_title:
+                    # 末章、标题对不上目录、或已连续无新内容：结束，避免整本抓完还误重开
+                    if is_last_catalog_chapter(current_chapter, catalog_titles):
                         reached_end = True
                         note = " [全书末尾]"
+                    elif not catalog_titles or catalog_index(catalog_titles, current_chapter) is None:
+                        reached_end = True
+                        note = " [无更多新内容]"
+                    elif page_num >= 20:
+                        # 本会话已稳定翻过很多页后停住，多半到书末
+                        reached_end = True
+                        note = " [无更多新内容]"
                     await commit_chapter(current_chapter, ch_blocks, note_suffix=note)
                     break
             else:

@@ -249,6 +249,30 @@ class TestExportPreciseCli(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_get_last_chapter_title_prefers_raw_and_strips_hash(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            md = root / "chapters"
+            raw = root / "raw"
+            md.mkdir(); raw.mkdir()
+            (md / "0001.md").write_text("# \n\n正文\n", encoding="utf-8")
+            (raw / "0001.json").write_text(
+                json.dumps({"title": "", "images": [], "text_len": 2}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            title, idx = export_precise.get_last_chapter_title(str(md))
+            self.assertEqual(idx, 1)
+            # 空 title 时 normalize 后为 None
+            self.assertIsNone(title)
+
+            (raw / "0001.json").write_text(
+                json.dumps({"title": "李白", "images": [], "text_len": 2}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (md / "0001.md").write_text("# 李白\n\n正文\n", encoding="utf-8")
+            title, idx = export_precise.get_last_chapter_title(str(md))
+            self.assertEqual((title, idx), ("李白", 1))
+
 
 if __name__ == "__main__":
     unittest.main()
