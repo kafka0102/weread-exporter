@@ -71,13 +71,34 @@ def format_elapsed(seconds):
 
 DEFAULT_NEW_BOOKS = Path("data") / "new_books.txt"
 
-CANVAS_HOOK = """
+CANVAS_HOOK = r"""
 (function() {
     window.__wr_chars = [];
     var origFill = CanvasRenderingContext2D.prototype.fillText;
     CanvasRenderingContext2D.prototype.fillText = function(text, x, y) {
-        if (text && text.trim())
-            window.__wr_chars.push({t: text, x: Math.round(x*10)/10, y: Math.round(y*10)/10});
+        if (text && String(text).trim()) {
+            var cl = 0, ct = 0, s = null;
+            try {
+                var canvas = this.canvas;
+                if (canvas && canvas.getBoundingClientRect) {
+                    var r = canvas.getBoundingClientRect();
+                    cl = Math.round(r.left);
+                    ct = Math.round(r.top);
+                }
+            } catch (e) {}
+            try {
+                var m = /(\d+(?:\.\d+)?)px/.exec(this.font || '');
+                if (m) s = parseFloat(m[1]);
+            } catch (e) {}
+            window.__wr_chars.push({
+                t: String(text),
+                x: Math.round(x * 10) / 10,
+                y: Math.round(y * 10) / 10,
+                cl: cl,
+                ct: ct,
+                s: s
+            });
+        }
         return origFill.apply(this, arguments);
     };
     window.__wr_reset = function() { window.__wr_chars = []; };
@@ -199,8 +220,58 @@ def next_catalog_title(catalog_titles, current_title: str):
     return catalog_titles[idx + 1]
 
 
+def group_chars_by_canvas(chars):
+    """按 canvas 屏幕 left(cl) 把字符分到各页，从左到右返回。
+
+    fillText 的 x/y 是 canvas 局部坐标；双页时左右页 y 区间重叠，
+    若不按 canvas 拆开再分行，会把左右页同一 y 的字交错拼成乱码。
+    """
+    if not chars:
+        return []
+    buckets: dict[int | None, list] = {}
+    for c in chars:
+        cl = c.get("cl")
+        if cl is None:
+            buckets.setdefault(None, []).append(c)
+            continue
+        try:
+            cl_v = float(cl)
+        except (TypeError, ValueError):
+            buckets.setdefault(None, []).append(c)
+            continue
+        key = None
+        for k in buckets:
+            if k is not None and abs(k - cl_v) <= 40:
+                key = k
+                break
+        if key is None:
+            key = int(round(cl_v))
+        buckets.setdefault(key, []).append(c)
+
+    ordered_keys = sorted(k for k in buckets if k is not None)
+    pages = [buckets[k] for k in ordered_keys]
+    if None in buckets:
+        if pages:
+            # 无 cl 的旧数据：并入左页，避免丢字
+            pages[0].extend(buckets[None])
+        else:
+            pages = [buckets[None]]
+    return pages
+
+
 def split_spread(chars):
-    """双页拆分：返回 [左页chars, 右页chars] 或 [单页chars]"""
+    """双页拆分：优先按 canvas 屏幕位置；否则回退 y 回跳启发式。
+
+    返回 [左页chars, 右页chars, ...] 或 [单页chars]
+    """
+    if not chars:
+        return [chars]
+
+    pages = group_chars_by_canvas(chars)
+    if len(pages) >= 2:
+        return pages
+
+    # 兼容未带 cl 的旧捕获：按绘制顺序的 y 回跳切分
     if len(chars) < 20:
         return [chars]
     singles = [(i, c) for i, c in enumerate(chars) if len(c["t"]) == 1]
@@ -263,12 +334,22 @@ def build_page_blocks(chars, images, canvas_rects, seen_imgs):
                 blocks.append({"type": "img", "src": payload["src"],
                                 "w": payload["w"], "h": payload["h"]})
 
-    if len(pages) == 2:
-        emit_page(pages[0], left_rect, left_imgs)
-        emit_page(pages[1], right_rect, right_imgs)
+    if len(pages) >= 2:
+        # 多 canvas：左→右逐页输出；首屏图归左，其余可见图归右/末页
+        page_rects = list(rects) if len(rects) >= len(pages) else [left_rect, right_rect]
+        while len(page_rects) < len(pages):
+            page_rects.append(page_rects[-1])
+        for i, page_chars in enumerate(pages):
+            if i == 0:
+                pimgs = left_imgs
+            elif i == len(pages) - 1:
+                pimgs = right_imgs
+            else:
+                pimgs = []
+            emit_page(page_chars, page_rects[i], pimgs)
     else:
         # 单页：图片全归这页，仍按 y 排
-        emit_page(pages[0], left_rect, left_imgs + right_imgs)
+        emit_page(pages[0] if pages else [], left_rect, left_imgs + right_imgs)
     return blocks
 
 
@@ -291,11 +372,10 @@ def render_chapter_md(ch_title, blocks, ch_idx):
         nonlocal para
         if not para:
             return
-        # 合并 canvas 软折行；词牌/短标题/【赏析】等保持独立段落
+        # 合并 canvas 软折行；词牌/短标题/【赏析】等保持独立段落。
+        # 注意：不得因 line==ch_title 丢弃正文行——词下作者署名常与章名相同（如「李白」）。
         merged = []
         for line in para:
-            if line == ch_title:
-                continue
             if merged and should_merge_soft_wrap(merged[-1], line):
                 merged[-1] += line
             else:

@@ -1,4 +1,4 @@
-"""export_precise 章节正文识别：词牌换行与章节边界切分。"""
+"""export_precise 章节正文识别：词牌换行、章节边界、双页拆分。"""
 import unittest
 
 import export_precise
@@ -35,9 +35,19 @@ class TestRenderChapterMdLineBreaks(unittest.TestCase):
             {"type": "text", "text": "西塞山前白鹭飞，桃花流水鳜鱼肥。"},
         ]
         body, _ = export_precise.render_chapter_md("张志和", blocks, 6)
-        # 章标题行本身被跳过；词牌与正文不粘连
-        self.assertIn("渔父\n\n西塞山前白鹭飞", body)
+        # 作者署名与章名相同时也要保留；词牌与正文不粘连
+        self.assertIn("张志和\n\n渔父\n\n西塞山前白鹭飞", body)
         self.assertNotIn("渔父西塞山前", body)
+
+    def test_keeps_author_line_same_as_chapter_title(self):
+        """词牌下的作者行即使与章标题相同也必须保留。"""
+        blocks = [
+            {"type": "text", "text": "菩萨蛮"},
+            {"type": "text", "text": "李白"},
+            {"type": "text", "text": "平林漠漠烟如织，寒山一带伤心碧。"},
+        ]
+        body, _ = export_precise.render_chapter_md("李白", blocks, 5)
+        self.assertIn("菩萨蛮\n\n李白\n\n平林漠漠烟如织", body)
 
 
 class TestSplitBlocksAtChapterStart(unittest.TestCase):
@@ -80,6 +90,62 @@ class TestSplitBlocksAtChapterStart(unittest.TestCase):
         self.assertEqual(export_precise.next_catalog_title(catalog, "李白"), "张志和")
         self.assertEqual(export_precise.next_catalog_title(catalog, "刘禹锡"), None)
         self.assertEqual(export_precise.next_catalog_title(catalog, "不存在"), None)
+
+
+class TestDualCanvasSplit(unittest.TestCase):
+    """双页 canvas 局部坐标不得按 y 交错合并。"""
+
+    def _char(self, t, x, y, cl, s=18):
+        return {"t": t, "x": x, "y": y, "cl": cl, "ct": 73, "s": s}
+
+    def test_group_chars_by_canvas_left_to_right(self):
+        chars = [
+            self._char("左", 10, 100, 190),
+            self._char("右", 10, 100, 649),
+            self._char("页", 28, 100, 190),
+            self._char("页", 28, 100, 649),
+        ]
+        pages = export_precise.group_chars_by_canvas(chars)
+        self.assertEqual(len(pages), 2)
+        left = "".join(c["t"] for c in sorted(pages[0], key=lambda c: c["x"]))
+        right = "".join(c["t"] for c in sorted(pages[1], key=lambda c: c["x"]))
+        self.assertEqual(left, "左页")
+        self.assertEqual(right, "右页")
+
+    def test_build_page_blocks_does_not_interleave_spread(self):
+        # 模拟：左页正文「至异…」，右页正文「萧史…」同一 y
+        left_text = "至异"
+        right_text = "萧史"
+        chars = []
+        for i, ch in enumerate(left_text):
+            chars.append(self._char(ch, 10 + i * 18, 100, 190))
+        for i, ch in enumerate(right_text):
+            chars.append(self._char(ch, 10 + i * 18, 100, 649))
+        for i, ch in enumerate("菩萨蛮"):
+            chars.append(self._char(ch, 140 + i * 27, 200, 649, s=27))
+        for i, ch in enumerate("李白"):
+            chars.append(self._char(ch, 152 + i * 29, 240, 649, s=28.8))
+        for i, ch in enumerate("平林"):
+            chars.append(self._char(ch, 10 + i * 18, 280, 649, s=18))
+
+        rects = [
+            {"top": 73, "left": 190, "w": 361, "h": 770},
+            {"top": 73, "left": 649, "w": 361, "h": 770},
+        ]
+        blocks = export_precise.build_page_blocks(chars, [], rects, set())
+        texts = [b["text"] for b in blocks if b["type"] == "text"]
+        joined = "\n".join(texts)
+        self.assertNotIn("至萧异史", joined)
+        self.assertIn("至异", texts)
+        self.assertIn("萧史", texts)
+        self.assertIn("菩萨蛮", texts)
+        self.assertIn("李白", texts)
+
+        body, _ = export_precise.render_chapter_md("李白", blocks, 5)
+        self.assertIn("菩萨蛮\n\n李白", body)
+        self.assertIn("李白\n\n平林", body)
+        self.assertNotIn("菩萨蛮平林", body)
+        self.assertNotIn("菩萨蛮李白平林", body)
 
 
 if __name__ == "__main__":
