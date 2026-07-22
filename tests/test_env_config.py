@@ -59,10 +59,10 @@ class TestEnvConfig(unittest.TestCase):
         self.assertGreater(env_config.SLEEP_SHELF_SCROLL, 0)
         # 代码默认值（不依赖当前 .env 是否被改过）
         self.assertEqual(env_config.env_float("SLEEP_BOOK_DETAIL_INTERVAL_UNSET_X", 5.0), 5.0)
-        self.assertEqual(env_config.SLEEP_BOOK_INTERVAL, 180.0)
+        self.assertEqual(env_config.SLEEP_BOOK_INTERVAL, 60.0)
         self.assertEqual(env_config.SLEEP_CHAPTER_PER_1K_CHARS, 2.0)
         self.assertEqual(env_config.SLEEP_CHAPTER_MIN, 2.0)
-        self.assertEqual(env_config.SLEEP_CHAPTER_MAX, 15.0)
+        self.assertEqual(env_config.SLEEP_CHAPTER_MAX, 8.0)
 
 
     def test_env_path_and_books_dir(self):
