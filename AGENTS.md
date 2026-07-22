@@ -55,13 +55,18 @@
 
 ## Skills（Claude Code / Codex 共用）
 
-仓库内置的 skill 放在 `.claude/skills/<name>/SKILL.md`。Claude Code 会自动发现；**Codex 不会自动扫描该目录**，需按下表手动读取对应文件后照做。
+仓库内置 skill 同步放在两处，内容保持一致：
+
+| 位置 | 用途 |
+|------|------|
+| `.claude/skills/<name>/SKILL.md` | Claude Code 自动发现 |
+| `.agents/skills/<name>/SKILL.md` | Codex 自动发现（仓库 skill root） |
 
 | 触发场景 | skill 文件 |
 |----------|-----------|
-| 书架书去重：判断 `data/shelf_books.txt` 的书是否已在 `data/ebook-info.json`，分别落到 `data/dup_books.txt` / `data/new_books.txt` | `.claude/skills/dedupe-shelf-books/SKILL.md` |
+| 书架书去重：判断 `data/shelf_books.txt` 的书是否已在 `data/ebook-info.json`，分别落到 `data/dup_books.txt` / `data/new_books.txt` | `.agents/skills/dedupe-shelf-books/SKILL.md`（同 `.claude/skills/dedupe-shelf-books/SKILL.md`） |
 
-当用户说"书架去重 / 找重复书 / 找新书 / 生成 dup_books、new_books"等，读 `.claude/skills/dedupe-shelf-books/SKILL.md` 并按其流程执行。
+当用户说"书架去重 / 找重复书 / 找新书 / 生成 dup_books、new_books"等，读上述 skill 并按其流程执行。
 
 ## 修改完成后必须自动提交
 
