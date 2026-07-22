@@ -171,6 +171,18 @@ class TestExportPreciseCli(unittest.TestCase):
         vp = export_precise.reader_viewport(1280, 720)
         self.assertEqual(vp, {"width": 1280, "height": 720})
 
+    def test_page_viewport_uses_browser_inner_size(self):
+        async def run():
+            page = mock.AsyncMock()
+            page.evaluate.return_value = {"width": 1004, "height": 477}
+
+            vp = await export_precise.page_viewport(
+                page, {"width": 1200, "height": 900})
+
+            self.assertEqual(vp, {"width": 1004, "height": 477})
+
+        asyncio.run(run())
+
     def test_reader_layout_keeps_desktop_width_unless_forced(self):
         async def run():
             page = mock.AsyncMock()

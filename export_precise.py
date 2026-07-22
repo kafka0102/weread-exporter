@@ -88,6 +88,22 @@ def viewport_focus_point(viewport=None):
     return int(vp["width"] * 0.5), int(vp["height"] * 0.45)
 
 
+async def page_viewport(page, fallback=None):
+    """读取当前页面真实 viewport；失败时回退到配置值。"""
+    fb = dict(fallback or reader_viewport())
+    try:
+        size = await page.evaluate(
+            "() => ({width: window.innerWidth, height: window.innerHeight})"
+        )
+        w = int(size.get("width") or 0)
+        h = int(size.get("height") or 0)
+        if w > 0 and h > 0:
+            return {"width": w, "height": h}
+    except Exception:
+        pass
+    return fb
+
+
 async def count_reader_canvases(page):
     """可见正文 canvas 数量（高度足够的才算阅读页）。"""
     return await page.evaluate(
@@ -590,6 +606,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         await page.goto(f"https://weread.qq.com/web/reader/{book_id}",
                         wait_until="networkidle", timeout=30000)
         await asyncio.sleep(SLEEP_READER_AFTER_LOAD)
+        actual_viewport = await page_viewport(page, viewport)
+        if actual_viewport != viewport:
+            print(
+                f"  🪟 页面视口: {actual_viewport['width']}x{actual_viewport['height']} "
+                f"（配置 {viewport['width']}x{viewport['height']}）"
+            )
+            viewport = actual_viewport
         if headless and await page_needs_login(page):
             await ctx.close()
             raise RuntimeError(

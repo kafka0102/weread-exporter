@@ -9,6 +9,7 @@ from weread_session import (
     prepare_browser_profile,
     resolve_headless,
 )
+import weread_session
 
 
 class TestIsLoginUrl(unittest.TestCase):
@@ -99,6 +100,27 @@ class TestPrepareBrowserProfile(unittest.TestCase):
             out = prepare_browser_profile(td)
             self.assertEqual(out, td)
             self.assertTrue(Path(td).is_dir())
+
+
+class TestLaunchOptions(unittest.TestCase):
+    def test_headful_viewport_uses_real_browser_window(self):
+        opts = weread_session.build_launch_kwargs(
+            headless=False,
+            viewport={"width": 1200, "height": 900},
+        )
+
+        self.assertTrue(opts["no_viewport"])
+        self.assertNotIn("viewport", opts)
+        self.assertIn("--window-size=1200,900", opts["args"])
+
+    def test_headless_keeps_fixed_viewport(self):
+        opts = weread_session.build_launch_kwargs(
+            headless=True,
+            viewport={"width": 1200, "height": 900},
+        )
+
+        self.assertEqual(opts["viewport"], {"width": 1200, "height": 900})
+        self.assertNotIn("no_viewport", opts)
 
 
 

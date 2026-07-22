@@ -72,6 +72,54 @@ def prepare_browser_profile(user_data_dir: str = USER_DATA_DIR) -> str:
     return str(root)
 
 
+def normalized_viewport(viewport: Optional[dict] = None) -> dict:
+    """返回可传给 Chromium 的整数 viewport/window 尺寸。"""
+    raw = viewport or DEFAULT_VIEWPORT
+    return {
+        "width": max(360, int(raw.get("width") or DEFAULT_VIEWPORT["width"])),
+        "height": max(480, int(raw.get("height") or DEFAULT_VIEWPORT["height"])),
+    }
+
+
+def with_window_size_arg(args: list[str], viewport: dict) -> list[str]:
+    """把真实浏览器窗口尺寸同步到 Chromium 启动参数。"""
+    out = [arg for arg in args if not str(arg).startswith("--window-size=")]
+    out.append(f"--window-size={viewport['width']},{viewport['height']}")
+    return out
+
+
+def build_launch_kwargs(
+    *,
+    headless: bool = False,
+    viewport: Optional[dict] = None,
+    **kwargs: Any,
+) -> dict:
+    """构建 launch_persistent_context 参数。
+
+    有头模式用真实窗口承载页面，避免窗口很大但网页仍被固定 viewport
+    约束在一小块区域内；无头模式保留固定 viewport，保证导出稳定。
+    """
+    vp = normalized_viewport(viewport)
+    args = list(kwargs.pop("args", DEFAULT_ARGS))
+    explicit_no_viewport = kwargs.pop("no_viewport", None)
+    use_real_window = (
+        (not headless)
+        if explicit_no_viewport is None
+        else bool(explicit_no_viewport)
+    )
+
+    launch_kwargs = {
+        "headless": headless,
+        "args": with_window_size_arg(args, vp) if use_real_window else args,
+    }
+    if use_real_window:
+        launch_kwargs["no_viewport"] = True
+    else:
+        launch_kwargs["viewport"] = vp
+    launch_kwargs.update(kwargs)
+    return launch_kwargs
+
+
 async def launch_weread_context(
     playwright: Any,
     *,
@@ -85,12 +133,11 @@ async def launch_weread_context(
     调用方负责关闭 context，并管理 async_playwright 生命周期。
     """
     prepare_browser_profile(user_data_dir)
-    launch_kwargs = {
-        "headless": headless,
-        "viewport": viewport or DEFAULT_VIEWPORT,
-        "args": list(kwargs.pop("args", DEFAULT_ARGS)),
-    }
-    launch_kwargs.update(kwargs)
+    launch_kwargs = build_launch_kwargs(
+        headless=headless,
+        viewport=viewport,
+        **kwargs,
+    )
     return await playwright.chromium.launch_persistent_context(
         user_data_dir, **launch_kwargs
     )
