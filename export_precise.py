@@ -717,6 +717,15 @@ def should_follow_header_title(catalog_titles, current_title, header_title) -> b
     return h_idx == c_idx + 1
 
 
+def reader_needs_chapter_sync(catalog_titles, target_title, reader_title) -> bool:
+    """内容切章后，阅读器是否仍未落到目标章。"""
+    target = resolve_chapter_title(target_title, catalog_titles)
+    if not target:
+        return False
+    reader = resolve_chapter_title(reader_title, catalog_titles)
+    return compact_title_key(reader) != compact_title_key(target)
+
+
 def chapter_blocks_fingerprint(title: str, blocks) -> str:
     """章节正文指纹：用于检测死循环重复落盘。"""
     body, _imgs = render_chapter_md(title, blocks or [], 0)
@@ -1981,6 +1990,34 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             print(f"    … 章间等待 {wait_s:.1f}s（按 {n_chars} 字）")
             await asyncio.sleep(wait_s)
 
+        async def sync_reader_after_content_split(target_title: str) -> bool:
+            """内容已切章时，确保阅读器也定位到同一目录项。"""
+            reader_title = await read_chapter_title(page, catalog_titles)
+            if not reader_needs_chapter_sync(
+                    catalog_titles, target_title, reader_title):
+                return True
+
+            print(
+                f"    … 内容已切到「{target_title[:20]}」，"
+                f"阅读器仍在「{(reader_title or '未知')[:20]}」，目录同步"
+            )
+            jumped = await goto_catalog_chapter(page, target_title)
+            if not jumped:
+                print(f"    ⚠️  内容切章后目录同步失败「{target_title[:20]}」")
+                return False
+
+            reset_page_dedupe()
+            for _ in range(4):
+                await dismiss_reader_search(page)
+                await close_reader_catalog(page)
+                if not await is_reader_catalog_open(page):
+                    break
+                await asyncio.sleep(0.12)
+            await blur_reader_inputs(page)
+            await focus_reader_for_keyboard(page)
+            await recover_reader_text_after_nav(page)
+            return True
+
         async def split_if_next_chapter_started():
             """目录下一章标题已出现在正文块中时，提前切章（修复标题栏滞后/读空导致的窜章）。
 
@@ -2020,6 +2057,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             current_chapter = nxt
             page_num = 0
             stale = 0
+            await sync_reader_after_content_split(current_chapter)
             return True
 
         # 首页

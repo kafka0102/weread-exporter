@@ -189,7 +189,6 @@ class TestHeaderChapterProgress(unittest.TestCase):
                 catalog, "春晓", "王维 二十七首"
             )
         )
-
     def test_fingerprint_stable_for_same_blocks(self):
         blocks = [
             {"type": "text", "text": "渭川田家"},
@@ -222,6 +221,25 @@ class TestHeaderChapterProgress(unittest.TestCase):
         self.assertNotEqual(fa, fc)
         self.assertEqual(export_precise.page_blocks_fingerprint([]), "")
 
+
+class TestReaderChapterSync(unittest.TestCase):
+    """内容切章后必须确认阅读器已落在目标章。"""
+
+    def test_requires_sync_when_reader_still_on_previous_chapter(self):
+        catalog = ["从军行", "卢照邻 一首", "长安古意"]
+        self.assertTrue(
+            export_precise.reader_needs_chapter_sync(
+                catalog, "长安古意", "卢照邻 一首"
+            )
+        )
+
+    def test_does_not_sync_when_reader_is_already_on_target_chapter(self):
+        catalog = ["从军行", "卢照邻 一首", "长安古意"]
+        self.assertFalse(
+            export_precise.reader_needs_chapter_sync(
+                catalog, "长安古意", "长安古意"
+            )
+        )
 
 
 class TestFindChapterSplit(unittest.TestCase):
@@ -419,4 +437,3 @@ class TestChapterStartSpaceTolerance(unittest.TestCase):
         ]
         found = export_precise.find_chapter_split(blocks, catalog, "赠苏绾书记")
         self.assertIsNone(found)
-
