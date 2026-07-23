@@ -1503,7 +1503,9 @@ def chapter_saved(text_len, images):
 async def click_catalog_list_item(page, target_title: str = "") -> str:
     """用真实鼠标点击目录项（Vue 对纯 JS click 常无响应）。
 
-    target_title 为空时点第一个可见项。成功返回清洗后的章名。
+    - target_title 为空：点第一个可见项（用于跳到全书开头）
+    - target_title 非空：只点匹配项；当前屏找不到则返回 ""（调用方滚目录再试）
+      **绝不**在指定目标时退回点击首项，否则会误跳到「版权信息」。
     """
     target = normalize_catalog_title(target_title)
     info = await page.evaluate(
@@ -1522,9 +1524,19 @@ async def click_catalog_list_item(page, target_title: str = "") -> str:
                     && r.right > 0 && r.left < window.innerWidth
                     && r.bottom > 0 && r.top < window.innerHeight;
             };
+            const matchTitle = (t, tgt) => {
+                if (!t) return false;
+                if (!tgt) return true;
+                if (t === tgt) return true;
+                if (t.includes(tgt) || tgt.includes(t)) {
+                    const a = Math.min(t.length, tgt.length);
+                    const b = Math.abs(t.length - tgt.length);
+                    return a >= 2 && b <= 12;
+                }
+                return false;
+            };
             const items = Array.from(document.querySelectorAll('.readerCatalog_list_item'));
-            let pick = null;
-            let raw = '';
+            const scored = [];
             for (const el of items) {
                 if (el.closest && el.closest('form, [class*="searchInput"], [class*="SearchInput"]')) {
                     continue;
@@ -1535,23 +1547,29 @@ async def click_catalog_list_item(page, target_title: str = "") -> str:
                 );
                 const t = strip((titleEl && titleEl.textContent) || el.textContent || '');
                 if (!t) continue;
-                if (!target || t === target || t.includes(target) || target.includes(t)) {
-                    pick = el;
-                    raw = t;
-                    break;
+                if (!matchTitle(t, target)) continue;
+                let score = 0;
+                if (t === target) score = 100;
+                else if (t.startsWith(target) || target.startsWith(t)) score = 80;
+                else score = 50;
+                scored.push({el, t, score});
+            }
+            scored.sort((a, b) => b.score - a.score);
+            let pick = scored.length ? scored[0].el : null;
+            let raw = scored.length ? scored[0].t : '';
+            if (!pick && !target) {
+                pick = items.find(el => visible(el)) || null;
+                if (pick) {
+                    const titleEl = pick.querySelector(
+                        '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
+                    );
+                    raw = strip((titleEl && titleEl.textContent) || pick.textContent || '');
                 }
             }
-            if (!pick) {
-                const el = items[0];
-                if (!el) return null;
-                const titleEl = el.querySelector(
-                    '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
-                );
-                raw = strip((titleEl && titleEl.textContent) || el.textContent || '');
-                pick = el;
-            }
+            if (!pick) return null;
             pick.scrollIntoView({block: 'center'});
             const r = pick.getBoundingClientRect();
+            if (r.width < 20 || r.height < 10) return null;
             return {
                 raw,
                 x: r.x + Math.min(Math.max(r.width / 2, 20), 120),
@@ -1565,41 +1583,23 @@ async def click_catalog_list_item(page, target_title: str = "") -> str:
     if not info:
         return ""
     raw = normalize_catalog_title(str(info.get("raw") or ""))
+    if target:
+        if not raw:
+            return ""
+        if raw != target and target not in raw and raw not in target:
+            return ""
+        if min(len(raw), len(target)) < 2:
+            return ""
     try:
         x, y = float(info["x"]), float(info["y"])
         w, h = float(info.get("w") or 0), float(info.get("h") or 0)
         if w >= 20 and h >= 10:
             await page.mouse.click(x, y)
         else:
-            await page.evaluate(
-                r"""(target) => {
-                    const strip = (s) => String(s || '')
-                        .replace(/(当前读到|已读到|读到)\s*\d+\s*%?\s*$/g, '')
-                        .replace(/\s*\d+\s*%\s*$/g, '')
-                        .trim();
-                    const items = Array.from(document.querySelectorAll('.readerCatalog_list_item'));
-                    for (const el of items) {
-                        const titleEl = el.querySelector(
-                            '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
-                        );
-                        const t = strip((titleEl && titleEl.textContent) || el.textContent || '');
-                        if (!target || t === target || t.includes(target) || target.includes(t)) {
-                            el.click();
-                            return true;
-                        }
-                    }
-                    if (items[0]) {
-                        items[0].click();
-                        return true;
-                    }
-                    return false;
-                }""",
-                target,
-            )
+            return ""
     except Exception:
-        return raw
+        return ""
     return raw
-
 
 
 async def goto_catalog_chapter(page, target_title: str) -> str:
@@ -1623,13 +1623,30 @@ async def goto_catalog_chapter(page, target_title: str) -> str:
             await blur_reader_inputs(page)
             clicked = await click_catalog_list_item(page, target)
             if clicked:
-                await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
-                await dismiss_reader_search(page)
-                await close_reader_catalog(page)
-                await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
-                if await is_reader_catalog_open(page):
+                hit = normalize_catalog_title(clicked)
+                ok = (
+                    hit == target
+                    or (
+                        hit and target
+                        and (hit in target or target in hit)
+                        and min(len(hit), len(target)) >= 2
+                        and abs(len(hit) - len(target)) <= 12
+                    )
+                )
+                if not ok:
+                    print(
+                        f"    … 目录点到「{(hit or '')[:24]}」≠目标「{target[:24]}」，继续滚找"
+                    )
+                else:
+                    await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
+                    await dismiss_reader_search(page)
                     await close_reader_catalog(page)
-                return normalize_catalog_title(clicked) or target
+                    await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
+                    for _ in range(3):
+                        if not await is_reader_catalog_open(page):
+                            break
+                        await close_reader_catalog(page)
+                    return hit or target
 
             moved = await page.evaluate(
                 """() => {
@@ -1719,9 +1736,31 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         # 顶栏仍空且是全书开头：用目录首项，保证后续能按目录顺序切章
         if not current_chapter and catalog_titles and (goto_first or start_idx <= 1):
             current_chapter = catalog_titles[0]
+        # 续传：阅读器常停在错误位置，目录跳到「已导出最后一章」的下一章
+        if (not goto_first) and start_idx > 1 and catalog_titles:
+            from_md_title, _ = get_last_chapter_title(md_dir)
+            anchor = normalize_catalog_title(from_md_title or "")
+            nxt = next_catalog_title(catalog_titles, anchor) if anchor else None
+            if nxt:
+                cur_idx = catalog_index(catalog_titles, current_chapter or "")
+                nxt_idx = catalog_index(catalog_titles, nxt)
+                if cur_idx is None or nxt_idx is None or abs(cur_idx - nxt_idx) > 1:
+                    print(
+                        f"  … 续传定位：目录跳到「{nxt[:32]}」"
+                        f"（接在「{(anchor or '')[:24]}」后）"
+                    )
+                    jumped = await goto_catalog_chapter(page, nxt)
+                    if jumped:
+                        current_chapter = resolve_chapter_title(
+                            jumped, catalog_titles) or jumped
+                    for _ in range(3):
+                        await close_reader_catalog(page)
+                        if not await is_reader_catalog_open(page):
+                            break
+                    await blur_reader_inputs(page)
+                    await focus_reader_for_keyboard(page)
         print(f"  📖 {book_title} — {book_author}")
-        print(f"  会话开始:「{current_chapter}」\n")
-
+        print(f"  会话开始:「{current_chapter}」")
         ch_idx = start_idx
         ch_blocks = []
         total_chars = total_imgs = 0
