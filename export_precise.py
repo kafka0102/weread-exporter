@@ -324,6 +324,41 @@ async def force_reader_repaint(page) -> None:
         pass
 
 
+async def recover_reader_text_after_nav(page) -> int:
+    """目录跳转/重定位后尽量保住 canvas 文字，禁止先 reset 再空等。
+
+    历史 bug：跳转等待期间 fillText 已写入 __wr_chars，随后 __wr_reset
+    一把清掉，再靠微扰动很难重绘 → 页面明明有字、日志一直 stale。
+    返回稳定后的字符计数（可能为 0）。
+    """
+    # 1) 先等已有绘制落稳（不 reset）
+    count = await wait_stable(page, 0, timeout=2.5)
+    if count and count > 0:
+        return count
+    # 2) 扰动重绘，仍不 reset
+    await force_reader_repaint(page)
+    count = await wait_stable(page, 0, timeout=2.0)
+    if count and count > 0:
+        return count
+    # 3) 左右键轻推一页再回到当前，迫使重新 fillText
+    try:
+        await dismiss_reader_search(page)
+        await focus_reader_for_keyboard(page)
+        await blur_reader_inputs(page)
+        await page.keyboard.press("ArrowLeft")
+        await asyncio.sleep(max(0.15, float(SLEEP_READER_PAGE_TURN) * 0.5))
+        await page.evaluate("() => window.__wr_reset && window.__wr_reset()")
+        await page.keyboard.press("ArrowRight")
+        await asyncio.sleep(max(0.2, float(SLEEP_READER_PAGE_TURN)))
+        await force_reader_repaint(page)
+        count = await wait_stable(page, 0, timeout=3.0)
+        if count and count > 0:
+            return count
+    except Exception:
+        pass
+    return int(count or 0)
+
+
 async def count_reader_canvases(page):
     """可见正文 canvas 数量（高度足够的才算阅读页）。"""
     return await page.evaluate(
@@ -1810,6 +1845,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                             break
                     await blur_reader_inputs(page)
                     await focus_reader_for_keyboard(page)
+                    await recover_reader_text_after_nav(page)
         print(f"  📖 {book_title} — {book_author}")
         print(f"  会话开始:「{current_chapter}」")
         ch_idx = start_idx
@@ -2080,9 +2116,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                             current_chapter = resolve_chapter_title(
                                 jumped, catalog_titles) or current_chapter
                         reset_page_dedupe()
-                        await page.evaluate("() => window.__wr_reset()")
-                        await force_reader_repaint(page)
-                        await wait_stable(page, 0)
+                        # 跳转期间已 fillText：切勿先 reset
+                        await recover_reader_text_after_nav(page)
                         await capture_current_page()
                         while await split_if_next_chapter_started():
                             if reached_end:
@@ -2124,9 +2159,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         current_chapter = resolve_chapter_title(
                             jumped, catalog_titles) or current_chapter
                     reset_page_dedupe()
-                    await page.evaluate("() => window.__wr_reset()")
-                    await force_reader_repaint(page)
-                    await wait_stable(page, 0)
+                    await recover_reader_text_after_nav(page)
                 await capture_current_page()
                 # 当前页也可能继续跨到再下一章
                 while await split_if_next_chapter_started():
@@ -2138,13 +2171,16 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 continue
 
             got_new = await capture_current_page()
-            # 偶发：页已翻但 fillText 迟到 → 短重绘再抓一次
+            # 偶发：页已翻但 fillText 迟到 → 短重绘再抓（禁止 repaint 后再 reset）
             if not got_new:
                 await force_reader_repaint(page)
-                await page.evaluate("() => window.__wr_reset()")
                 await asyncio.sleep(max(0.08, float(SLEEP_READER_PAGE_RENDER)))
                 await wait_stable(page, 0, timeout=1.5)
                 got_new = await capture_current_page()
+                if not got_new:
+                    n = await recover_reader_text_after_nav(page)
+                    if n and n > 0:
+                        got_new = await capture_current_page()
                 if got_new:
                     print(
                         f"    … 重绘后抓到新内容 当前「{(current_chapter or '')[:24]}」"
@@ -2275,9 +2311,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         await asyncio.sleep(0.15)
                     await blur_reader_inputs(page)
                     await focus_reader_for_keyboard(page)
-                    await page.evaluate("() => window.__wr_reset()")
-                    await force_reader_repaint(page)
-                    await wait_stable(page, 0)
+                    await recover_reader_text_after_nav(page)
                     await capture_current_page()
                     while await split_if_next_chapter_started():
                         if reached_end:
