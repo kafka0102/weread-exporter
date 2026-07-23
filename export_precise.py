@@ -927,6 +927,81 @@ def chapter_saved(text_len, images):
     return bool(text_len or images)
 
 
+
+async def goto_catalog_chapter(page, target_title: str) -> str:
+    """打开目录并点击目标章名；成功返回实际点到的清洗标题，失败返回空串。
+
+    用于键盘翻页失效/同页空转时，强制跳到目录中的下一章，打破死循环。
+    """
+    target = normalize_catalog_title(target_title)
+    if not target:
+        return ""
+    try:
+        await page.click("button.readerControls_item.catalog", timeout=5000)
+        await asyncio.sleep(SLEEP_READER_CATALOG_OPEN)
+
+        for _ in range(60):
+            clicked = await page.evaluate(
+                r"""(target) => {
+                    const strip = (s) => String(s || '')
+                        .replace(/(当前读到|已读到|读到)\s*\d+\s*%?\s*$/g, '')
+                        .replace(/\s*\d+\s*%\s*$/g, '')
+                        .trim();
+                    const items = Array.from(
+                        document.querySelectorAll('.readerCatalog_list_item')
+                    );
+                    for (const el of items) {
+                        const titleEl = el.querySelector(
+                            '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
+                        );
+                        const raw = strip((titleEl && titleEl.textContent) || el.textContent || '');
+                        if (!raw) continue;
+                        if (raw === target || raw.includes(target) || target.includes(raw)) {
+                            el.scrollIntoView({block: 'center'});
+                            el.click();
+                            return raw;
+                        }
+                    }
+                    return '';
+                }""",
+                target,
+            )
+            if clicked:
+                await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
+                await close_reader_catalog(page)
+                await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
+                return normalize_catalog_title(clicked) or target
+
+            moved = await page.evaluate(
+                """() => {
+                    const sc = document.querySelector(
+                        '.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]'
+                    );
+                    if (!sc) return false;
+                    const before = sc.scrollTop;
+                    const max = Math.max(0, sc.scrollHeight - sc.clientHeight);
+                    if (before >= max - 1) return false;
+                    sc.scrollTop = Math.min(
+                        max, before + Math.max(sc.clientHeight * 0.85, 100)
+                    );
+                    return sc.scrollTop > before;
+                }"""
+            )
+            if not moved:
+                break
+            await asyncio.sleep(max(0.05, float(SLEEP_READER_CATALOG_SCROLL) * 0.15))
+
+        await close_reader_catalog(page)
+        print(f"  ⚠️  目录中未找到「{target}」")
+    except Exception as e:
+        print(f"  ⚠️  目录跳转「{target}」异常: {e}")
+        try:
+            await close_reader_catalog(page)
+        except Exception:
+            pass
+    return ""
+
+
 async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                       goto_first=False, catalog_path=None, headless=False,
                       reader_width=None, reader_height=None,
@@ -1004,38 +1079,73 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         saved_chapter_fps: set[str] = set()
         dup_chapter_hits = [0]
         MAX_DUP_CHAPTER_HITS = 5
-        # 上一页正文指纹：翻页失败/同页重绘时不得反复 append
-        last_page_fp = ""
+        # 页指纹集合 + 正文行集合：同页重绘只要行内容一样就不算新页
+        seen_page_fps: set[str] = set()
+        seen_text_lines: set[str] = set()
         turn_methods = ("arrow", "space", "pagedown")
         turn_method_idx = 0
+        catalog_jump_count = 0
+        MAX_CATALOG_JUMPS = 30
+
+        def reset_page_dedupe():
+            """换章或目录跳转后清空页级去重状态。"""
+            nonlocal seen_page_fps, seen_text_lines
+            seen_page_fps = set()
+            seen_text_lines = set()
+
+        def remember_text_lines(blocks):
+            for b in blocks or []:
+                if b.get("type") == "text":
+                    t = (b.get("text") or "").strip()
+                    if t:
+                        seen_text_lines.add(t)
 
         async def capture_current_page():
             """抓当前页的有序块，累加到 ch_blocks；返回是否有新内容。
 
-            同一页（正文指纹相同）重复捕获时不追加，避免：
-            1) got_new 恒为 True → stale 永不累计 → 死循环空转
-            2) 同页内容反复 append 后被内容切章再次切开
+            去重策略（从强到弱）：
+            1) 整页指纹已见过 → 丢弃
+            2) 文本行已在本章缓冲中出现过 → 跳过该行
+            避免 canvas 重绘细微差异导致 got_new 恒真、死循环空转。
             """
-            nonlocal ch_blocks, last_page_fp
+            nonlocal ch_blocks
             await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
             chars = await page.evaluate("() => window.__wr_chars")
             rects = await page.evaluate(CANVAS_RECTS_JS)
             imgs = await page.evaluate(VIEWPORT_IMGS_JS)
             new_blocks = build_page_blocks(chars, imgs, rects, seen_imgs)
-            page_fp = page_blocks_fingerprint(new_blocks)
             if not new_blocks:
                 return False
-            if page_fp and page_fp == last_page_fp:
+            page_fp = page_blocks_fingerprint(new_blocks)
+            if page_fp and page_fp in seen_page_fps:
                 return False
-            before = len(ch_blocks)
+            added = 0
             for b in new_blocks:
-                if b["type"] == "text":
-                    if ch_blocks and ch_blocks[-1].get("type") == "text" and ch_blocks[-1]["text"] == b["text"]:
+                if b.get("type") == "text":
+                    t = (b.get("text") or "").strip()
+                    if not t:
                         continue
-                ch_blocks.append(b)
-            if len(ch_blocks) > before:
-                last_page_fp = page_fp
+                    if t in seen_text_lines:
+                        continue
+                    if (
+                        ch_blocks
+                        and ch_blocks[-1].get("type") == "text"
+                        and ch_blocks[-1].get("text") == t
+                    ):
+                        continue
+                    seen_text_lines.add(t)
+                    ch_blocks.append({"type": "text", "text": t})
+                    added += 1
+                else:
+                    ch_blocks.append(b)
+                    added += 1
+            if added > 0:
+                if page_fp:
+                    seen_page_fps.add(page_fp)
                 return True
+            # 行全是重复：也记入页指纹，防止反复解析同一页
+            if page_fp:
+                seen_page_fps.add(page_fp)
             return False
 
         async def commit_chapter(title, blocks, *, note_suffix=""):
@@ -1109,6 +1219,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 await sleep_between_chapters(n)
             # before 为空：上一章已落盘或本页已属新章，仅把块归属切到下一章
             ch_blocks = after
+            # after 中的行本就来自旧缓冲，保持 seen_text_lines，避免同页再抓时重复切入
+            remember_text_lines(after)
             current_chapter = nxt
             page_num = 0
             stale = 0
@@ -1141,10 +1253,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 n, _imgs = await commit_chapter(current_chapter, ch_blocks)
                 ch_idx += 1
                 ch_blocks = after
+                remember_text_lines(after)
                 current_chapter = resolve_chapter_title(new_chapter, catalog_titles) or new_chapter
                 page_num = 0
                 stale = 0
-                last_page_fp = ""
                 turn_method_idx = 0
                 if not is_last:
                     await sleep_between_chapters(n)
@@ -1177,26 +1289,64 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 # 同页空转时轮换翻页键，并给出可观察日志
                 if stale in (1, 3, 5, 8):
                     print(
-                        f"    … 翻页无新内容 stale={stale}/10 "
+                        f"    … 翻页无新内容 stale={stale}/8 "
                         f"当前「{(current_chapter or '')[:24]}」 key={turn_method}"
                     )
                 if stale >= 2:
                     turn_method_idx += 1
-                if stale >= 10:
+
+                # 键盘翻页连续失效：用目录强制跳到下一章（诗词选集高频场景）
+                if stale >= 5 and catalog_titles:
+                    nxt = next_catalog_title(catalog_titles, current_chapter)
+                    if not nxt:
+                        await commit_chapter(
+                            current_chapter, ch_blocks, note_suffix=" [全书末尾]")
+                        reached_end = True
+                        break
+                    if catalog_jump_count >= MAX_CATALOG_JUMPS:
+                        raise RuntimeError(
+                            "目录强制跳转次数过多，疑似无法前进。"
+                            f"当前章「{current_chapter}」，下一章「{nxt}」。"
+                        )
+                    print(
+                        f"    … 翻页停滞，目录跳转 →「{nxt[:32]}」"
+                        f"（{catalog_jump_count + 1}/{MAX_CATALOG_JUMPS}）"
+                    )
+                    n, _imgs = await commit_chapter(
+                        current_chapter, ch_blocks, note_suffix=" [目录跳转切章]")
+                    ch_idx += 1
+                    if n:
+                        await sleep_between_chapters(n)
+                    ch_blocks = []
+                    reset_page_dedupe()
+                    jumped = await goto_catalog_chapter(page, nxt)
+                    current_chapter = resolve_chapter_title(
+                        jumped or nxt, catalog_titles) or nxt
+                    catalog_jump_count += 1
+                    stale = 0
+                    page_num = 0
+                    turn_method_idx = 0
+                    await page.evaluate("() => window.__wr_reset()")
+                    await wait_stable(page, 0)
+                    await capture_current_page()
+                    while await split_if_next_chapter_started():
+                        if reached_end:
+                            break
+                    continue
+
+                if stale >= 8:
                     note = ""
-                    # 末章、标题对不上目录、或已连续无新内容：结束，避免整本抓完还误重开
                     if is_last_catalog_chapter(current_chapter, catalog_titles):
                         reached_end = True
                         note = " [全书末尾]"
-                    elif not catalog_titles or catalog_index(catalog_titles, current_chapter) is None:
+                    elif not catalog_titles or catalog_index(
+                            catalog_titles, current_chapter) is None:
                         reached_end = True
                         note = " [无更多新内容]"
                     elif page_num >= 20:
-                        # 本会话已稳定翻过很多页后停住，多半到书末
                         reached_end = True
                         note = " [无更多新内容]"
                     else:
-                        # 中段卡住：结束本会话以便重开；避免同页无限空转
                         note = " [翻页停滞]"
                     await commit_chapter(current_chapter, ch_blocks, note_suffix=note)
                     break
