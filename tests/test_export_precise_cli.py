@@ -205,15 +205,12 @@ class TestExportPreciseCli(unittest.TestCase):
             page = mock.Mock()
             page.keyboard.press = mock.AsyncMock()
             page.click = mock.AsyncMock()
-            catalog = mock.Mock()
-            catalog.is_visible = mock.AsyncMock(return_value=False)
-            page.locator.return_value = catalog
+            page.evaluate = mock.AsyncMock(return_value=False)
 
             closed = await export_precise.close_reader_catalog(page)
 
             self.assertFalse(closed)
             page.keyboard.press.assert_not_called()
-            page.click.assert_not_called()
 
         asyncio.run(run())
 
@@ -222,15 +219,13 @@ class TestExportPreciseCli(unittest.TestCase):
             page = mock.Mock()
             page.keyboard.press = mock.AsyncMock()
             page.click = mock.AsyncMock()
-            catalog = mock.Mock()
-            catalog.is_visible = mock.AsyncMock(return_value=True)
-            page.locator.return_value = catalog
+            # is_reader_catalog_open -> True first, then False after close attempts
+            page.evaluate = mock.AsyncMock(side_effect=[True, 0, False, 0])
 
             closed = await export_precise.close_reader_catalog(page)
 
             self.assertTrue(closed)
-            page.keyboard.press.assert_awaited_once_with("Escape")
-            page.click.assert_not_called()
+            page.keyboard.press.assert_any_await("Escape")
 
         asyncio.run(run())
 

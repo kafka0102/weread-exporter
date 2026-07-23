@@ -812,13 +812,143 @@ async def fetch_book_title(page):
     return info.get("title", "未知"), info.get("author", "")
 
 
-async def close_reader_catalog(page):
-    """仅在目录仍可见时关闭，避免选章后再次把目录打开。"""
-    catalog = page.locator(".readerCatalog")
-    if not await catalog.is_visible():
+async def dismiss_reader_overlays(page) -> bool:
+    """关掉阅读器遮罩/蒙层，避免 wr_mask 拦截目录按钮点击。"""
+    removed = await page.evaluate(
+        """() => {
+            let n = 0;
+            document.querySelectorAll(
+                '.wr_mask, .wr_mask_Show, [class*="wr_mask"]'
+            ).forEach(el => {
+                try {
+                    el.style.pointerEvents = 'none';
+                    el.style.display = 'none';
+                    el.remove();
+                    n += 1;
+                } catch (e) {}
+            });
+            return n;
+        }"""
+    )
+    return bool(removed)
+
+
+async def is_reader_catalog_open(page) -> bool:
+    """目录侧栏是否处于打开状态。"""
+    try:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const el = document.querySelector(
+                        '.readerCatalog, [class*="readerCatalog"]'
+                    );
+                    if (!el) return false;
+                    const st = window.getComputedStyle(el);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 80 && r.height > 80;
+                }"""
+            )
+        )
+    except Exception:
         return False
+
+
+async def close_reader_catalog(page):
+    """强制关闭目录侧栏与遮罩；目录一直开着会导致翻页/点按钮失效。"""
+    closed = False
+    try:
+        if await is_reader_catalog_open(page):
+            closed = True
+            # 优先点遮罩空白或按 Esc；再 JS 隐藏
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.15)
+            await page.evaluate(
+                """() => {
+                    // 再点一次目录按钮通常会收起
+                    const btn = document.querySelector(
+                        'button.readerControls_item.catalog, button[title="目录"]'
+                    );
+                    const panel = document.querySelector(
+                        '.readerCatalog, [class*="readerCatalog"]'
+                    );
+                    const open = !!(panel && panel.getBoundingClientRect().width > 80);
+                    if (open && btn) btn.click();
+                }"""
+            )
+            await asyncio.sleep(0.15)
+            await page.keyboard.press("Escape")
+        await dismiss_reader_overlays(page)
+        # 兜底：直接隐藏侧栏
+        if await is_reader_catalog_open(page):
+            await page.evaluate(
+                """() => {
+                    document.querySelectorAll(
+                        '.readerCatalog, [class*="readerCatalog"]'
+                    ).forEach(el => {
+                        el.style.display = 'none';
+                        el.style.visibility = 'hidden';
+                        el.style.pointerEvents = 'none';
+                    });
+                }"""
+            )
+            closed = True
+            await dismiss_reader_overlays(page)
+    except Exception:
+        try:
+            await dismiss_reader_overlays(page)
+        except Exception:
+            pass
+    return closed
+
+
+async def open_reader_catalog(page) -> bool:
+    """打开目录；若已打开则直接成功。处理 wr_mask 拦截。"""
+    if await is_reader_catalog_open(page):
+        return True
+    await dismiss_reader_overlays(page)
+    # 先尝试 JS click，绕过 pointer 拦截
+    opened = await page.evaluate(
+        """() => {
+            const btn = document.querySelector(
+                'button.readerControls_item.catalog, button[title="目录"]'
+            );
+            if (!btn) return false;
+            btn.click();
+            return true;
+        }"""
+    )
+    if not opened:
+        try:
+            await page.click(
+                'button.readerControls_item.catalog, button[title="目录"]',
+                timeout=5000,
+                force=True,
+            )
+        except Exception:
+            await dismiss_reader_overlays(page)
+            await page.click(
+                'button.readerControls_item.catalog, button[title="目录"]',
+                timeout=5000,
+                force=True,
+            )
+    await asyncio.sleep(SLEEP_READER_CATALOG_OPEN)
+    if await is_reader_catalog_open(page):
+        return True
+    # 再试一次 Esc 清场后 force click
     await page.keyboard.press("Escape")
-    return True
+    await dismiss_reader_overlays(page)
+    await asyncio.sleep(0.2)
+    try:
+        await page.click(
+            'button.readerControls_item.catalog, button[title="目录"]',
+            timeout=5000,
+            force=True,
+        )
+    except Exception:
+        return False
+    await asyncio.sleep(SLEEP_READER_CATALOG_OPEN)
+    return await is_reader_catalog_open(page)
 
 
 async def scrape_catalog_titles(page) -> list[str]:
@@ -879,8 +1009,8 @@ async def goto_first_chapter(page, catalog_path=None):
     """打开目录、保存章名列表、点击第一项；返回清洗后的首章标题。"""
     first_title = ""
     try:
-        await page.click("button.readerControls_item.catalog", timeout=5000)
-        await asyncio.sleep(SLEEP_READER_CATALOG_OPEN)
+        if not await open_reader_catalog(page):
+            raise RuntimeError("无法打开目录")
         titles = await scrape_catalog_titles(page)
         if titles and catalog_path:
             with open(catalog_path, "w", encoding="utf-8") as f:
@@ -932,13 +1062,16 @@ async def goto_catalog_chapter(page, target_title: str) -> str:
     """打开目录并点击目标章名；成功返回实际点到的清洗标题，失败返回空串。
 
     用于键盘翻页失效/同页空转时，强制跳到目录中的下一章，打破死循环。
+    失败时务必关闭目录，避免侧栏常开挡住翻页。
     """
     target = normalize_catalog_title(target_title)
     if not target:
         return ""
     try:
-        await page.click("button.readerControls_item.catalog", timeout=5000)
-        await asyncio.sleep(SLEEP_READER_CATALOG_OPEN)
+        if not await open_reader_catalog(page):
+            print(f"  ⚠️  无法打开目录以跳转「{target}」")
+            await close_reader_catalog(page)
+            return ""
 
         for _ in range(60):
             clicked = await page.evaluate(
@@ -970,6 +1103,8 @@ async def goto_catalog_chapter(page, target_title: str) -> str:
                 await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
                 await close_reader_catalog(page)
                 await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
+                if await is_reader_catalog_open(page):
+                    await close_reader_catalog(page)
                 return normalize_catalog_title(clicked) or target
 
             moved = await page.evaluate(
@@ -991,10 +1126,10 @@ async def goto_catalog_chapter(page, target_title: str) -> str:
                 break
             await asyncio.sleep(max(0.05, float(SLEEP_READER_CATALOG_SCROLL) * 0.15))
 
-        await close_reader_catalog(page)
         print(f"  ⚠️  目录中未找到「{target}」")
     except Exception as e:
         print(f"  ⚠️  目录跳转「{target}」异常: {e}")
+    finally:
         try:
             await close_reader_catalog(page)
         except Exception:
@@ -1183,6 +1318,9 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             return n, imgs
 
         async def sleep_between_chapters(n_chars):
+            # 0 字（空切章/重复跳过）不等待，避免刷屏空等
+            if not n_chars or int(n_chars) <= 0:
+                return
             wait_s = chapter_sleep_seconds(
                 n_chars,
                 per_1k=SLEEP_CHAPTER_PER_1K_CHARS,
@@ -1208,15 +1346,26 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if before:
                 n, _imgs = await commit_chapter(
                     title_to_save, before, note_suffix=" [内容切章]")
-                ch_idx += 1
-                if is_last:
+                # 仅实际落盘成功才推进编号，避免 0 字空切制造空洞
+                if chapter_saved(n, _imgs):
+                    ch_idx += 1
+                    if is_last:
+                        ch_blocks = after
+                        remember_text_lines(after)
+                        current_chapter = nxt
+                        page_num = 0
+                        stale = 0
+                        reached_end = True
+                        return True
+                    await sleep_between_chapters(n)
+                elif is_last:
                     ch_blocks = after
+                    remember_text_lines(after)
                     current_chapter = nxt
                     page_num = 0
                     stale = 0
                     reached_end = True
                     return True
-                await sleep_between_chapters(n)
             # before 为空：上一章已落盘或本页已属新章，仅把块归属切到下一章
             ch_blocks = after
             # after 中的行本就来自旧缓冲，保持 seen_text_lines，避免同页再抓时重复切入
@@ -1235,6 +1384,9 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 break
 
         while not reached_end:
+            # 目录侧栏常开会吞掉键盘翻页并挡住控件
+            if await is_reader_catalog_open(page):
+                await close_reader_catalog(page)
             await page.evaluate("() => window.__wr_reset()")
             turn_method = turn_methods[turn_method_idx % len(turn_methods)]
             await turn_reader_page(page, method=turn_method)
@@ -1251,14 +1403,15 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     ch_blocks = before
                 is_last = is_last_catalog_chapter(current_chapter, catalog_titles)
                 n, _imgs = await commit_chapter(current_chapter, ch_blocks)
-                ch_idx += 1
+                if chapter_saved(n, _imgs):
+                    ch_idx += 1
                 ch_blocks = after
                 remember_text_lines(after)
                 current_chapter = resolve_chapter_title(new_chapter, catalog_titles) or new_chapter
                 page_num = 0
                 stale = 0
                 turn_method_idx = 0
-                if not is_last:
+                if not is_last and chapter_saved(n, _imgs):
                     await sleep_between_chapters(n)
                 await capture_current_page()
                 # 当前页也可能继续跨到再下一章
@@ -1308,24 +1461,39 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                             "目录强制跳转次数过多，疑似无法前进。"
                             f"当前章「{current_chapter}」，下一章「{nxt}」。"
                         )
+                    # 先确保目录不挡着；再尝试跳转。失败则不推进章名，避免跳章。
+                    await close_reader_catalog(page)
                     print(
                         f"    … 翻页停滞，目录跳转 →「{nxt[:32]}」"
                         f"（{catalog_jump_count + 1}/{MAX_CATALOG_JUMPS}）"
                     )
+                    jumped = await goto_catalog_chapter(page, nxt)
+                    catalog_jump_count += 1
+                    if not jumped:
+                        print(
+                            f"    ⚠️  目录跳转失败，保持当前「"
+                            f"{(current_chapter or '')[:24]}」，继续翻页"
+                        )
+                        await close_reader_catalog(page)
+                        # 给键盘翻页多几次机会，避免连续失败立刻再跳
+                        stale = 2
+                        turn_method_idx += 1
+                        continue
+
+                    # 跳转成功才落盘当前章并推进
                     n, _imgs = await commit_chapter(
                         current_chapter, ch_blocks, note_suffix=" [目录跳转切章]")
-                    ch_idx += 1
-                    if n:
+                    if chapter_saved(n, _imgs):
+                        ch_idx += 1
                         await sleep_between_chapters(n)
                     ch_blocks = []
                     reset_page_dedupe()
-                    jumped = await goto_catalog_chapter(page, nxt)
                     current_chapter = resolve_chapter_title(
-                        jumped or nxt, catalog_titles) or nxt
-                    catalog_jump_count += 1
+                        jumped, catalog_titles) or jumped
                     stale = 0
                     page_num = 0
                     turn_method_idx = 0
+                    await close_reader_catalog(page)
                     await page.evaluate("() => window.__wr_reset()")
                     await wait_stable(page, 0)
                     await capture_current_page()
