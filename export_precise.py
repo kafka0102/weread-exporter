@@ -1359,7 +1359,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         # 表现为：浏览器其实在翻页，日志却一直 stale（山居秋暝）。
         last_page_fp = ""
         last_page_lines: set[str] = set()
-        turn_methods = ("arrow", "space", "pagedown")
+        # 不用 Space：焦点不对时会打开搜索/触发按钮，反而弹出目录搜索层
+        turn_methods = ("arrow", "pagedown", "arrow")
         turn_method_idx = 0
         catalog_jump_count = 0
         MAX_CATALOG_JUMPS = 8
