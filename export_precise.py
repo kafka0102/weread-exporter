@@ -155,33 +155,94 @@ async def focus_reader_for_keyboard(page):
     )
 
 
+async def blur_reader_inputs(page) -> None:
+    """失焦任何 input/textarea，避免按键打进搜索框。"""
+    try:
+        await page.evaluate(
+            """() => {
+                const blurOne = (el) => {
+                    try { if (el && typeof el.blur === 'function') el.blur(); } catch (e) {}
+                };
+                blurOne(document.activeElement);
+                document.querySelectorAll('input, textarea, [contenteditable="true"]').forEach(blurOne);
+            }"""
+        )
+    except Exception:
+        pass
+
+
+async def dismiss_reader_search(page) -> bool:
+    """关闭目录/顶栏搜索态，绝不去点搜索图标本身。
+
+    微信读书目录搜索态特征：顶栏可见搜索输入 +「取消」。
+    返回是否处理过搜索相关 UI。
+    """
+    handled = False
+    try:
+        # 1) 若有可见搜索输入：先点「取消」（只点顶栏取消，不点搜索按钮）
+        clicked_cancel = await page.evaluate(
+            """() => {
+                const visible = (el, minW=12, minH=12) => {
+                    if (!el) return false;
+                    const st = window.getComputedStyle(el);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+                    if (parseFloat(st.opacity || '1') < 0.05) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < minW || r.height < minH) return false;
+                    const vw = window.innerWidth, vh = window.innerHeight;
+                    if (r.right <= 0 || r.left >= vw || r.bottom <= 0 || r.top >= vh) return false;
+                    return true;
+                };
+                const hasSearch = Array.from(document.querySelectorAll(
+                    'input[placeholder*="搜索"], input[type="search"], .readerCatalog input, [class*="readerCatalog"] input'
+                )).some(el => visible(el, 40, 12));
+                if (!hasSearch) return false;
+                // 仅顶栏「取消」
+                for (const el of Array.from(document.querySelectorAll('button, a, span, div'))) {
+                    if ((el.textContent || '').trim() !== '取消') continue;
+                    if (!visible(el, 12, 12)) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.top > 140) continue;
+                    el.click();
+                    return true;
+                }
+                return true; // 有搜索输入但没点到取消，仍算检测到
+            }"""
+        )
+        if clicked_cancel:
+            handled = True
+            await asyncio.sleep(0.12)
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.08)
+        # 2) 无论是否搜索态，都 blur，防止焦点落在 input
+        await blur_reader_inputs(page)
+    except Exception:
+        try:
+            await blur_reader_inputs(page)
+        except Exception:
+            pass
+    return handled
+
+
 async def turn_reader_page(page, *, method: str = "arrow"):
-    """聚焦阅读器并翻到下一页。
+    """聚焦阅读器并仅用键盘翻到下一页。
+
+    **禁止**点击正文/canvas：点阅读区会拉起顶栏控件，极易误触「搜索」。
 
     method:
-      - arrow: ArrowRight（默认）
-      - click_right: 点击最右侧正文 canvas 右缘（微信读书点右侧翻页）
-      - pagedown: PageDown（次选；目录开着时可能只滚目录，慎用）
-      - space: Space（易误开搜索，仅显式指定时使用）
-    连续抓到同一页时轮换方式，避免焦点/快捷键失效导致空转。
+      - arrow: ArrowRight（默认，唯一稳定方式）
+      - arrow2: 连按两次 ArrowRight（偶发单次被吞时）
+      - pagedown/space: 仅显式指定时使用（易误触目录/搜索）
     """
+    await dismiss_reader_search(page)
     await focus_reader_for_keyboard(page)
+    await blur_reader_inputs(page)
     m = (method or "arrow").strip().lower()
-    if m == "click_right":
-        rects = await page.evaluate(
-            """() => Array.from(document.querySelectorAll('canvas'))
-                .map(c => c.getBoundingClientRect())
-                .filter(r => r.height > 300 && r.width > 100)
-                .map(r => ({left: r.left, top: r.top, width: r.width, height: r.height}))"""
-        )
-        if rects:
-            right = max(rects, key=lambda r: float(r.get("left") or 0))
-            x = float(right["left"]) + float(right["width"]) * 0.92
-            y = float(right["top"]) + float(right["height"]) * 0.50
-            await page.mouse.click(x, y)
-            return "click_right"
-        # 无 canvas 时退回方向键
-        m = "arrow"
+    if m == "arrow2":
+        await page.keyboard.press("ArrowRight")
+        await asyncio.sleep(0.05)
+        await page.keyboard.press("ArrowRight")
+        return "arrow2"
     key = {
         "space": "Space",
         "pagedown": "PageDown",
@@ -1015,28 +1076,19 @@ async def close_reader_catalog(page):
     """
     closed = False
     try:
+        # 无论目录是否判定打开，先退搜索态（搜索框可单独盖住正文）
+        if await dismiss_reader_search(page):
+            closed = True
         if not await is_reader_catalog_open(page):
             await dismiss_reader_overlays(page)
-            return False
+            await blur_reader_inputs(page)
+            return closed
+
         closed = True
 
-        # 0) 目录搜索态：优先点顶栏「取消」（截图：搜索框旁「取消」）
-        await page.evaluate(
-            """() => {
-                const nodes = Array.from(document.querySelectorAll('button, a, span, div'));
-                for (const el of nodes) {
-                    const t = (el.textContent || '').trim();
-                    if (t !== '取消') continue;
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 12 || r.height < 12) continue;
-                    if (r.top > 120) continue; // 顶栏区域
-                    el.click();
-                    return true;
-                }
-                return false;
-            }"""
-        )
-        await asyncio.sleep(0.15)
+        # 0) 再清一次搜索态
+        await dismiss_reader_search(page)
+        await asyncio.sleep(0.1)
 
         # 1) Esc 退出搜索/收起一层
         for _ in range(3):
@@ -1045,11 +1097,11 @@ async def close_reader_catalog(page):
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.12)
 
-        # 2) 关掉目录内搜索框 X / 关闭按钮
+        # 2) 再退搜索态 + 仅点明确的关闭/取消，绝不点 title=搜索 的按钮
         if await is_reader_catalog_open(page):
+            await dismiss_reader_search(page)
             await page.evaluate(
                 """() => {
-                    // 再点一次「取消」
                     for (const el of Array.from(document.querySelectorAll('button, a, span, div'))) {
                         if ((el.textContent || '').trim() === '取消') {
                             const r = el.getBoundingClientRect();
@@ -1059,11 +1111,14 @@ async def close_reader_catalog(page):
                             }
                         }
                     }
+                    // 不要用 [class*="search"]：会命中「搜索」按钮本身
                     const closeBtns = Array.from(document.querySelectorAll(
-                        '.readerCatalog button, [class*="readerCatalog"] button, [class*="search"] button'
+                        '.readerCatalog button, [class*="readerCatalog"] button'
                     ));
                     for (const b of closeBtns) {
                         const t = (b.getAttribute('title') || b.getAttribute('aria-label') || b.textContent || '').trim();
+                        if (!t) continue;
+                        if (/搜索|search|查找/i.test(t)) continue;
                         if (t === '关闭' || t === '取消' || t === '×' || t === 'x' || t === 'X') {
                             b.click();
                             return;
@@ -1072,7 +1127,10 @@ async def close_reader_catalog(page):
                     const x = document.querySelector(
                         '.readerCatalog [class*="close"], [class*="readerCatalog"] [class*="Close"], .readerCatalog .wr_close'
                     );
-                    if (x) x.click();
+                    if (x) {
+                        const t = (x.getAttribute('title') || x.getAttribute('aria-label') || x.textContent || '').trim();
+                        if (!/搜索|search|查找/i.test(t)) x.click();
+                    }
                 }"""
             )
             await asyncio.sleep(0.15)
@@ -1167,7 +1225,11 @@ async def open_reader_catalog(page) -> bool:
     except Exception:
         return False
     await asyncio.sleep(SLEEP_READER_CATALOG_OPEN)
-    return await is_reader_catalog_open(page)
+    opened = await is_reader_catalog_open(page)
+    if opened:
+        # 打开目录后微信读书常把焦点放进搜索框——立刻失焦，避免后续按键进搜索
+        await blur_reader_inputs(page)
+    return opened
 
 
 async def scrape_catalog_titles(page) -> list[str]:
@@ -1293,6 +1355,9 @@ async def goto_catalog_chapter(page, target_title: str) -> str:
             return ""
 
         for _ in range(60):
+            # 目录内若误入搜索态，先退回列表
+            await dismiss_reader_search(page)
+            await blur_reader_inputs(page)
             clicked = await page.evaluate(
                 r"""(target) => {
                     const strip = (s) => String(s || '')
@@ -1303,6 +1368,10 @@ async def goto_catalog_chapter(page, target_title: str) -> str:
                         document.querySelectorAll('.readerCatalog_list_item')
                     );
                     for (const el of items) {
+                        // 跳过搜索结果区/搜索表单内节点，避免点到搜索相关项结构
+                        if (el.closest && el.closest('form, [class*="searchInput"], [class*="SearchInput"]')) {
+                            continue;
+                        }
                         const titleEl = el.querySelector(
                             '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
                         );
@@ -1431,9 +1500,9 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         # 表现为：浏览器其实在翻页，日志却一直 stale（山居秋暝）。
         last_page_fp = ""
         last_page_lines: set[str] = set()
-        # 不用 Space：焦点不对时会打开搜索/触发按钮，反而弹出目录搜索层
-        # PageDown 在目录未关严时只会滚目录，看起来像「上下翻页」；优先键+点右缘
-        turn_methods = ("arrow", "click_right", "arrow")
+        # 只用方向键翻页：点 canvas/正文会拉起顶栏并误触「搜索」
+        # 偶发单次 ArrowRight 被吞时用 arrow2（连按两次）
+        turn_methods = ("arrow", "arrow", "arrow2")
         turn_method_idx = 0
         catalog_jump_count = 0
         catalog_jump_failures = 0
@@ -1594,14 +1663,17 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 break
 
         while not reached_end:
-            # 目录开着时方向键只会在目录列表里跳，必须先关掉再翻页
+            # 搜索框/目录开着时方向键不会翻页，且会把字打进搜索
+            await dismiss_reader_search(page)
             if await is_reader_catalog_open(page):
                 await close_reader_catalog(page)
+                await dismiss_reader_search(page)
                 if await is_reader_catalog_open(page):
                     # 连续关不掉时，可能是检测误报；不要永久跳过翻页导致 0 章失败
                     print("    … 目录似乎未关闭，尝试继续翻页")
                     await dismiss_reader_overlays(page)
                     await page.keyboard.press("Escape")
+                    await blur_reader_inputs(page)
                     await asyncio.sleep(0.2)
             await page.evaluate("() => window.__wr_reset()")
             turn_method = turn_methods[turn_method_idx % len(turn_methods)]

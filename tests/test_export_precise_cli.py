@@ -235,11 +235,26 @@ class TestExportPreciseCli(unittest.TestCase):
     def test_turn_reader_page_focuses_without_clicking_content(self):
         async def run():
             page = mock.AsyncMock()
+            # dismiss_reader_search / blur / focus 都会 evaluate
+            page.evaluate = mock.AsyncMock(return_value=False)
 
             await export_precise.turn_reader_page(page)
 
-            page.evaluate.assert_awaited_once()
-            page.keyboard.press.assert_awaited_once_with("ArrowRight")
+            self.assertGreaterEqual(page.evaluate.await_count, 1)
+            page.keyboard.press.assert_awaited_with("ArrowRight")
+            page.mouse.click.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_turn_reader_page_never_clicks_for_arrow2(self):
+        async def run():
+            page = mock.AsyncMock()
+            page.evaluate = mock.AsyncMock(return_value=False)
+
+            await export_precise.turn_reader_page(page, method="arrow2")
+
+            self.assertEqual(page.keyboard.press.await_count, 2)
+            page.keyboard.press.assert_any_await("ArrowRight")
             page.mouse.click.assert_not_called()
 
         asyncio.run(run())
