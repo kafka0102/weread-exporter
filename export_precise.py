@@ -324,34 +324,38 @@ async def force_reader_repaint(page) -> None:
         pass
 
 
-async def recover_reader_text_after_nav(page) -> int:
+async def recover_reader_text_after_nav(page, *, allow_nudge: bool = True) -> int:
     """目录跳转/重定位后尽量保住 canvas 文字，禁止先 reset 再空等。
 
     历史 bug：跳转等待期间 fillText 已写入 __wr_chars，随后 __wr_reset
     一把清掉，再靠微扰动很难重绘 → 页面明明有字、日志一直 stale。
     返回稳定后的字符计数（可能为 0）。
+
+    allow_nudge=False 时只做短等+微重绘，供普通翻页空抓使用，避免每轮 10s+。
     """
-    # 1) 先等已有绘制落稳（不 reset）
-    count = await wait_stable(page, 0, timeout=2.5)
+    # 1) 先等已有绘制落稳（不 reset）——目录跳后通常已有字
+    count = await wait_stable(page, 0, timeout=1.2 if allow_nudge else 0.6)
     if count and count > 0:
         return count
     # 2) 扰动重绘，仍不 reset
     await force_reader_repaint(page)
-    count = await wait_stable(page, 0, timeout=2.0)
+    count = await wait_stable(page, 0, timeout=1.0 if allow_nudge else 0.5)
     if count and count > 0:
         return count
-    # 3) 左右键轻推一页再回到当前，迫使重新 fillText
+    if not allow_nudge:
+        return int(count or 0)
+    # 3) 左右键轻推一页再回到当前，迫使重新 fillText（仅导航后）
     try:
         await dismiss_reader_search(page)
         await focus_reader_for_keyboard(page)
         await blur_reader_inputs(page)
         await page.keyboard.press("ArrowLeft")
-        await asyncio.sleep(max(0.15, float(SLEEP_READER_PAGE_TURN) * 0.5))
+        await asyncio.sleep(0.12)
         await page.evaluate("() => window.__wr_reset && window.__wr_reset()")
         await page.keyboard.press("ArrowRight")
-        await asyncio.sleep(max(0.2, float(SLEEP_READER_PAGE_TURN)))
+        await asyncio.sleep(max(0.15, float(SLEEP_READER_PAGE_TURN) * 0.4))
         await force_reader_repaint(page)
-        count = await wait_stable(page, 0, timeout=3.0)
+        count = await wait_stable(page, 0, timeout=1.5)
         if count and count > 0:
             return count
     except Exception:
@@ -1871,7 +1875,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         MAX_CATALOG_JUMP_FAILURES = 3
         # 顶栏已前进但当前章仍无正文时，优先目录回跳重抓，避免空跟章丢篇
         empty_header_resync = 0
-        MAX_EMPTY_HEADER_RESYNC = 2
+        MAX_EMPTY_HEADER_RESYNC = 1
 
         def reset_page_dedupe():
             """换章或目录跳转后清空页级去重状态。"""
@@ -2172,13 +2176,15 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
 
             got_new = await capture_current_page()
             # 偶发：页已翻但 fillText 迟到 → 短重绘再抓（禁止 repaint 后再 reset）
+            # 注意：完整 recover（含左右键）绝不能每轮空翻都跑，否则单次 10s+ 像卡死。
             if not got_new:
                 await force_reader_repaint(page)
-                await asyncio.sleep(max(0.08, float(SLEEP_READER_PAGE_RENDER)))
-                await wait_stable(page, 0, timeout=1.5)
+                await asyncio.sleep(max(0.05, float(SLEEP_READER_PAGE_RENDER)))
+                await wait_stable(page, 0, timeout=0.8)
                 got_new = await capture_current_page()
-                if not got_new:
-                    n = await recover_reader_text_after_nav(page)
+                if not got_new and stale >= 2:
+                    # 仅在连续空翻后做轻量 recover，仍禁止每轮左右键
+                    n = await recover_reader_text_after_nav(page, allow_nudge=False)
                     if n and n > 0:
                         got_new = await capture_current_page()
                 if got_new:
@@ -2224,14 +2230,15 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     turn_method_idx += 1
 
                 # 顶栏已明显超前且抓空：提前只跳「下一章」，勿跟远处顶栏
-                if stale >= 3 and catalog_titles and new_chapter:
+                if stale >= 2 and catalog_titles and new_chapter:
                     h_idx = catalog_index(catalog_titles, new_chapter)
                     c_idx = catalog_index(catalog_titles, current_chapter)
                     if (
                         h_idx is not None
                         and c_idx is not None
-                        and h_idx > c_idx + 1
+                        and h_idx > c_idx
                     ):
+                        # 顶栏领先 ≥1 且本页抓空：尽快目录落到 next，少空转
                         print(
                             f"    … 顶栏超前「{new_chapter[:20]}」"
                             f"/逻辑「{(current_chapter or '')[:20]}」，"
