@@ -156,20 +156,61 @@ async def focus_reader_for_keyboard(page):
 
 
 async def turn_reader_page(page, *, method: str = "arrow"):
-    """聚焦阅读器并发送翻页键，全程不点击正文内容。
+    """聚焦阅读器并翻到下一页。
 
     method:
       - arrow: ArrowRight（默认）
-      - space: Space
-      - pagedown: PageDown
-    连续抓到同一页时轮换按键，避免焦点/快捷键失效导致空转。
+      - click_right: 点击最右侧正文 canvas 右缘（微信读书点右侧翻页）
+      - pagedown: PageDown（次选；目录开着时可能只滚目录，慎用）
+      - space: Space（易误开搜索，仅显式指定时使用）
+    连续抓到同一页时轮换方式，避免焦点/快捷键失效导致空转。
     """
     await focus_reader_for_keyboard(page)
+    m = (method or "arrow").strip().lower()
+    if m == "click_right":
+        rects = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('canvas'))
+                .map(c => c.getBoundingClientRect())
+                .filter(r => r.height > 300 && r.width > 100)
+                .map(r => ({left: r.left, top: r.top, width: r.width, height: r.height}))"""
+        )
+        if rects:
+            right = max(rects, key=lambda r: float(r.get("left") or 0))
+            x = float(right["left"]) + float(right["width"]) * 0.92
+            y = float(right["top"]) + float(right["height"]) * 0.50
+            await page.mouse.click(x, y)
+            return "click_right"
+        # 无 canvas 时退回方向键
+        m = "arrow"
     key = {
         "space": "Space",
         "pagedown": "PageDown",
-    }.get(method or "arrow", "ArrowRight")
+        "arrow": "ArrowRight",
+    }.get(m, "ArrowRight")
     await page.keyboard.press(key)
+    return m
+
+
+async def force_reader_repaint(page) -> None:
+    """翻页后 canvas 未再次 fillText 时，轻推视口触发重绘。"""
+    try:
+        vp = await page.evaluate(
+            "() => ({width: window.innerWidth, height: window.innerHeight})"
+        )
+        w = int(vp.get("width") or 0)
+        h = int(vp.get("height") or 0)
+        if w > 10 and h > 10:
+            await page.set_viewport_size({"width": w - 1, "height": h})
+            await asyncio.sleep(0.05)
+            await page.set_viewport_size({"width": w, "height": h})
+            await asyncio.sleep(0.05)
+        await page.evaluate(
+            """() => {
+                try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+            }"""
+        )
+    except Exception:
+        pass
 
 
 async def count_reader_canvases(page):
@@ -460,12 +501,15 @@ def should_follow_header_title(catalog_titles, current_title, header_title) -> b
     作者/卷小节名，而正文已按目录切到「渭川田家」等子篇。若此时盲从顶栏，
     会把目录进度回退并反复落盘同一批章节。
 
+    反过来，顶栏也可能一次跳过多章（翻页空抓时阅读器其实已连翻多页）。
+    若盲从跨章顶栏，会把中间章整段丢掉（临洞庭湖 → 直接王维）。
+
     规则：
     - 顶栏空/与当前相同：不切换
     - 无目录：允许切换（退化行为）
     - 顶栏无法对齐目录：不切换
     - 当前无法对齐目录：允许切换
-    - 仅当顶栏目录下标严格大于当前时切换（只前进）
+    - 有目录时：仅当顶栏是「目录中的下一章」才切换（只前进一格）
     """
     header = resolve_chapter_title(header_title, catalog_titles)
     current = resolve_chapter_title(current_title, catalog_titles)
@@ -479,7 +523,8 @@ def should_follow_header_title(catalog_titles, current_title, header_title) -> b
     c_idx = catalog_index(catalog_titles, current)
     if c_idx is None:
         return True
-    return h_idx > c_idx
+    # 只跟随紧邻下一章，避免顶栏跨章把中间目录项整段跳过
+    return h_idx == c_idx + 1
 
 
 def chapter_blocks_fingerprint(title: str, blocks) -> str:
@@ -1387,10 +1432,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         last_page_fp = ""
         last_page_lines: set[str] = set()
         # 不用 Space：焦点不对时会打开搜索/触发按钮，反而弹出目录搜索层
-        turn_methods = ("arrow", "pagedown", "arrow")
+        # PageDown 在目录未关严时只会滚目录，看起来像「上下翻页」；优先键+点右缘
+        turn_methods = ("arrow", "click_right", "arrow")
         turn_method_idx = 0
         catalog_jump_count = 0
+        catalog_jump_failures = 0
         MAX_CATALOG_JUMPS = 8
+        MAX_CATALOG_JUMP_FAILURES = 3
 
         def reset_page_dedupe():
             """换章或目录跳转后清空页级去重状态。"""
@@ -1559,7 +1607,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             turn_method = turn_methods[turn_method_idx % len(turn_methods)]
             await turn_reader_page(page, method=turn_method)
             await asyncio.sleep(SLEEP_READER_PAGE_TURN)
-            await wait_stable(page, 0)
+            stable_count = await wait_stable(page, 0)
+            # 翻页后若完全没有 fillText，轻推重绘一次再等（双页短诗区高发）
+            if not stable_count or stable_count <= 0:
+                await force_reader_repaint(page)
+                await page.evaluate("() => window.__wr_reset()")
+                await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
+                stable_count = await wait_stable(page, 0, timeout=4)
 
             new_chapter = await read_chapter_title(page, catalog_titles)
             if new_chapter and should_follow_header_title(
@@ -1637,16 +1691,33 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     jumped = await goto_catalog_chapter(page, nxt)
                     catalog_jump_count += 1
                     if not jumped:
+                        catalog_jump_failures += 1
                         print(
-                            f"    ⚠️  目录跳转失败，保持当前「"
-                            f"{(current_chapter or '')[:24]}」，继续翻页"
+                            f"    ⚠️  目录跳转失败（"
+                            f"{catalog_jump_failures}/{MAX_CATALOG_JUMP_FAILURES}），"
+                            f"保持当前「{(current_chapter or '')[:24]}」"
                         )
                         await close_reader_catalog(page)
                         await close_reader_catalog(page)
-                        # 拉高门槛，优先键盘翻页，避免反复打开目录卡死
-                        stale = 0
+                        await dismiss_reader_overlays(page)
+                        await page.keyboard.press("Escape")
+                        # 绝不能 stale=0：否则目录打不开时会永久空转
+                        if catalog_jump_failures >= MAX_CATALOG_JUMP_FAILURES:
+                            await commit_chapter(
+                                current_chapter,
+                                ch_blocks,
+                                note_suffix=" [目录跳转失败]",
+                            )
+                            raise RuntimeError(
+                                "目录跳转连续失败，停止空转以免丢章。"
+                                f"当前章「{current_chapter}」，目标「{nxt}」。"
+                                "可重跑续传；若仍失败请检查登录态与目录是否可打开。"
+                            )
+                        # 略降 stale，再试几轮键/点右缘翻页
+                        stale = 5
                         turn_method_idx += 1
                         continue
+                    catalog_jump_failures = 0
 
                     # 跳转成功才落盘当前章并推进
                     n, _imgs = await commit_chapter(

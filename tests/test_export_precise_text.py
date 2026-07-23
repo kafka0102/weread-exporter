@@ -150,14 +150,44 @@ class TestHeaderChapterProgress(unittest.TestCase):
         self.assertTrue(
             export_precise.should_follow_header_title(catalog, "导言", "李白")
         )
-        self.assertTrue(
+        # 仅允许紧邻下一章；跨章顶栏不得直接跟随（否则会丢中间章）
+        self.assertFalse(
             export_precise.should_follow_header_title(catalog, "李白", "刘禹锡")
+        )
+        self.assertTrue(
+            export_precise.should_follow_header_title(catalog, "李白", "张志和")
         )
         self.assertFalse(
             export_precise.should_follow_header_title(catalog, "李白", "李白")
         )
         self.assertFalse(
             export_precise.should_follow_header_title(catalog, "张志和", "李白")
+        )
+
+    def test_should_not_follow_multi_skip_header_title(self):
+        """顶栏从临洞庭湖直接跳到王维时，不得一口吞掉中间孟浩然诸篇。"""
+        catalog = [
+            "晚泊浔阳望香炉峰",
+            "临洞庭湖赠张丞相",
+            "广陵别薛八",
+            "春晓",
+            "王维 二十七首",
+            "渭川田家",
+        ]
+        self.assertFalse(
+            export_precise.should_follow_header_title(
+                catalog, "临洞庭湖赠张丞相", "王维 二十七首"
+            )
+        )
+        self.assertTrue(
+            export_precise.should_follow_header_title(
+                catalog, "临洞庭湖赠张丞相", "广陵别薛八"
+            )
+        )
+        self.assertTrue(
+            export_precise.should_follow_header_title(
+                catalog, "春晓", "王维 二十七首"
+            )
         )
 
     def test_fingerprint_stable_for_same_blocks(self):
