@@ -834,58 +834,67 @@ async def dismiss_reader_overlays(page) -> bool:
 
 
 async def is_reader_catalog_open(page) -> bool:
-    """目录侧栏是否真正展开并遮挡阅读区。
+    """目录/目录搜索层是否真正展开并遮挡阅读区。
 
-    注意：不能用 ``[class*="readerCatalog"]`` 宽匹配——关闭时节点仍在 DOM，
-    getBoundingClientRect 也可能非零，导致误判「一直开着」进而永久跳过翻页。
+    微信读书打开目录后点搜索，会出现顶栏「搜索 + 取消」浮层（截图常见），
+    此时正文被半透明遮罩盖住，必须关掉才能翻页。
     """
     try:
         return bool(
             await page.evaluate(
                 """() => {
-                    const visible = (el) => {
+                    const visibleBox = (el, minW=20, minH=20) => {
                         if (!el) return false;
                         const st = window.getComputedStyle(el);
                         if (st.display === 'none' || st.visibility === 'hidden') return false;
                         if (parseFloat(st.opacity || '1') < 0.05) return false;
                         const r = el.getBoundingClientRect();
-                        if (r.width < 160 || r.height < 160) return false;
-                        // 必须有一部分落在视口内（排除 translateX 藏到屏外的面板）
+                        if (r.width < minW || r.height < minH) return false;
                         const vw = window.innerWidth, vh = window.innerHeight;
                         if (r.right <= 8 || r.left >= vw - 8) return false;
                         if (r.bottom <= 8 || r.top >= vh - 8) return false;
                         return true;
                     };
 
-                    // 1) 蒙层显示是强信号
+                    // A) 目录搜索态：可见「取消」+ 搜索输入（截图特征）
+                    const cancelBtns = Array.from(document.querySelectorAll('button, a, span, div'))
+                        .filter(el => {
+                            const t = (el.textContent || '').trim();
+                            return t === '取消' && visibleBox(el, 20, 12);
+                        });
+                    const searchInput = document.querySelector(
+                        'input[placeholder*="搜索"], input[type="search"], .readerCatalog input, [class*="readerCatalog"] input, [class*="search"] input'
+                    );
+                    if (cancelBtns.length && visibleBox(searchInput, 40, 12)) {
+                        return true;
+                    }
+
+                    // B) 蒙层
                     const mask = document.querySelector(
                         '.wr_mask_Show, .wr_mask.wr_mask_Show, .wr_mask[class*="Show"]'
                     );
-                    if (visible(mask) || (mask && (() => {
+                    if (mask) {
                         const st = window.getComputedStyle(mask);
                         const r = mask.getBoundingClientRect();
-                        return st.display !== 'none' && r.width > 50 && r.height > 50
-                            && parseFloat(st.opacity || '1') > 0.05;
-                    })())) {
-                        // 蒙层在 + 能找到目录列表，基本可认定打开
-                        if (document.querySelector('.readerCatalog_list_item, .readerCatalog_list')) {
-                            return true;
+                        if (st.display !== 'none' && parseFloat(st.opacity || '1') > 0.05
+                            && r.width > 50 && r.height > 50) {
+                            if (document.querySelector('.readerCatalog_list_item, .readerCatalog_list, input[placeholder*="搜索"]')) {
+                                return true;
+                            }
                         }
                     }
 
-                    // 2) 精确面板选择器（不要用 class*=readerCatalog 扫到控件碎片）
+                    // C) 目录列表面板（视口内较大右侧区域）
                     const panels = document.querySelectorAll(
                         '.readerCatalog, .readerCatalog_list_scroll_area, [class*="readerCatalog_list"]'
                     );
                     for (const el of panels) {
                         if (el.closest && el.closest('button')) continue;
-                        if (!visible(el)) continue;
-                        // 打开的目录通常占右侧较大区域
+                        if (!visibleBox(el, 160, 160)) continue;
                         const r = el.getBoundingClientRect();
                         if (r.width >= 200 && r.height >= 200 && r.left > window.innerWidth * 0.25) {
                             return true;
                         }
-                        // 或内部已有目录项且面板在视口内
                         if (el.querySelector && el.querySelector('.readerCatalog_list_item')) {
                             return true;
                         }
@@ -933,6 +942,24 @@ async def close_reader_catalog(page):
             return False
         closed = True
 
+        # 0) 目录搜索态：优先点顶栏「取消」（截图：搜索框旁「取消」）
+        await page.evaluate(
+            """() => {
+                const nodes = Array.from(document.querySelectorAll('button, a, span, div'));
+                for (const el of nodes) {
+                    const t = (el.textContent || '').trim();
+                    if (t !== '取消') continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 12 || r.height < 12) continue;
+                    if (r.top > 120) continue; // 顶栏区域
+                    el.click();
+                    return true;
+                }
+                return false;
+            }"""
+        )
+        await asyncio.sleep(0.15)
+
         # 1) Esc 退出搜索/收起一层
         for _ in range(3):
             if not await is_reader_catalog_open(page):
@@ -940,10 +967,20 @@ async def close_reader_catalog(page):
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.12)
 
-        # 2) 关掉目录内搜索框（截图里顶部有搜索栏 + X）
+        # 2) 关掉目录内搜索框 X / 关闭按钮
         if await is_reader_catalog_open(page):
             await page.evaluate(
                 """() => {
+                    // 再点一次「取消」
+                    for (const el of Array.from(document.querySelectorAll('button, a, span, div'))) {
+                        if ((el.textContent || '').trim() === '取消') {
+                            const r = el.getBoundingClientRect();
+                            if (r.width >= 12 && r.height >= 12 && r.top <= 120) {
+                                el.click();
+                                break;
+                            }
+                        }
+                    }
                     const closeBtns = Array.from(document.querySelectorAll(
                         '.readerCatalog button, [class*="readerCatalog"] button, [class*="search"] button'
                     ));
@@ -954,7 +991,6 @@ async def close_reader_catalog(page):
                             return;
                         }
                     }
-                    // 常见关闭图标按钮
                     const x = document.querySelector(
                         '.readerCatalog [class*="close"], [class*="readerCatalog"] [class*="Close"], .readerCatalog .wr_close'
                     );
