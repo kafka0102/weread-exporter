@@ -834,19 +834,63 @@ async def dismiss_reader_overlays(page) -> bool:
 
 
 async def is_reader_catalog_open(page) -> bool:
-    """目录侧栏是否处于打开状态。"""
+    """目录侧栏是否真正展开并遮挡阅读区。
+
+    注意：不能用 ``[class*="readerCatalog"]`` 宽匹配——关闭时节点仍在 DOM，
+    getBoundingClientRect 也可能非零，导致误判「一直开着」进而永久跳过翻页。
+    """
     try:
         return bool(
             await page.evaluate(
                 """() => {
-                    const el = document.querySelector(
-                        '.readerCatalog, [class*="readerCatalog"]'
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden') return false;
+                        if (parseFloat(st.opacity || '1') < 0.05) return false;
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 160 || r.height < 160) return false;
+                        // 必须有一部分落在视口内（排除 translateX 藏到屏外的面板）
+                        const vw = window.innerWidth, vh = window.innerHeight;
+                        if (r.right <= 8 || r.left >= vw - 8) return false;
+                        if (r.bottom <= 8 || r.top >= vh - 8) return false;
+                        return true;
+                    };
+
+                    // 1) 蒙层显示是强信号
+                    const mask = document.querySelector(
+                        '.wr_mask_Show, .wr_mask.wr_mask_Show, .wr_mask[class*="Show"]'
                     );
-                    if (!el) return false;
-                    const st = window.getComputedStyle(el);
-                    if (st.display === 'none' || st.visibility === 'hidden') return false;
-                    const r = el.getBoundingClientRect();
-                    return r.width > 80 && r.height > 80;
+                    if (visible(mask) || (mask && (() => {
+                        const st = window.getComputedStyle(mask);
+                        const r = mask.getBoundingClientRect();
+                        return st.display !== 'none' && r.width > 50 && r.height > 50
+                            && parseFloat(st.opacity || '1') > 0.05;
+                    })())) {
+                        // 蒙层在 + 能找到目录列表，基本可认定打开
+                        if (document.querySelector('.readerCatalog_list_item, .readerCatalog_list')) {
+                            return true;
+                        }
+                    }
+
+                    // 2) 精确面板选择器（不要用 class*=readerCatalog 扫到控件碎片）
+                    const panels = document.querySelectorAll(
+                        '.readerCatalog, .readerCatalog_list_scroll_area, [class*="readerCatalog_list"]'
+                    );
+                    for (const el of panels) {
+                        if (el.closest && el.closest('button')) continue;
+                        if (!visible(el)) continue;
+                        // 打开的目录通常占右侧较大区域
+                        const r = el.getBoundingClientRect();
+                        if (r.width >= 200 && r.height >= 200 && r.left > window.innerWidth * 0.25) {
+                            return true;
+                        }
+                        // 或内部已有目录项且面板在视口内
+                        if (el.querySelector && el.querySelector('.readerCatalog_list_item')) {
+                            return true;
+                        }
+                    }
+                    return false;
                 }"""
             )
         )
@@ -1442,15 +1486,11 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if await is_reader_catalog_open(page):
                 await close_reader_catalog(page)
                 if await is_reader_catalog_open(page):
-                    # 仍关不上：本轮只尝试关，不发送翻页键，避免目录空转
-                    print("    … 目录未关闭，跳过本轮翻页键")
-                    stale += 1
-                    if stale >= 8:
-                        await commit_chapter(
-                            current_chapter, ch_blocks, note_suffix=" [目录无法关闭]")
-                        break
-                    await asyncio.sleep(0.5)
-                    continue
+                    # 连续关不掉时，可能是检测误报；不要永久跳过翻页导致 0 章失败
+                    print("    … 目录似乎未关闭，尝试继续翻页")
+                    await dismiss_reader_overlays(page)
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.2)
             await page.evaluate("() => window.__wr_reset()")
             turn_method = turn_methods[turn_method_idx % len(turn_methods)]
             await turn_reader_page(page, method=turn_method)
