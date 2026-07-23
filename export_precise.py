@@ -122,10 +122,21 @@ async def focus_reader_for_keyboard(page):
     )
 
 
-async def turn_reader_page(page):
-    """聚焦阅读器并发送翻页键，全程不点击正文内容。"""
+async def turn_reader_page(page, *, method: str = "arrow"):
+    """聚焦阅读器并发送翻页键，全程不点击正文内容。
+
+    method:
+      - arrow: ArrowRight（默认）
+      - space: Space
+      - pagedown: PageDown
+    连续抓到同一页时轮换按键，避免焦点/快捷键失效导致空转。
+    """
     await focus_reader_for_keyboard(page)
-    await page.keyboard.press("ArrowRight")
+    key = {
+        "space": "Space",
+        "pagedown": "PageDown",
+    }.get(method or "arrow", "ArrowRight")
+    await page.keyboard.press(key)
 
 
 async def count_reader_canvases(page):
@@ -445,6 +456,19 @@ def chapter_blocks_fingerprint(title: str, blocks) -> str:
     return hashlib.md5(payload).hexdigest()
 
 
+def page_blocks_fingerprint(blocks) -> str:
+    """单页正文指纹（忽略图片 URL），用于判断翻页是否真的产生新内容。"""
+    parts = []
+    for b in blocks or []:
+        if b.get("type") == "text":
+            t = (b.get("text") or "").strip()
+            if t:
+                parts.append(t)
+        elif b.get("type") == "img":
+            parts.append("[img]")
+    return hashlib.md5("\n".join(parts).encode("utf-8")).hexdigest() if parts else ""
+
+
 def display_chapter_title(title: str, ch_idx: int) -> str:
     """落盘用章名；空标题回退为编号，避免 md 首行变成「# 」。"""
     t = normalize_catalog_title(title)
@@ -674,18 +698,23 @@ def render_chapter_md(ch_title, blocks, ch_idx):
     return body, img_records
 
 
-async def wait_stable(page, prev_count, timeout=8):
-    """等页面渲染稳定，返回稳定后的字符数"""
+async def wait_stable(page, prev_count=0, timeout=8):
+    """等页面渲染稳定，返回稳定后的字符数。
+
+    注意：__wr_reset 后计数从 0 开始。若把「连续两次 0」也当成稳定，
+    会在 canvas 尚未 fillText 时过早返回，导致抓到空页、翻页看起来像没动。
+    因此仅在 count>0 且连续两次相同后才视为稳定。
+    """
     last = -1
     poll = SLEEP_READER_STABLE_POLL
     steps = max(1, int(timeout / poll)) if poll > 0 else 1
     for _ in range(steps):
         c = await page.evaluate("() => window.__wr_count()")
-        if c == last:
+        if c > 0 and c == last:
             return c
         last = c
         await asyncio.sleep(poll)
-    return last
+    return last if last is not None and last >= 0 else 0
 
 
 def get_last_chapter_title(md_dir):
@@ -975,23 +1004,39 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         saved_chapter_fps: set[str] = set()
         dup_chapter_hits = [0]
         MAX_DUP_CHAPTER_HITS = 5
+        # 上一页正文指纹：翻页失败/同页重绘时不得反复 append
+        last_page_fp = ""
+        turn_methods = ("arrow", "space", "pagedown")
+        turn_method_idx = 0
 
         async def capture_current_page():
-            """抓当前页的有序块，累加到 ch_blocks；返回是否有新内容"""
-            nonlocal ch_blocks
+            """抓当前页的有序块，累加到 ch_blocks；返回是否有新内容。
+
+            同一页（正文指纹相同）重复捕获时不追加，避免：
+            1) got_new 恒为 True → stale 永不累计 → 死循环空转
+            2) 同页内容反复 append 后被内容切章再次切开
+            """
+            nonlocal ch_blocks, last_page_fp
             await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
             chars = await page.evaluate("() => window.__wr_chars")
             rects = await page.evaluate(CANVAS_RECTS_JS)
             imgs = await page.evaluate(VIEWPORT_IMGS_JS)
-            before = len(ch_blocks)
             new_blocks = build_page_blocks(chars, imgs, rects, seen_imgs)
-            # 文字去重：同一页可能重复捕获，按文本行内容去重
+            page_fp = page_blocks_fingerprint(new_blocks)
+            if not new_blocks:
+                return False
+            if page_fp and page_fp == last_page_fp:
+                return False
+            before = len(ch_blocks)
             for b in new_blocks:
                 if b["type"] == "text":
                     if ch_blocks and ch_blocks[-1].get("type") == "text" and ch_blocks[-1]["text"] == b["text"]:
                         continue
                 ch_blocks.append(b)
-            return len(ch_blocks) > before
+            if len(ch_blocks) > before:
+                last_page_fp = page_fp
+                return True
+            return False
 
         async def commit_chapter(title, blocks, *, note_suffix=""):
             """落盘一章并累计统计；返回 (text_len, imgs)。
@@ -1079,7 +1124,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
 
         while not reached_end:
             await page.evaluate("() => window.__wr_reset()")
-            await turn_reader_page(page)
+            turn_method = turn_methods[turn_method_idx % len(turn_methods)]
+            await turn_reader_page(page, method=turn_method)
             await asyncio.sleep(SLEEP_READER_PAGE_TURN)
             await wait_stable(page, 0)
 
@@ -1098,6 +1144,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 current_chapter = resolve_chapter_title(new_chapter, catalog_titles) or new_chapter
                 page_num = 0
                 stale = 0
+                last_page_fp = ""
+                turn_method_idx = 0
                 if not is_last:
                     await sleep_between_chapters(n)
                 await capture_current_page()
@@ -1119,9 +1167,21 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if reached_end:
                 break
             if split:
+                # 内容切章成功说明本页已贡献进度，下轮继续翻页
+                stale = 0
+                turn_method_idx = 0
+                page_num += 1
                 continue
             if not got_new:
                 stale += 1
+                # 同页空转时轮换翻页键，并给出可观察日志
+                if stale in (1, 3, 5, 8):
+                    print(
+                        f"    … 翻页无新内容 stale={stale}/10 "
+                        f"当前「{(current_chapter or '')[:24]}」 key={turn_method}"
+                    )
+                if stale >= 2:
+                    turn_method_idx += 1
                 if stale >= 10:
                     note = ""
                     # 末章、标题对不上目录、或已连续无新内容：结束，避免整本抓完还误重开
@@ -1135,10 +1195,14 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         # 本会话已稳定翻过很多页后停住，多半到书末
                         reached_end = True
                         note = " [无更多新内容]"
+                    else:
+                        # 中段卡住：结束本会话以便重开；避免同页无限空转
+                        note = " [翻页停滞]"
                     await commit_chapter(current_chapter, ch_blocks, note_suffix=note)
                     break
             else:
                 stale = 0
+                turn_method_idx = 0
             page_num += 1
 
         # reached_end 时把最后一章存下

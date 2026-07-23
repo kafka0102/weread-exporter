@@ -172,6 +172,28 @@ class TestHeaderChapterProgress(unittest.TestCase):
         self.assertNotEqual(a, c)
 
 
+    def test_page_blocks_fingerprint_ignores_identical_pages(self):
+        blocks_a = [
+            {"type": "text", "text": "渭川田家"},
+            {"type": "text", "text": "斜光照墟落，穷巷牛羊归。"},
+        ]
+        blocks_b = [
+            {"type": "text", "text": "渭川田家"},
+            {"type": "text", "text": "斜光照墟落，穷巷牛羊归。"},
+        ]
+        blocks_c = [
+            {"type": "text", "text": "宿郑州"},
+            {"type": "text", "text": "朝与周人辞，暮投郑人宿。"},
+        ]
+        fa = export_precise.page_blocks_fingerprint(blocks_a)
+        fb = export_precise.page_blocks_fingerprint(blocks_b)
+        fc = export_precise.page_blocks_fingerprint(blocks_c)
+        self.assertEqual(fa, fb)
+        self.assertNotEqual(fa, fc)
+        self.assertEqual(export_precise.page_blocks_fingerprint([]), "")
+
+
+
 class TestFindChapterSplit(unittest.TestCase):
     def test_empty_current_finds_first_catalog_title_in_order(self):
         blocks = [
