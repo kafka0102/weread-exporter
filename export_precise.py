@@ -1933,21 +1933,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 turn_method = "click_midright"
             await turn_reader_page(page, method=turn_method)
             await asyncio.sleep(SLEEP_READER_PAGE_TURN)
-            stable_count = await wait_stable(page, 0)
-            # 翻页后若完全没有 fillText，轻推重绘再抓（双页短诗区高发）
+            # 默认短等：诗词页常不二次 fillText，长 timeout 会让日志长时间空白
+            stable_count = await wait_stable(page, 0, timeout=2.5)
             if not stable_count or stable_count <= 0:
                 await force_reader_repaint(page)
                 await page.evaluate("() => window.__wr_reset()")
-                await asyncio.sleep(max(0.12, float(SLEEP_READER_PAGE_RENDER)))
-                stable_count = await wait_stable(page, 0, timeout=4)
-                if not stable_count or stable_count <= 0:
-                    # 第二次：中右点击互动后再等（不额外 Arrow，避免连翻两页）
-                    await turn_reader_page(page, method="click_midright")
-                    await asyncio.sleep(SLEEP_READER_PAGE_TURN)
-                    await force_reader_repaint(page)
-                    await page.evaluate("() => window.__wr_reset()")
-                    await asyncio.sleep(max(0.12, float(SLEEP_READER_PAGE_RENDER)))
-                    stable_count = await wait_stable(page, 0, timeout=4)
+                await asyncio.sleep(max(0.08, float(SLEEP_READER_PAGE_RENDER)))
+                stable_count = await wait_stable(page, 0, timeout=2.0)
 
             new_chapter = await read_chapter_title(page, catalog_titles)
             if new_chapter and should_follow_header_title(
@@ -1979,12 +1971,12 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 continue
 
             got_new = await capture_current_page()
-            # 偶发：页已翻但 fillText 迟到 → 再重绘抓一次，避免「浏览器在翻、日志无进度」
+            # 偶发：页已翻但 fillText 迟到 → 短重绘再抓一次
             if not got_new:
                 await force_reader_repaint(page)
                 await page.evaluate("() => window.__wr_reset()")
-                await asyncio.sleep(max(0.12, float(SLEEP_READER_PAGE_RENDER)))
-                await wait_stable(page, 0, timeout=3)
+                await asyncio.sleep(max(0.08, float(SLEEP_READER_PAGE_RENDER)))
+                await wait_stable(page, 0, timeout=1.5)
                 got_new = await capture_current_page()
                 if got_new:
                     print(
@@ -2004,19 +1996,22 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 page_num += 1
                 continue
             if got_new:
-                # 有进度心跳：每 3 页回显一次，避免长时间只见 stale
-                if page_num > 0 and page_num % 3 == 0:
+                page_num += 1  # 原先只在 split 分支 +1，导致有抓取也无页进度心跳
+                stale = 0
+                turn_method_idx = 0
+                if page_num == 1 or page_num % 2 == 0:
                     n_lines = sum(
                         1 for b in ch_blocks if b.get("type") == "text"
                     )
                     print(
                         f"    … 翻页中 p={page_num} 本章约 {n_lines} 行 "
-                        f"「{(current_chapter or '')[:24]}」"
+                        f"「{(current_chapter or '')[:24]}」 key={turn_method}"
                     )
+                continue
             if not got_new:
                 stale += 1
-                # 同页空转时轮换翻页键；stale=1 太吵，从 3 起回显
-                if stale in (3, 5, 8):
+                # 每轮空转都给短心跳，避免「浏览器在翻、终端像卡死」
+                if stale == 1 or stale in (3, 5, 8) or stale % 2 == 0:
                     print(
                         f"    … 翻页无新内容 stale={stale}/8 "
                         f"当前「{(current_chapter or '')[:24]}」 key={turn_method}"
@@ -2121,10 +2116,6 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         note = " [翻页停滞]"
                     await commit_chapter(current_chapter, ch_blocks, note_suffix=note)
                     break
-            else:
-                stale = 0
-                turn_method_idx = 0
-            page_num += 1
 
         # reached_end 时把最后一章存下
         if reached_end and ch_blocks:
