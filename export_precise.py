@@ -174,12 +174,13 @@ async def blur_reader_inputs(page) -> None:
 async def dismiss_reader_search(page) -> bool:
     """关闭目录/顶栏搜索态，绝不去点搜索图标本身。
 
-    微信读书目录搜索态特征：顶栏可见搜索输入 +「取消」。
-    返回是否处理过搜索相关 UI。
+    仅当「可见搜索输入 + 顶栏取消」同时出现时，才认定进入搜索态并点取消。
+    目录面板里常驻但尺寸为 0 的搜索 input、以及 pointer-events:none 的
+    float search 包装层，都不当作搜索态，避免误按 Esc/误点搜索。
+    返回是否实际处理过搜索 UI。
     """
     handled = False
     try:
-        # 1) 若有可见搜索输入：先点「取消」（只点顶栏取消，不点搜索按钮）
         clicked_cancel = await page.evaluate(
             """() => {
                 const visible = (el, minW=12, minH=12) => {
@@ -187,18 +188,28 @@ async def dismiss_reader_search(page) -> bool:
                     const st = window.getComputedStyle(el);
                     if (st.display === 'none' || st.visibility === 'hidden') return false;
                     if (parseFloat(st.opacity || '1') < 0.05) return false;
+                    if (st.pointerEvents === 'none') return false;
                     const r = el.getBoundingClientRect();
                     if (r.width < minW || r.height < minH) return false;
                     const vw = window.innerWidth, vh = window.innerHeight;
                     if (r.right <= 0 || r.left >= vw || r.bottom <= 0 || r.top >= vh) return false;
                     return true;
                 };
+                // 真·搜索态：可见、可点、有尺寸的搜索输入
                 const hasSearch = Array.from(document.querySelectorAll(
-                    'input[placeholder*="搜索"], input[type="search"], .readerCatalog input, [class*="readerCatalog"] input'
+                    'input[placeholder*="搜索"], input[type="search"]'
                 )).some(el => visible(el, 40, 12));
                 if (!hasSearch) return false;
-                // 仅顶栏「取消」
+                // 只点顶栏「取消」，绝不点 title/aria 含搜索的按钮
                 for (const el of Array.from(document.querySelectorAll('button, a, span, div'))) {
+                    const label = (
+                        (el.getAttribute('title') || '') + ' ' +
+                        (el.getAttribute('aria-label') || '') + ' ' +
+                        (el.textContent || '')
+                    ).trim();
+                    if (/搜索|search|查找/i.test(label) && (el.textContent || '').trim() !== '取消') {
+                        continue;
+                    }
                     if ((el.textContent || '').trim() !== '取消') continue;
                     if (!visible(el, 12, 12)) continue;
                     const r = el.getBoundingClientRect();
@@ -206,7 +217,7 @@ async def dismiss_reader_search(page) -> bool:
                     el.click();
                     return true;
                 }
-                return true; // 有搜索输入但没点到取消，仍算检测到
+                return false;
             }"""
         )
         if clicked_cancel:
@@ -214,7 +225,7 @@ async def dismiss_reader_search(page) -> bool:
             await asyncio.sleep(0.12)
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.08)
-        # 2) 无论是否搜索态，都 blur，防止焦点落在 input
+        # 无论是否搜索态都 blur，防止方向键打进输入框
         await blur_reader_inputs(page)
     except Exception:
         try:
@@ -975,8 +986,11 @@ async def dismiss_reader_overlays(page) -> bool:
 async def is_reader_catalog_open(page) -> bool:
     """目录/目录搜索层是否真正展开并遮挡阅读区。
 
-    微信读书打开目录后点搜索，会出现顶栏「搜索 + 取消」浮层（截图常见），
-    此时正文被半透明遮罩盖住，必须关掉才能翻页。
+    关闭态下微信读书仍会在 DOM 里保留：
+    - placeholder=搜索 的 input（宽高常为 0）
+    - `.readerCatalog_list_item`（宽高常为 0）
+    - `reader_float_search_panel_wrapper`（全屏但 pointer-events:none）
+    因此**必须**以「可见且可交互的目录项 / 真搜索态」为准，不能仅凭节点存在判断。
     """
     try:
         return bool(
@@ -987,6 +1001,7 @@ async def is_reader_catalog_open(page) -> bool:
                         const st = window.getComputedStyle(el);
                         if (st.display === 'none' || st.visibility === 'hidden') return false;
                         if (parseFloat(st.opacity || '1') < 0.05) return false;
+                        if (st.pointerEvents === 'none') return false;
                         const r = el.getBoundingClientRect();
                         if (r.width < minW || r.height < minH) return false;
                         const vw = window.innerWidth, vh = window.innerHeight;
@@ -995,20 +1010,29 @@ async def is_reader_catalog_open(page) -> bool:
                         return true;
                     };
 
-                    // A) 目录搜索态：可见「取消」+ 搜索输入（截图特征）
+                    const visibleCatalogItems = () => Array.from(
+                        document.querySelectorAll('.readerCatalog_list_item')
+                    ).filter(el => visibleBox(el, 40, 16));
+
+                    // A) 真搜索态：可见「取消」+ 可见可点的搜索输入
                     const cancelBtns = Array.from(document.querySelectorAll('button, a, span, div'))
                         .filter(el => {
                             const t = (el.textContent || '').trim();
                             return t === '取消' && visibleBox(el, 20, 12);
                         });
-                    const searchInput = document.querySelector(
-                        'input[placeholder*="搜索"], input[type="search"], .readerCatalog input, [class*="readerCatalog"] input, [class*="search"] input'
-                    );
-                    if (cancelBtns.length && visibleBox(searchInput, 40, 12)) {
+                    const searchInputs = Array.from(document.querySelectorAll(
+                        'input[placeholder*="搜索"], input[type="search"]'
+                    )).filter(el => visibleBox(el, 40, 12));
+                    if (cancelBtns.length && searchInputs.length) {
                         return true;
                     }
 
-                    // B) 蒙层
+                    // B) 有可见目录项 = 目录真正展开（最可靠）
+                    if (visibleCatalogItems().length > 0) {
+                        return true;
+                    }
+
+                    // C) 蒙层 + 可见目录列表（不要用「DOM 里有搜索 input」当证据）
                     const mask = document.querySelector(
                         '.wr_mask_Show, .wr_mask.wr_mask_Show, .wr_mask[class*="Show"]'
                     );
@@ -1016,25 +1040,29 @@ async def is_reader_catalog_open(page) -> bool:
                         const st = window.getComputedStyle(mask);
                         const r = mask.getBoundingClientRect();
                         if (st.display !== 'none' && parseFloat(st.opacity || '1') > 0.05
-                            && r.width > 50 && r.height > 50) {
-                            if (document.querySelector('.readerCatalog_list_item, .readerCatalog_list, input[placeholder*="搜索"]')) {
+                            && st.pointerEvents !== 'none'
+                            && r.width > 50 && r.height > 50
+                            && r.left > -100) {
+                            if (document.querySelector('.readerCatalog_list, .readerCatalog_list_scroll_area')
+                                && visibleCatalogItems().length > 0) {
                                 return true;
                             }
                         }
                     }
 
-                    // C) 目录列表面板（视口内较大右侧区域）
+                    // D) 右侧大面板且内部有可见目录项
                     const panels = document.querySelectorAll(
-                        '.readerCatalog, .readerCatalog_list_scroll_area, [class*="readerCatalog_list"]'
+                        '.readerCatalog, .readerCatalog_list_scroll_area'
                     );
                     for (const el of panels) {
                         if (el.closest && el.closest('button')) continue;
                         if (!visibleBox(el, 160, 160)) continue;
                         const r = el.getBoundingClientRect();
-                        if (r.width >= 200 && r.height >= 200 && r.left > window.innerWidth * 0.25) {
-                            return true;
-                        }
-                        if (el.querySelector && el.querySelector('.readerCatalog_list_item')) {
+                        const hasVisItem = el.querySelector && Array.from(
+                            el.querySelectorAll('.readerCatalog_list_item')
+                        ).some(it => visibleBox(it, 40, 16));
+                        if (!hasVisItem) continue;
+                        if (r.width >= 200 && r.height >= 200) {
                             return true;
                         }
                     }
@@ -1068,15 +1096,13 @@ async def restore_reader_catalog_styles(page) -> None:
 async def close_reader_catalog(page):
     """关闭目录侧栏与遮罩。
 
-    目录开着时 ArrowRight 会在目录列表里移动，不会翻阅读页——这是「页面像在动
-    /菜单关不上/导出空转」的高发原因。
+    目录开着时 ArrowRight 会在目录列表里移动，不会翻阅读页。
 
-    策略：Esc → 关搜索框 X → 再点目录按钮收起 → 点遮罩 → 再 Esc。
-    **绝不** display:none 永久隐藏目录组件。
+    策略：退搜索态 → Esc → 再点目录按钮收起 → 点遮罩/点左侧正文区 → 再 Esc。
+    **绝不** display:none 永久隐藏目录组件，也**绝不**点击搜索按钮。
     """
     closed = False
     try:
-        # 无论目录是否判定打开，先退搜索态（搜索框可单独盖住正文）
         if await dismiss_reader_search(page):
             closed = True
         if not await is_reader_catalog_open(page):
@@ -1097,7 +1123,7 @@ async def close_reader_catalog(page):
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.12)
 
-        # 2) 再退搜索态 + 仅点明确的关闭/取消，绝不点 title=搜索 的按钮
+        # 2) 仅点明确的关闭/取消，绝不点 title=搜索 的按钮
         if await is_reader_catalog_open(page):
             await dismiss_reader_search(page)
             await page.evaluate(
@@ -1111,7 +1137,6 @@ async def close_reader_catalog(page):
                             }
                         }
                     }
-                    // 不要用 [class*="search"]：会命中「搜索」按钮本身
                     const closeBtns = Array.from(document.querySelectorAll(
                         '.readerCatalog button, [class*="readerCatalog"] button'
                     ));
@@ -1124,48 +1149,81 @@ async def close_reader_catalog(page):
                             return;
                         }
                     }
-                    const x = document.querySelector(
-                        '.readerCatalog [class*="close"], [class*="readerCatalog"] [class*="Close"], .readerCatalog .wr_close'
-                    );
-                    if (x) {
-                        const t = (x.getAttribute('title') || x.getAttribute('aria-label') || x.textContent || '').trim();
-                        if (!/搜索|search|查找/i.test(t)) x.click();
-                    }
                 }"""
             )
             await asyncio.sleep(0.15)
 
-        # 3) 再点一次目录按钮 = toggle 收起
+        # 3) 再点一次目录按钮 = toggle 收起（优先真实鼠标点击，避免 JS click 被吞）
         if await is_reader_catalog_open(page):
-            await page.evaluate(
+            clicked = await page.evaluate(
                 """() => {
                     const btn = document.querySelector(
                         'button.readerControls_item.catalog, button[title="目录"]'
                     );
-                    if (btn) btn.click();
+                    if (!btn) return null;
+                    const r = btn.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) return null;
+                    return {x: r.x + r.width / 2, y: r.y + r.height / 2};
                 }"""
             )
+            if clicked:
+                try:
+                    await page.mouse.click(float(clicked["x"]), float(clicked["y"]))
+                except Exception:
+                    await page.evaluate(
+                        """() => {
+                            const btn = document.querySelector(
+                                'button.readerControls_item.catalog, button[title="目录"]'
+                            );
+                            if (btn) btn.click();
+                        }"""
+                    )
+            else:
+                await page.evaluate(
+                    """() => {
+                        const btn = document.querySelector(
+                            'button.readerControls_item.catalog, button[title="目录"]'
+                        );
+                        if (btn) btn.click();
+                    }"""
+                )
             await asyncio.sleep(0.25)
 
-        # 4) 点遮罩空白收起
+        # 4) 点遮罩 / 点左侧阅读区空白收起
         if await is_reader_catalog_open(page):
             await page.evaluate(
                 """() => {
-                    const mask = document.querySelector(
+                    const masks = Array.from(document.querySelectorAll(
                         '.wr_mask, .wr_mask_Show, [class*="wr_mask"]'
-                    );
-                    if (mask) mask.click();
+                    ));
+                    for (const mask of masks) {
+                        const st = window.getComputedStyle(mask);
+                        const r = mask.getBoundingClientRect();
+                        if (st.display === 'none' || parseFloat(st.opacity || '1') < 0.05) continue;
+                        if (st.pointerEvents === 'none') continue;
+                        if (r.width < 50 || r.height < 50 || r.left < -100) continue;
+                        mask.click();
+                        return;
+                    }
                 }"""
             )
+            await asyncio.sleep(0.1)
+            # 左侧正文区：远离右侧控件与目录
+            try:
+                await page.mouse.click(180, 360)
+            except Exception:
+                pass
             await asyncio.sleep(0.15)
 
         await dismiss_reader_overlays(page)
+        await blur_reader_inputs(page)
 
         # 5) 最后再 Esc
         if await is_reader_catalog_open(page):
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.15)
             await dismiss_reader_overlays(page)
+            await blur_reader_inputs(page)
 
         if await is_reader_catalog_open(page):
             print("  ⚠️  目录侧栏仍未关闭（后续翻页可能失效）")
@@ -1177,24 +1235,58 @@ async def close_reader_catalog(page):
     return closed
 
 
+
 async def open_reader_catalog(page) -> bool:
-    """打开目录；若已打开则直接成功。处理 wr_mask 拦截。"""
+    """打开目录；若已打开则直接成功。处理 wr_mask 拦截。
+
+    成功标准：出现可见的 `.readerCatalog_list_item`（关闭态 DOM 里虽有节点但宽高为 0）。
+    """
     await restore_reader_catalog_styles(page)
     if await is_reader_catalog_open(page):
+        await blur_reader_inputs(page)
         return True
     await dismiss_reader_overlays(page)
-    # 先尝试 JS click，绕过 pointer 拦截
-    opened = await page.evaluate(
-        """() => {
-            const btn = document.querySelector(
-                'button.readerControls_item.catalog, button[title="目录"]'
-            );
-            if (!btn) return false;
-            btn.click();
-            return true;
-        }"""
-    )
-    if not opened:
+    await dismiss_reader_search(page)
+
+    async def _click_catalog_btn() -> bool:
+        box = await page.evaluate(
+            """() => {
+                const btn = document.querySelector(
+                    'button.readerControls_item.catalog, button[title="目录"]'
+                );
+                if (!btn) return null;
+                // 排除 class 里夹带 search 的误匹配
+                const t = (btn.getAttribute('title') || btn.getAttribute('aria-label') || '').trim();
+                if (/搜索|search|查找/i.test(t)) return null;
+                if (!/catalog/i.test(btn.className || '') && t !== '目录') return null;
+                const r = btn.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) {
+                    // 仍尝试 JS click（有时布局测量为 0 但仍可点）
+                    btn.click();
+                    return {js: true};
+                }
+                return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+            }"""
+        )
+        if not box:
+            return False
+        if box.get("js"):
+            return True
+        try:
+            await page.mouse.click(float(box["x"]), float(box["y"]))
+            return True
+        except Exception:
+            try:
+                await page.click(
+                    'button.readerControls_item.catalog, button[title="目录"]',
+                    timeout=5000,
+                    force=True,
+                )
+                return True
+            except Exception:
+                return False
+
+    if not await _click_catalog_btn():
         try:
             await page.click(
                 'button.readerControls_item.catalog, button[title="目录"]',
@@ -1203,33 +1295,40 @@ async def open_reader_catalog(page) -> bool:
             )
         except Exception:
             await dismiss_reader_overlays(page)
+            try:
+                await page.click(
+                    'button.readerControls_item.catalog, button[title="目录"]',
+                    timeout=5000,
+                    force=True,
+                )
+            except Exception:
+                return False
+    await asyncio.sleep(SLEEP_READER_CATALOG_OPEN)
+    if await is_reader_catalog_open(page):
+        await blur_reader_inputs(page)
+        return True
+
+    # 再试一次 Esc 清场后点击
+    await page.keyboard.press("Escape")
+    await dismiss_reader_overlays(page)
+    await restore_reader_catalog_styles(page)
+    await asyncio.sleep(0.2)
+    if not await _click_catalog_btn():
+        try:
             await page.click(
                 'button.readerControls_item.catalog, button[title="目录"]',
                 timeout=5000,
                 force=True,
             )
-    await asyncio.sleep(SLEEP_READER_CATALOG_OPEN)
-    if await is_reader_catalog_open(page):
-        return True
-    # 再试一次 Esc 清场后 force click
-    await page.keyboard.press("Escape")
-    await dismiss_reader_overlays(page)
-    await restore_reader_catalog_styles(page)
-    await asyncio.sleep(0.2)
-    try:
-        await page.click(
-            'button.readerControls_item.catalog, button[title="目录"]',
-            timeout=5000,
-            force=True,
-        )
-    except Exception:
-        return False
+        except Exception:
+            return False
     await asyncio.sleep(SLEEP_READER_CATALOG_OPEN)
     opened = await is_reader_catalog_open(page)
     if opened:
-        # 打开目录后微信读书常把焦点放进搜索框——立刻失焦，避免后续按键进搜索
+        # 打开目录后微信读书常把焦点放进搜索框——立刻失焦
         await blur_reader_inputs(page)
     return opened
+
 
 
 async def scrape_catalog_titles(page) -> list[str]:
@@ -1296,13 +1395,38 @@ async def goto_first_chapter(page, catalog_path=None):
         if titles and catalog_path:
             with open(catalog_path, "w", encoding="utf-8") as f:
                 json.dump(titles, f, ensure_ascii=False)
-        item = page.locator(".readerCatalog_list_item").first
-        first_raw = (await item.text_content() or "").strip()
-        first_title = normalize_catalog_title(first_raw) or (titles[0] if titles else "")
-        await item.click(timeout=4000)
+        # 用 JS 点可见首项，避免 Playwright locator 点到 0 尺寸隐藏节点或误触搜索
+        clicked = await page.evaluate(
+            r"""() => {
+                const strip = (s) => String(s || '')
+                    .replace(/(当前读到|已读到|读到)\s*\d+\s*%?\s*$/g, '')
+                    .replace(/\s*\d+\s*%\s*$/g, '')
+                    .trim();
+                const items = Array.from(document.querySelectorAll('.readerCatalog_list_item'));
+                const pick = items.find(el => {
+                    if (el.closest && el.closest('form, [class*="searchInput"], [class*="SearchInput"]')) {
+                        return false;
+                    }
+                    const r = el.getBoundingClientRect();
+                    return r.width >= 40 && r.height >= 12;
+                }) || items[0];
+                if (!pick) return '';
+                const titleEl = pick.querySelector(
+                    '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
+                );
+                const raw = strip((titleEl && titleEl.textContent) || pick.textContent || '');
+                pick.scrollIntoView({block: 'center'});
+                pick.click();
+                return raw;
+            }"""
+        )
+        first_title = normalize_catalog_title(clicked) or (titles[0] if titles else "")
         await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
+        await dismiss_reader_search(page)
         await close_reader_catalog(page)
         await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
+        if await is_reader_catalog_open(page):
+            await close_reader_catalog(page)
     except Exception as e:
         print(f"  ⚠️  目录跳转异常: {e}")
     # 顶栏可能滞后/读空：多读几次，仍空则用目录首项
