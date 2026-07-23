@@ -104,6 +104,39 @@ async def page_viewport(page, fallback=None):
     return fb
 
 
+async def ensure_configured_viewport(page, viewport):
+    """确保页面使用配置的阅读器视口；有头窗口缩小时强制 set_viewport_size。"""
+    desired = {
+        "width": int(viewport["width"]),
+        "height": int(viewport["height"]),
+    }
+    actual = await page_viewport(page, desired)
+    if actual == desired:
+        return desired
+
+    print(
+        f"  🪟 页面视口: {actual['width']}x{actual['height']} "
+        f"（配置 {desired['width']}x{desired['height']}），尝试强制配置值"
+    )
+    try:
+        await page.set_viewport_size(desired)
+        await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
+        actual = await page_viewport(page, desired)
+        if actual == desired:
+            print(
+                f"  ✅ 已强制视口 {desired['width']}x{desired['height']}"
+            )
+            return desired
+        print(
+            f"  ⚠️  强制后视口仍为 {actual['width']}x{actual['height']}，"
+            f"继续按配置 {desired['width']}x{desired['height']} 处理"
+        )
+        return desired
+    except Exception as e:
+        print(f"  ⚠️  强制视口失败: {e}，改用实际 {actual['width']}x{actual['height']}")
+        return actual
+
+
 async def focus_reader_for_keyboard(page):
     """把键盘焦点交给页面主体，不点击正文或图片。"""
     return await page.evaluate(
@@ -1305,13 +1338,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         await page.goto(f"https://weread.qq.com/web/reader/{book_id}",
                         wait_until="networkidle", timeout=30000)
         await asyncio.sleep(SLEEP_READER_AFTER_LOAD)
-        actual_viewport = await page_viewport(page, viewport)
-        if actual_viewport != viewport:
-            print(
-                f"  🪟 页面视口: {actual_viewport['width']}x{actual_viewport['height']} "
-                f"（配置 {viewport['width']}x{viewport['height']}）"
-            )
-            viewport = actual_viewport
+        viewport = await ensure_configured_viewport(page, viewport)
         if headless and await page_needs_login(page):
             await ctx.close()
             raise RuntimeError(
@@ -1916,14 +1943,14 @@ def parse_args(argv=None):
     parser.add_argument(
         "--reader-width",
         type=int,
-        default=None,
-        help=f"临时覆盖阅读器视口宽度（默认 .env READER_VIEWPORT_WIDTH={READER_VIEWPORT_WIDTH}）",
+        default=READER_VIEWPORT_WIDTH,
+        help=f"阅读器视口宽度（默认 {READER_VIEWPORT_WIDTH}，来自 .env READER_VIEWPORT_WIDTH）",
     )
     parser.add_argument(
         "--reader-height",
         type=int,
-        default=None,
-        help=f"临时覆盖阅读器视口高度（默认 .env READER_VIEWPORT_HEIGHT={READER_VIEWPORT_HEIGHT}）",
+        default=READER_VIEWPORT_HEIGHT,
+        help=f"阅读器视口高度（默认 {READER_VIEWPORT_HEIGHT}，来自 .env READER_VIEWPORT_HEIGHT）",
     )
     parser.add_argument(
         "--force-single-page",

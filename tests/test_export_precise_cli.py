@@ -35,8 +35,8 @@ class TestExportPreciseCli(unittest.TestCase):
 
     def test_parse_args_reader_layout_defaults(self):
         args = export_precise.parse_args([])
-        self.assertIsNone(args.reader_width)
-        self.assertIsNone(args.reader_height)
+        self.assertEqual(args.reader_width, export_precise.READER_VIEWPORT_WIDTH)
+        self.assertEqual(args.reader_height, export_precise.READER_VIEWPORT_HEIGHT)
         self.assertIsNone(args.force_single_page)
 
     def test_parse_args_can_disable_force_single_page(self):
@@ -185,6 +185,50 @@ class TestExportPreciseCli(unittest.TestCase):
                 page, {"width": 1200, "height": 900})
 
             self.assertEqual(vp, {"width": 1004, "height": 477})
+
+        asyncio.run(run())
+
+    def test_ensure_configured_viewport_keeps_match(self):
+        async def run():
+            page = mock.AsyncMock()
+            page.evaluate.return_value = {"width": 1200, "height": 900}
+            desired = {"width": 1200, "height": 900}
+
+            vp = await export_precise.ensure_configured_viewport(page, desired)
+
+            self.assertEqual(vp, desired)
+            page.set_viewport_size.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_ensure_configured_viewport_forces_mismatch(self):
+        async def run():
+            page = mock.AsyncMock()
+            # first read: mismatch; after set_viewport_size: match
+            page.evaluate.side_effect = [
+                {"width": 1024, "height": 497},
+                {"width": 1200, "height": 900},
+            ]
+            desired = {"width": 1200, "height": 900}
+
+            with mock.patch.object(export_precise.asyncio, "sleep", new=mock.AsyncMock()):
+                vp = await export_precise.ensure_configured_viewport(page, desired)
+
+            self.assertEqual(vp, desired)
+            page.set_viewport_size.assert_awaited_once_with(desired)
+
+        asyncio.run(run())
+
+    def test_ensure_configured_viewport_falls_back_on_set_error(self):
+        async def run():
+            page = mock.AsyncMock()
+            page.evaluate.return_value = {"width": 1024, "height": 497}
+            page.set_viewport_size.side_effect = RuntimeError("boom")
+            desired = {"width": 1200, "height": 900}
+
+            vp = await export_precise.ensure_configured_viewport(page, desired)
+
+            self.assertEqual(vp, {"width": 1024, "height": 497})
 
         asyncio.run(run())
 
