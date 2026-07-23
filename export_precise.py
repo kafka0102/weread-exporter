@@ -854,46 +854,55 @@ async def is_reader_catalog_open(page) -> bool:
         return False
 
 
+async def restore_reader_catalog_styles(page) -> None:
+    """清除可能被错误写入的目录样式，避免目录按钮永久失灵。"""
+    try:
+        await page.evaluate(
+            """() => {
+                document.querySelectorAll(
+                    '.readerCatalog, [class*="readerCatalog"]'
+                ).forEach(el => {
+                    if (!el.style) return;
+                    el.style.removeProperty('display');
+                    el.style.removeProperty('visibility');
+                    el.style.removeProperty('pointer-events');
+                });
+            }"""
+        )
+    except Exception:
+        pass
+
+
 async def close_reader_catalog(page):
-    """强制关闭目录侧栏与遮罩；目录一直开着会导致翻页/点按钮失效。"""
+    """关闭目录侧栏与遮罩。
+
+    只用 Esc / 再点目录按钮收起，**绝不** display:none 永久隐藏目录，
+    否则目录按钮会失灵（手动点击也没反应）。
+    """
     closed = False
     try:
         if await is_reader_catalog_open(page):
             closed = True
-            # 优先点遮罩空白或按 Esc；再 JS 隐藏
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.15)
-            await page.evaluate(
-                """() => {
-                    // 再点一次目录按钮通常会收起
-                    const btn = document.querySelector(
-                        'button.readerControls_item.catalog, button[title="目录"]'
-                    );
-                    const panel = document.querySelector(
-                        '.readerCatalog, [class*="readerCatalog"]'
-                    );
-                    const open = !!(panel && panel.getBoundingClientRect().width > 80);
-                    if (open && btn) btn.click();
-                }"""
-            )
-            await asyncio.sleep(0.15)
-            await page.keyboard.press("Escape")
+            if await is_reader_catalog_open(page):
+                await page.evaluate(
+                    """() => {
+                        const btn = document.querySelector(
+                            'button.readerControls_item.catalog, button[title="目录"]'
+                        );
+                        if (btn) btn.click();
+                    }"""
+                )
+                await asyncio.sleep(0.2)
+            if await is_reader_catalog_open(page):
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.15)
         await dismiss_reader_overlays(page)
-        # 兜底：直接隐藏侧栏
         if await is_reader_catalog_open(page):
-            await page.evaluate(
-                """() => {
-                    document.querySelectorAll(
-                        '.readerCatalog, [class*="readerCatalog"]'
-                    ).forEach(el => {
-                        el.style.display = 'none';
-                        el.style.visibility = 'hidden';
-                        el.style.pointerEvents = 'none';
-                    });
-                }"""
-            )
-            closed = True
+            await page.keyboard.press("Escape")
             await dismiss_reader_overlays(page)
+            closed = True
     except Exception:
         try:
             await dismiss_reader_overlays(page)
@@ -904,6 +913,7 @@ async def close_reader_catalog(page):
 
 async def open_reader_catalog(page) -> bool:
     """打开目录；若已打开则直接成功。处理 wr_mask 拦截。"""
+    await restore_reader_catalog_styles(page)
     if await is_reader_catalog_open(page):
         return True
     await dismiss_reader_overlays(page)
@@ -938,6 +948,7 @@ async def open_reader_catalog(page) -> bool:
     # 再试一次 Esc 清场后 force click
     await page.keyboard.press("Escape")
     await dismiss_reader_overlays(page)
+    await restore_reader_catalog_styles(page)
     await asyncio.sleep(0.2)
     try:
         await page.click(
@@ -1214,9 +1225,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         saved_chapter_fps: set[str] = set()
         dup_chapter_hits = [0]
         MAX_DUP_CHAPTER_HITS = 5
-        # 页指纹集合 + 正文行集合：同页重绘只要行内容一样就不算新页
-        seen_page_fps: set[str] = set()
-        seen_text_lines: set[str] = set()
+        # 仅与「上一页」去重。全局行/页集合会把双页预读到的后续正文永久吞掉，
+        # 表现为：浏览器其实在翻页，日志却一直 stale（山居秋暝）。
+        last_page_fp = ""
+        last_page_lines: set[str] = set()
         turn_methods = ("arrow", "space", "pagedown")
         turn_method_idx = 0
         catalog_jump_count = 0
@@ -1224,26 +1236,19 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
 
         def reset_page_dedupe():
             """换章或目录跳转后清空页级去重状态。"""
-            nonlocal seen_page_fps, seen_text_lines
-            seen_page_fps = set()
-            seen_text_lines = set()
-
-        def remember_text_lines(blocks):
-            for b in blocks or []:
-                if b.get("type") == "text":
-                    t = (b.get("text") or "").strip()
-                    if t:
-                        seen_text_lines.add(t)
+            nonlocal last_page_fp, last_page_lines
+            last_page_fp = ""
+            last_page_lines = set()
 
         async def capture_current_page():
             """抓当前页的有序块，累加到 ch_blocks；返回是否有新内容。
 
-            去重策略（从强到弱）：
-            1) 整页指纹已见过 → 丢弃
-            2) 文本行已在本章缓冲中出现过 → 跳过该行
-            避免 canvas 重绘细微差异导致 got_new 恒真、死循环空转。
+            去重：
+            - 整页指纹与上一页相同 → 丢弃
+            - 文本行若出现在「上一页」→ 跳过（双页重叠半页）
+            - 不用会话级全局行集合
             """
-            nonlocal ch_blocks
+            nonlocal ch_blocks, last_page_fp, last_page_lines
             await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
             chars = await page.evaluate("() => window.__wr_chars")
             rects = await page.evaluate(CANVAS_RECTS_JS)
@@ -1252,35 +1257,38 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if not new_blocks:
                 return False
             page_fp = page_blocks_fingerprint(new_blocks)
-            if page_fp and page_fp in seen_page_fps:
+            if page_fp and page_fp == last_page_fp:
                 return False
+
+            page_line_set: set[str] = set()
             added = 0
             for b in new_blocks:
                 if b.get("type") == "text":
                     t = (b.get("text") or "").strip()
                     if not t:
                         continue
-                    if t in seen_text_lines:
+                    page_line_set.add(t)
+                    if t in last_page_lines:
                         continue
                     if (
                         ch_blocks
                         and ch_blocks[-1].get("type") == "text"
-                        and ch_blocks[-1].get("text") == t
+                        and (ch_blocks[-1].get("text") or "").strip() == t
                     ):
                         continue
-                    seen_text_lines.add(t)
                     ch_blocks.append({"type": "text", "text": t})
                     added += 1
                 else:
                     ch_blocks.append(b)
                     added += 1
+
             if added > 0:
                 if page_fp:
-                    seen_page_fps.add(page_fp)
+                    last_page_fp = page_fp
+                last_page_lines = page_line_set
                 return True
-            # 行全是重复：也记入页指纹，防止反复解析同一页
             if page_fp:
-                seen_page_fps.add(page_fp)
+                last_page_fp = page_fp
             return False
 
         async def commit_chapter(title, blocks, *, note_suffix=""):
@@ -1351,7 +1359,6 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     ch_idx += 1
                     if is_last:
                         ch_blocks = after
-                        remember_text_lines(after)
                         current_chapter = nxt
                         page_num = 0
                         stale = 0
@@ -1360,7 +1367,6 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     await sleep_between_chapters(n)
                 elif is_last:
                     ch_blocks = after
-                    remember_text_lines(after)
                     current_chapter = nxt
                     page_num = 0
                     stale = 0
@@ -1368,8 +1374,6 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     return True
             # before 为空：上一章已落盘或本页已属新章，仅把块归属切到下一章
             ch_blocks = after
-            # after 中的行本就来自旧缓冲，保持 seen_text_lines，避免同页再抓时重复切入
-            remember_text_lines(after)
             current_chapter = nxt
             page_num = 0
             stale = 0
@@ -1406,7 +1410,6 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 if chapter_saved(n, _imgs):
                     ch_idx += 1
                 ch_blocks = after
-                remember_text_lines(after)
                 current_chapter = resolve_chapter_title(new_chapter, catalog_titles) or new_chapter
                 page_num = 0
                 stale = 0
