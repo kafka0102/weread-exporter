@@ -219,9 +219,12 @@ class TestExportPreciseCli(unittest.TestCase):
             page = mock.Mock()
             page.keyboard.press = mock.AsyncMock()
             page.click = mock.AsyncMock()
-            # is_open True once, then False for subsequent checks; other evaluate calls return 0/None
+            # 前几次 is_open=True 才会走进 Esc 流程；之后关闭
+            opens = [True, True, True, False]
             page.evaluate = mock.AsyncMock(
-                side_effect=[True] + [False] * 20
+                side_effect=lambda *a, **k: (
+                    opens.pop(0) if opens else False
+                )
             )
 
             closed = await export_precise.close_reader_catalog(page)
