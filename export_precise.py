@@ -409,6 +409,42 @@ def resolve_chapter_title(raw_title: str, catalog_titles) -> str:
     return cleaned
 
 
+def should_follow_header_title(catalog_titles, current_title, header_title) -> bool:
+    """是否应根据顶栏章名切换 current_chapter。
+
+    内容切章可能已超前于顶栏：诗词选集里顶栏常停在「王维 二十七首」这类
+    作者/卷小节名，而正文已按目录切到「渭川田家」等子篇。若此时盲从顶栏，
+    会把目录进度回退并反复落盘同一批章节。
+
+    规则：
+    - 顶栏空/与当前相同：不切换
+    - 无目录：允许切换（退化行为）
+    - 顶栏无法对齐目录：不切换
+    - 当前无法对齐目录：允许切换
+    - 仅当顶栏目录下标严格大于当前时切换（只前进）
+    """
+    header = resolve_chapter_title(header_title, catalog_titles)
+    current = resolve_chapter_title(current_title, catalog_titles)
+    if not header or header == current:
+        return False
+    if not catalog_titles:
+        return True
+    h_idx = catalog_index(catalog_titles, header)
+    if h_idx is None:
+        return False
+    c_idx = catalog_index(catalog_titles, current)
+    if c_idx is None:
+        return True
+    return h_idx > c_idx
+
+
+def chapter_blocks_fingerprint(title: str, blocks) -> str:
+    """章节正文指纹：用于检测死循环重复落盘。"""
+    body, _imgs = render_chapter_md(title, blocks or [], 0)
+    payload = (normalize_catalog_title(title) + "\n" + body).encode("utf-8")
+    return hashlib.md5(payload).hexdigest()
+
+
 def display_chapter_title(title: str, ch_idx: int) -> str:
     """落盘用章名；空标题回退为编号，避免 md 首行变成「# 」。"""
     t = normalize_catalog_title(title)
@@ -935,6 +971,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         chapters_this_session = 0
         stale = 0
         page_num = 0
+        # 会话内已落盘章节指纹；重复则说明切章回退/停滞
+        saved_chapter_fps: set[str] = set()
+        dup_chapter_hits = [0]
+        MAX_DUP_CHAPTER_HITS = 5
 
         async def capture_current_page():
             """抓当前页的有序块，累加到 ch_blocks；返回是否有新内容"""
@@ -954,11 +994,31 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             return len(ch_blocks) > before
 
         async def commit_chapter(title, blocks, *, note_suffix=""):
-            """落盘一章并累计统计；返回 (text_len, imgs)。"""
-            nonlocal total_chars, total_imgs, chapters_this_session
+            """落盘一章并累计统计；返回 (text_len, imgs)。
+
+            若同一章同一正文指纹反复出现，视为切章死循环并中止，
+            避免像「王维」小节那样成千上万次重复落盘。
+            """
+            nonlocal total_chars, total_imgs, chapters_this_session, reached_end
+            fp = chapter_blocks_fingerprint(title, blocks)
+            if fp in saved_chapter_fps:
+                dup_chapter_hits[0] += 1
+                print(
+                    f"  ⚠️  重复章节内容「{(title or '')[:32]}」"
+                    f"（{dup_chapter_hits[0]}/{MAX_DUP_CHAPTER_HITS}），跳过落盘"
+                )
+                if dup_chapter_hits[0] >= MAX_DUP_CHAPTER_HITS:
+                    raise RuntimeError(
+                        "章节进度疑似死循环：相同标题与正文反复出现。"
+                        "常见原因是顶栏停在卷/作者名而内容切章已前进，"
+                        "随后又被顶栏回退。请更新导出逻辑后清理对应 "
+                        f"output 目录重试。"
+                    )
+                return 0, []
             n, imgs = save_chapter(title, blocks, ch_idx, md_dir, raw_dir)
             if not chapter_saved(n, imgs):
                 return n, imgs
+            saved_chapter_fps.add(fp)
             total_chars += n
             total_imgs += len(imgs)
             note = f" +{len(imgs)}图" if imgs else ""
@@ -1024,8 +1084,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             await wait_stable(page, 0)
 
             new_chapter = await read_chapter_title(page, catalog_titles)
-            if new_chapter and new_chapter != current_chapter:
-                # 标题栏切换：先把已窜入上一章末尾的新章内容剥回
+            if new_chapter and should_follow_header_title(
+                    catalog_titles, current_chapter, new_chapter):
+                # 标题栏前进：先把已窜入上一章末尾的新章内容剥回
+                # 注意：顶栏落后于内容切章时必须忽略，否则会目录回退死循环
                 before, after = split_blocks_at_chapter_start(ch_blocks, new_chapter)
                 if after:
                     ch_blocks = before
@@ -1033,7 +1095,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 n, _imgs = await commit_chapter(current_chapter, ch_blocks)
                 ch_idx += 1
                 ch_blocks = after
-                current_chapter = new_chapter
+                current_chapter = resolve_chapter_title(new_chapter, catalog_titles) or new_chapter
                 page_num = 0
                 stale = 0
                 if not is_last:

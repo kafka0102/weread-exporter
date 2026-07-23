@@ -118,6 +118,60 @@ class TestCatalogTitleCleaning(unittest.TestCase):
         self.assertEqual(export_precise.display_chapter_title("李白", 3), "李白")
 
 
+
+class TestHeaderChapterProgress(unittest.TestCase):
+    """顶栏不得把已内容切章前进的目录进度回退。"""
+
+    def test_should_not_follow_earlier_header_title(self):
+        catalog = [
+            "孟浩然 九首",
+            "春晓",
+            "王维 二十七首",
+            "渭川田家",
+            "宿郑州",
+            "西施咏",
+            "桃源行",
+            "陇头吟",
+        ]
+        # 内容切章已到桃源行，顶栏仍停在作者小节名
+        self.assertFalse(
+            export_precise.should_follow_header_title(
+                catalog, "桃源行", "王维 二十七首"
+            )
+        )
+        self.assertFalse(
+            export_precise.should_follow_header_title(
+                catalog, "渭川田家", "王维 二十七首"
+            )
+        )
+
+    def test_should_follow_forward_header_title(self):
+        catalog = ["导言", "李白", "张志和", "刘禹锡"]
+        self.assertTrue(
+            export_precise.should_follow_header_title(catalog, "导言", "李白")
+        )
+        self.assertTrue(
+            export_precise.should_follow_header_title(catalog, "李白", "刘禹锡")
+        )
+        self.assertFalse(
+            export_precise.should_follow_header_title(catalog, "李白", "李白")
+        )
+        self.assertFalse(
+            export_precise.should_follow_header_title(catalog, "张志和", "李白")
+        )
+
+    def test_fingerprint_stable_for_same_blocks(self):
+        blocks = [
+            {"type": "text", "text": "渭川田家"},
+            {"type": "text", "text": "斜光照墟落，穷巷牛羊归。"},
+        ]
+        a = export_precise.chapter_blocks_fingerprint("渭川田家", blocks)
+        b = export_precise.chapter_blocks_fingerprint("渭川田家", list(blocks))
+        c = export_precise.chapter_blocks_fingerprint("宿郑州", blocks)
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+
+
 class TestFindChapterSplit(unittest.TestCase):
     def test_empty_current_finds_first_catalog_title_in_order(self):
         blocks = [
