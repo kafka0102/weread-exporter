@@ -236,14 +236,13 @@ async def dismiss_reader_search(page) -> bool:
 
 
 async def turn_reader_page(page, *, method: str = "arrow"):
-    """聚焦阅读器并仅用键盘翻到下一页。
-
-    **禁止**点击正文/canvas：点阅读区会拉起顶栏控件，极易误触「搜索」。
+    """聚焦阅读器并翻到下一页。
 
     method:
-      - arrow: ArrowRight（默认，唯一稳定方式）
-      - arrow2: 连按两次 ArrowRight（偶发单次被吞时）
-      - pagedown/space: 仅显式指定时使用（易误触目录/搜索）
+      - arrow: ArrowRight（默认）
+      - arrow2: 连按两次 ArrowRight
+      - click_midright: 点阅读区中右（避开右侧工具条与搜索按钮）
+      - pagedown/space: 仅显式指定时使用
     """
     await dismiss_reader_search(page)
     await focus_reader_for_keyboard(page)
@@ -254,6 +253,23 @@ async def turn_reader_page(page, *, method: str = "arrow"):
         await asyncio.sleep(0.05)
         await page.keyboard.press("ArrowRight")
         return "arrow2"
+    if m in ("click_midright", "click_right"):
+        # 右侧工具条约在 x≈1028（1200 宽）；点中右内容区翻下一页，避开工具条
+        try:
+            box = await page.evaluate(
+                """() => {
+                    const vw = window.innerWidth || 1200;
+                    const vh = window.innerHeight || 900;
+                    const x = Math.min(vw * 0.72, vw - 220);
+                    const y = vh * 0.48;
+                    return {x, y};
+                }"""
+            )
+            await page.mouse.click(float(box["x"]), float(box["y"]))
+        except Exception:
+            await page.keyboard.press("ArrowRight")
+        await blur_reader_inputs(page)
+        return "click_midright"
     key = {
         "space": "Space",
         "pagedown": "PageDown",
@@ -261,7 +277,6 @@ async def turn_reader_page(page, *, method: str = "arrow"):
     }.get(m, "ArrowRight")
     await page.keyboard.press(key)
     return m
-
 
 async def force_reader_repaint(page) -> None:
     """翻页后 canvas 未再次 fillText 时，轻推视口触发重绘。"""
@@ -1395,32 +1410,19 @@ async def goto_first_chapter(page, catalog_path=None):
         if titles and catalog_path:
             with open(catalog_path, "w", encoding="utf-8") as f:
                 json.dump(titles, f, ensure_ascii=False)
-        # 用 JS 点可见首项，避免 Playwright locator 点到 0 尺寸隐藏节点或误触搜索
-        clicked = await page.evaluate(
-            r"""() => {
-                const strip = (s) => String(s || '')
-                    .replace(/(当前读到|已读到|读到)\s*\d+\s*%?\s*$/g, '')
-                    .replace(/\s*\d+\s*%\s*$/g, '')
-                    .trim();
-                const items = Array.from(document.querySelectorAll('.readerCatalog_list_item'));
-                const pick = items.find(el => {
-                    if (el.closest && el.closest('form, [class*="searchInput"], [class*="SearchInput"]')) {
-                        return false;
-                    }
-                    const r = el.getBoundingClientRect();
-                    return r.width >= 40 && r.height >= 12;
-                }) || items[0];
-                if (!pick) return '';
-                const titleEl = pick.querySelector(
-                    '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
+        # 目录滚回顶部后，用真实鼠标点首项（Vue 对 element.click() 常不跳转）
+        await page.evaluate(
+            """() => {
+                const sc = document.querySelector(
+                    '.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]'
                 );
-                const raw = strip((titleEl && titleEl.textContent) || pick.textContent || '');
-                pick.scrollIntoView({block: 'center'});
-                pick.click();
-                return raw;
+                if (sc) sc.scrollTop = 0;
             }"""
         )
-        first_title = normalize_catalog_title(clicked) or (titles[0] if titles else "")
+        await asyncio.sleep(max(0.1, float(SLEEP_READER_CATALOG_SCROLL) * 0.3))
+        want = titles[0] if titles else ""
+        clicked = await click_catalog_list_item(page, want)
+        first_title = normalize_catalog_title(clicked) or want
         await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
         await dismiss_reader_search(page)
         await close_reader_catalog(page)
@@ -1463,6 +1465,108 @@ def chapter_saved(text_len, images):
 
 
 
+async def click_catalog_list_item(page, target_title: str = "") -> str:
+    """用真实鼠标点击目录项（Vue 对纯 JS click 常无响应）。
+
+    target_title 为空时点第一个可见项。成功返回清洗后的章名。
+    """
+    target = normalize_catalog_title(target_title)
+    info = await page.evaluate(
+        r"""(target) => {
+            const strip = (s) => String(s || '')
+                .replace(/(当前读到|已读到|读到)\s*\d+\s*%?\s*$/g, '')
+                .replace(/\s*\d+\s*%\s*$/g, '')
+                .trim();
+            const visible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') return false;
+                if (parseFloat(st.opacity || '1') < 0.05) return false;
+                const r = el.getBoundingClientRect();
+                return r.width >= 40 && r.height >= 12
+                    && r.right > 0 && r.left < window.innerWidth
+                    && r.bottom > 0 && r.top < window.innerHeight;
+            };
+            const items = Array.from(document.querySelectorAll('.readerCatalog_list_item'));
+            let pick = null;
+            let raw = '';
+            for (const el of items) {
+                if (el.closest && el.closest('form, [class*="searchInput"], [class*="SearchInput"]')) {
+                    continue;
+                }
+                if (!visible(el)) continue;
+                const titleEl = el.querySelector(
+                    '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
+                );
+                const t = strip((titleEl && titleEl.textContent) || el.textContent || '');
+                if (!t) continue;
+                if (!target || t === target || t.includes(target) || target.includes(t)) {
+                    pick = el;
+                    raw = t;
+                    break;
+                }
+            }
+            if (!pick) {
+                const el = items[0];
+                if (!el) return null;
+                const titleEl = el.querySelector(
+                    '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
+                );
+                raw = strip((titleEl && titleEl.textContent) || el.textContent || '');
+                pick = el;
+            }
+            pick.scrollIntoView({block: 'center'});
+            const r = pick.getBoundingClientRect();
+            return {
+                raw,
+                x: r.x + Math.min(Math.max(r.width / 2, 20), 120),
+                y: r.y + r.height / 2,
+                w: r.width,
+                h: r.height,
+            };
+        }""",
+        target,
+    )
+    if not info:
+        return ""
+    raw = normalize_catalog_title(str(info.get("raw") or ""))
+    try:
+        x, y = float(info["x"]), float(info["y"])
+        w, h = float(info.get("w") or 0), float(info.get("h") or 0)
+        if w >= 20 and h >= 10:
+            await page.mouse.click(x, y)
+        else:
+            await page.evaluate(
+                r"""(target) => {
+                    const strip = (s) => String(s || '')
+                        .replace(/(当前读到|已读到|读到)\s*\d+\s*%?\s*$/g, '')
+                        .replace(/\s*\d+\s*%\s*$/g, '')
+                        .trim();
+                    const items = Array.from(document.querySelectorAll('.readerCatalog_list_item'));
+                    for (const el of items) {
+                        const titleEl = el.querySelector(
+                            '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
+                        );
+                        const t = strip((titleEl && titleEl.textContent) || el.textContent || '');
+                        if (!target || t === target || t.includes(target) || target.includes(t)) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    if (items[0]) {
+                        items[0].click();
+                        return true;
+                    }
+                    return false;
+                }""",
+                target,
+            )
+    except Exception:
+        return raw
+    return raw
+
+
+
 async def goto_catalog_chapter(page, target_title: str) -> str:
     """打开目录并点击目标章名；成功返回实际点到的清洗标题，失败返回空串。
 
@@ -1482,37 +1586,10 @@ async def goto_catalog_chapter(page, target_title: str) -> str:
             # 目录内若误入搜索态，先退回列表
             await dismiss_reader_search(page)
             await blur_reader_inputs(page)
-            clicked = await page.evaluate(
-                r"""(target) => {
-                    const strip = (s) => String(s || '')
-                        .replace(/(当前读到|已读到|读到)\s*\d+\s*%?\s*$/g, '')
-                        .replace(/\s*\d+\s*%\s*$/g, '')
-                        .trim();
-                    const items = Array.from(
-                        document.querySelectorAll('.readerCatalog_list_item')
-                    );
-                    for (const el of items) {
-                        // 跳过搜索结果区/搜索表单内节点，避免点到搜索相关项结构
-                        if (el.closest && el.closest('form, [class*="searchInput"], [class*="SearchInput"]')) {
-                            continue;
-                        }
-                        const titleEl = el.querySelector(
-                            '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
-                        );
-                        const raw = strip((titleEl && titleEl.textContent) || el.textContent || '');
-                        if (!raw) continue;
-                        if (raw === target || raw.includes(target) || target.includes(raw)) {
-                            el.scrollIntoView({block: 'center'});
-                            el.click();
-                            return raw;
-                        }
-                    }
-                    return '';
-                }""",
-                target,
-            )
+            clicked = await click_catalog_list_item(page, target)
             if clicked:
                 await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
+                await dismiss_reader_search(page)
                 await close_reader_catalog(page)
                 await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
                 if await is_reader_catalog_open(page):
@@ -1624,9 +1701,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         # 表现为：浏览器其实在翻页，日志却一直 stale（山居秋暝）。
         last_page_fp = ""
         last_page_lines: set[str] = set()
-        # 只用方向键翻页：点 canvas/正文会拉起顶栏并误触「搜索」
-        # 偶发单次 ArrowRight 被吞时用 arrow2（连按两次）
-        turn_methods = ("arrow", "arrow", "arrow2")
+        # 优先方向键；停滞时再点阅读区中右（避开右侧工具条/搜索）
+        turn_methods = ("arrow", "arrow2", "click_midright")
         turn_method_idx = 0
         catalog_jump_count = 0
         catalog_jump_failures = 0
