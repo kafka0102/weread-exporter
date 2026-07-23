@@ -279,23 +279,47 @@ async def turn_reader_page(page, *, method: str = "arrow"):
     return m
 
 async def force_reader_repaint(page) -> None:
-    """翻页后 canvas 未再次 fillText 时，轻推视口触发重绘。"""
+    """翻页后 canvas 未再次 fillText 时，触发重绘。
+
+    有头模式常用 no_viewport，set_viewport_size 会失败；改为 resize 事件 +
+    canvas 微样式扰动 + 鼠标微移，避免静默抓空页。
+    """
     try:
-        vp = await page.evaluate(
-            "() => ({width: window.innerWidth, height: window.innerHeight})"
-        )
-        w = int(vp.get("width") or 0)
-        h = int(vp.get("height") or 0)
-        if w > 10 and h > 10:
-            await page.set_viewport_size({"width": w - 1, "height": h})
-            await asyncio.sleep(0.05)
-            await page.set_viewport_size({"width": w, "height": h})
-            await asyncio.sleep(0.05)
         await page.evaluate(
             """() => {
                 try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+                document.querySelectorAll('canvas').forEach(c => {
+                    try {
+                        const st = c.style;
+                        const old = st.transform;
+                        st.transform = 'translateZ(0) scale(1.001)';
+                        void c.offsetWidth;
+                        st.transform = old || '';
+                    } catch (e) {}
+                });
             }"""
         )
+        # 微移鼠标：不 click，避免拉起顶栏/误触搜索
+        try:
+            await page.mouse.move(380, 420)
+            await asyncio.sleep(0.03)
+            await page.mouse.move(400, 430)
+        except Exception:
+            pass
+        # 无头/固定 viewport 时再尝试 1px 尺寸抖动（失败忽略）
+        try:
+            vp = await page.evaluate(
+                "() => ({width: window.innerWidth, height: window.innerHeight})"
+            )
+            w = int(vp.get("width") or 0)
+            h = int(vp.get("height") or 0)
+            if w > 20 and h > 20:
+                await page.set_viewport_size({"width": w - 1, "height": h})
+                await asyncio.sleep(0.04)
+                await page.set_viewport_size({"width": w, "height": h})
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
     except Exception:
         pass
 
@@ -1168,20 +1192,27 @@ async def close_reader_catalog(page):
             )
             await asyncio.sleep(0.15)
 
-        # 3) 再点一次目录按钮 = toggle 收起（优先真实鼠标点击，避免 JS click 被吞）
-        if await is_reader_catalog_open(page):
+        # 3) 多次 toggle 目录按钮（真实鼠标），避免点了章名后面板仍开着
+        for _ in range(3):
+            if not await is_reader_catalog_open(page):
+                break
             clicked = await page.evaluate(
                 """() => {
                     const btn = document.querySelector(
                         'button.readerControls_item.catalog, button[title="目录"]'
                     );
                     if (!btn) return null;
+                    const t = (btn.getAttribute('title') || btn.getAttribute('aria-label') || '').trim();
+                    if (/搜索|search|查找/i.test(t)) return null;
                     const r = btn.getBoundingClientRect();
-                    if (r.width < 8 || r.height < 8) return null;
+                    if (r.width < 8 || r.height < 8) {
+                        btn.click();
+                        return {js: true};
+                    }
                     return {x: r.x + r.width / 2, y: r.y + r.height / 2};
                 }"""
             )
-            if clicked:
+            if clicked and not clicked.get("js"):
                 try:
                     await page.mouse.click(float(clicked["x"]), float(clicked["y"]))
                 except Exception:
@@ -1193,7 +1224,7 @@ async def close_reader_catalog(page):
                             if (btn) btn.click();
                         }"""
                     )
-            else:
+            elif not clicked:
                 await page.evaluate(
                     """() => {
                         const btn = document.querySelector(
@@ -1202,9 +1233,9 @@ async def close_reader_catalog(page):
                         if (btn) btn.click();
                     }"""
                 )
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.22)
 
-        # 4) 点遮罩 / 点左侧阅读区空白收起
+        # 4) 点遮罩 / 点阅读区空白收起（多点位，避开右侧工具条）
         if await is_reader_catalog_open(page):
             await page.evaluate(
                 """() => {
@@ -1222,21 +1253,25 @@ async def close_reader_catalog(page):
                     }
                 }"""
             )
-            await asyncio.sleep(0.1)
-            # 左侧正文区：远离右侧控件与目录
-            try:
-                await page.mouse.click(180, 360)
-            except Exception:
-                pass
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.08)
+            for x, y in ((160, 320), (220, 480), (360, 240), (500, 400)):
+                if not await is_reader_catalog_open(page):
+                    break
+                try:
+                    await page.mouse.click(float(x), float(y))
+                except Exception:
+                    pass
+                await asyncio.sleep(0.1)
 
         await dismiss_reader_overlays(page)
         await blur_reader_inputs(page)
 
-        # 5) 最后再 Esc
-        if await is_reader_catalog_open(page):
+        # 5) 最后再 Esc 两下
+        for _ in range(2):
+            if not await is_reader_catalog_open(page):
+                break
             await page.keyboard.press("Escape")
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.12)
             await dismiss_reader_overlays(page)
             await blur_reader_inputs(page)
 
@@ -1865,27 +1900,54 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         while not reached_end:
             # 搜索框/目录开着时方向键不会翻页，且会把字打进搜索
             await dismiss_reader_search(page)
+            catalog_blocking = False
             if await is_reader_catalog_open(page):
                 await close_reader_catalog(page)
                 await dismiss_reader_search(page)
                 if await is_reader_catalog_open(page):
-                    # 连续关不掉时，可能是检测误报；不要永久跳过翻页导致 0 章失败
-                    print("    … 目录似乎未关闭，尝试继续翻页")
+                    # 再硬关一次：目录开着时按方向键只会在目录列表移动，导致「看似翻页」
+                    await close_reader_catalog(page)
+                    await blur_reader_inputs(page)
+                if await is_reader_catalog_open(page):
+                    catalog_blocking = True
+                    stale += 1
+                    if stale in (3, 5, 8):
+                        print(
+                            f"    … 目录未关闭，跳过翻页键 stale={stale}/8 "
+                            f"当前「{(current_chapter or '')[:24]}」"
+                        )
                     await dismiss_reader_overlays(page)
                     await page.keyboard.press("Escape")
                     await blur_reader_inputs(page)
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.15)
+                    # 绝不在目录仍开时 ArrowRight
+                    if stale >= 8 and catalog_titles:
+                        # 落到后面的目录跳转逻辑（复用）
+                        pass
+                    else:
+                        continue
             await page.evaluate("() => window.__wr_reset()")
             turn_method = turn_methods[turn_method_idx % len(turn_methods)]
+            # 目录刚关不稳时优先点阅读区中右翻页，减少方向键被目录吞掉
+            if catalog_blocking:
+                turn_method = "click_midright"
             await turn_reader_page(page, method=turn_method)
             await asyncio.sleep(SLEEP_READER_PAGE_TURN)
             stable_count = await wait_stable(page, 0)
-            # 翻页后若完全没有 fillText，轻推重绘一次再等（双页短诗区高发）
+            # 翻页后若完全没有 fillText，轻推重绘再抓（双页短诗区高发）
             if not stable_count or stable_count <= 0:
                 await force_reader_repaint(page)
                 await page.evaluate("() => window.__wr_reset()")
-                await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
+                await asyncio.sleep(max(0.12, float(SLEEP_READER_PAGE_RENDER)))
                 stable_count = await wait_stable(page, 0, timeout=4)
+                if not stable_count or stable_count <= 0:
+                    # 第二次：中右点击互动后再等（不额外 Arrow，避免连翻两页）
+                    await turn_reader_page(page, method="click_midright")
+                    await asyncio.sleep(SLEEP_READER_PAGE_TURN)
+                    await force_reader_repaint(page)
+                    await page.evaluate("() => window.__wr_reset()")
+                    await asyncio.sleep(max(0.12, float(SLEEP_READER_PAGE_RENDER)))
+                    stable_count = await wait_stable(page, 0, timeout=4)
 
             new_chapter = await read_chapter_title(page, catalog_titles)
             if new_chapter and should_follow_header_title(
@@ -1917,6 +1979,17 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 continue
 
             got_new = await capture_current_page()
+            # 偶发：页已翻但 fillText 迟到 → 再重绘抓一次，避免「浏览器在翻、日志无进度」
+            if not got_new:
+                await force_reader_repaint(page)
+                await page.evaluate("() => window.__wr_reset()")
+                await asyncio.sleep(max(0.12, float(SLEEP_READER_PAGE_RENDER)))
+                await wait_stable(page, 0, timeout=3)
+                got_new = await capture_current_page()
+                if got_new:
+                    print(
+                        f"    … 重绘后抓到新内容 当前「{(current_chapter or '')[:24]}」"
+                    )
             split = False
             while await split_if_next_chapter_started():
                 split = True
@@ -1930,10 +2003,20 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 turn_method_idx = 0
                 page_num += 1
                 continue
+            if got_new:
+                # 有进度心跳：每 3 页回显一次，避免长时间只见 stale
+                if page_num > 0 and page_num % 3 == 0:
+                    n_lines = sum(
+                        1 for b in ch_blocks if b.get("type") == "text"
+                    )
+                    print(
+                        f"    … 翻页中 p={page_num} 本章约 {n_lines} 行 "
+                        f"「{(current_chapter or '')[:24]}」"
+                    )
             if not got_new:
                 stale += 1
-                # 同页空转时轮换翻页键，并给出可观察日志
-                if stale in (1, 3, 5, 8):
+                # 同页空转时轮换翻页键；stale=1 太吵，从 3 起回显
+                if stale in (3, 5, 8):
                     print(
                         f"    … 翻页无新内容 stale={stale}/8 "
                         f"当前「{(current_chapter or '')[:24]}」 key={turn_method}"
@@ -2004,10 +2087,17 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     stale = 0
                     page_num = 0
                     turn_method_idx = 0
-                    await close_reader_catalog(page)
-                    if await is_reader_catalog_open(page):
+                    # 跳章后面板常仍开着：硬关多轮，避免后续方向键在目录里乱跳回卷首
+                    for _ in range(4):
+                        await dismiss_reader_search(page)
                         await close_reader_catalog(page)
+                        if not await is_reader_catalog_open(page):
+                            break
+                        await asyncio.sleep(0.15)
+                    await blur_reader_inputs(page)
+                    await focus_reader_for_keyboard(page)
                     await page.evaluate("() => window.__wr_reset()")
+                    await force_reader_repaint(page)
                     await wait_stable(page, 0)
                     await capture_current_page()
                     while await split_if_next_chapter_started():
