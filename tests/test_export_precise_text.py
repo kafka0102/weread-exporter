@@ -320,6 +320,72 @@ class TestDualCanvasSplit(unittest.TestCase):
         self.assertNotIn("菩萨蛮李白平林", body)
 
 
+
+class TestShortTitleChapterStart(unittest.TestCase):
+    """短目录名不得前缀命中正文行。"""
+
+    def test_short_title_not_prefix_of_prose(self):
+        self.assertFalse(
+            export_precise.is_chapter_start_text("云破月来花弄影", "云")
+        )
+        self.assertFalse(
+            export_precise.is_chapter_start_text("云想衣裳花想容", "云")
+        )
+        self.assertFalse(
+            export_precise.is_chapter_start_text("春日迟迟", "春日")
+        )
+        self.assertFalse(
+            export_precise.is_chapter_start_text("感遇陈子昂", "感遇")
+        )
+        self.assertFalse(
+            export_precise.is_chapter_start_text("雪消门外千山绿", "雪")
+        )
+        self.assertTrue(export_precise.is_chapter_start_text("云", "云"))
+        self.assertTrue(export_precise.is_chapter_start_text("春日", "春日"))
+        self.assertTrue(export_precise.is_chapter_start_text("感遇", "感遇"))
+
+    def test_long_title_space_and_glue_still_ok(self):
+        self.assertTrue(
+            export_precise.is_chapter_start_text("沈佺期三首", "沈佺期 三首")
+        )
+        # 较长标题允许短粘连
+        self.assertTrue(
+            export_precise.is_chapter_start_text(
+                "送杜少府之任蜀川五律", "送杜少府之任蜀川"
+            )
+        )
+
+    def test_find_split_ignores_cloud_prose(self):
+        catalog = ["来鹄 二首", "云", "蚕妇"]
+        blocks = [
+            {"type": "text", "text": "来鹄二首"},
+            {"type": "text", "text": "云破月来花弄影"},
+            {"type": "text", "text": "注释"},
+        ]
+        found = export_precise.find_chapter_split(blocks, catalog, "来鹄 二首")
+        self.assertIsNone(found)
+        blocks2 = [
+            {"type": "text", "text": "来鹄正文"},
+            {"type": "text", "text": "云"},
+            {"type": "text", "text": "千形万象竟还空"},
+        ]
+        found2 = export_precise.find_chapter_split(blocks2, catalog, "来鹄 二首")
+        self.assertIsNotNone(found2)
+        self.assertEqual(found2[0], "云")
+
+    def test_catalog_index_no_short_false_hit(self):
+        catalog = ["春日", "野望", "春日京中有怀", "云", "宿云门寺阁"]
+        self.assertEqual(export_precise.catalog_index(catalog, "春日"), 0)
+        self.assertEqual(
+            export_precise.catalog_index(catalog, "春日京中有怀"), 2
+        )
+        self.assertEqual(export_precise.catalog_index(catalog, "云"), 3)
+        # 不应把含「云」的长标题解析成短章「云」
+        self.assertEqual(
+            export_precise.catalog_index(catalog, "宿云门寺阁"), 4
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -343,7 +409,8 @@ class TestChapterStartSpaceTolerance(unittest.TestCase):
         self.assertIsNotNone(found)
         self.assertEqual(found[0], "沈佺期 三首")
 
-    def test_find_split_looks_ahead_if_next_missing(self):
+    def test_find_split_does_not_skip_missing_next(self):
+        """中间目录项未出现在正文时，不得跳切到更后面的章。"""
         catalog = ["赠苏绾书记", "沈佺期 三首", "杂诗"]
         blocks = [
             {"type": "text", "text": "赠苏正文"},
@@ -351,6 +418,5 @@ class TestChapterStartSpaceTolerance(unittest.TestCase):
             {"type": "text", "text": "闻道黄龙戍"},
         ]
         found = export_precise.find_chapter_split(blocks, catalog, "赠苏绾书记")
-        self.assertIsNotNone(found)
-        self.assertEqual(found[0], "杂诗")
+        self.assertIsNone(found)
 

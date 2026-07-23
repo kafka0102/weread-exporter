@@ -474,6 +474,9 @@ def is_chapter_start_text(text: str, chapter_title: str) -> bool:
 
     canvas 文本常去掉空格（「沈佺期三首」），目录却带空格（「沈佺期 三首」），
     必须按压缩键匹配，否则会漏切章、日志停在旧章而页面已前进。
+
+    极短标题（≤2 字压缩键，如「云」「雪」「雁」）只允许整行精确/压缩全等，
+    禁止前缀命中正文「云破月来花弄影」等，否则会窜到目录后部短章名。
     """
     t = (text or "").strip()
     title = normalize_catalog_title(chapter_title)
@@ -485,18 +488,17 @@ def is_chapter_start_text(text: str, chapter_title: str) -> bool:
     tk, titlek = compact_title_key(t), compact_title_key(title)
     if tk and titlek and tk == titlek:
         return True
-    # 前缀：原串或压缩串
+    # 极短标题（云/雪/雁/序/春日 等 ≤2 字）禁止前缀粘连正文
+    if not titlek or len(titlek) <= 2:
+        return False
+    # 前缀：原串或压缩串（标题+词牌/作者粘连）
     if t.startswith(title):
         rest = t[len(title):]
-    elif tk.startswith(titlek) and titlek:
-        # 用原串尽量切出 rest：去掉与 title 压缩匹配的前缀长度
-        # 保守：仅当 t 去空白后以 titlek 开头，rest 取压缩后的尾巴在原串中难对齐；
-        # 若整行压缩后只比标题多一点后缀，仍算章首。
+    elif tk.startswith(titlek):
         rest_k = tk[len(titlek):]
         if not rest_k:
             return True
-        # 原串里从第一个非空字符对齐困难；用 rest_k 首字在 t 中定位
-        rest = rest_k  # 后续只检查首字符属性
+        rest = rest_k
     else:
         return False
     if not rest:
@@ -584,6 +586,7 @@ def catalog_index(catalog_titles, title: str):
         except ValueError:
             pass
         nk = compact_title_key(norm)
+        # 先只做压缩全等，避免短名「春日」误命中「春日京中有怀」
         for i, c in enumerate(catalog_titles):
             cn = normalize_catalog_title(c)
             if not cn:
@@ -592,10 +595,19 @@ def catalog_index(catalog_titles, title: str):
                 return i
             if nk and compact_title_key(cn) == nk:
                 return i
-            # 顶栏偶发更短/更长（少了卷名前缀等）
-            if len(norm) >= 2 and len(cn) >= 2 and (norm == cn or norm in cn or cn in norm):
-                # 避免极短误匹配：较短一方至少 2 字且长度差不大
-                if min(len(norm), len(cn)) >= 2 and abs(len(norm) - len(cn)) <= 8:
+        # 顶栏偶发更短/更长：仅当较短方≥4 且是较长方前缀/包含时放宽
+        if nk and len(nk) >= 4:
+            for i, c in enumerate(catalog_titles):
+                cn = normalize_catalog_title(c)
+                if not cn:
+                    continue
+                ck = compact_title_key(cn)
+                if not ck or len(ck) < 4:
+                    continue
+                shorter, longer = (nk, ck) if len(nk) <= len(ck) else (ck, nk)
+                if longer.startswith(shorter) and abs(len(nk) - len(ck)) <= 8:
+                    return i
+                if shorter in longer and abs(len(nk) - len(ck)) <= 4 and len(shorter) >= 6:
                     return i
     return None
 
@@ -699,35 +711,21 @@ def find_chapter_split(blocks, catalog_titles, current_title: str):
 
     返回 (next_title, before, after)；找不到则 None。
 
-    - 当前章能在目录定位时：按目录顺序找「之后」第一个作为章首出现的标题
-      （不限于紧邻下一章，避免中间标题被 canvas 吃掉空格时永远漏切）。
+    - 当前章能在目录定位时：只匹配「下一章」标题（避免跳章吞掉中间目录项）。
+      章名比对已忽略空格差异（canvas「沈佺期三首」vs 目录「沈佺期 三首」）。
     - 当前章未知（顶栏为空）时：按目录顺序找第一个作为章首出现的标题。
     """
     if not blocks or not catalog_titles:
         return None
     cur = normalize_catalog_title(current_title)
     if cur:
-        idx = catalog_index(catalog_titles, cur)
-        if idx is None:
-            # 无法定位时退化为全局按序搜索
-            start = 0
-        else:
-            start = idx + 1
-        best = None
-        best_i = None
-        for j in range(start, len(catalog_titles)):
-            title = catalog_titles[j]
-            before, after = split_blocks_at_chapter_start(blocks, title)
-            if not after:
-                continue
-            # 取在 blocks 中最早出现的那个标题
-            pos = len(blocks) - len(after)
-            if best is None or pos < best_i:
-                best = (title, before, after)
-                best_i = pos
-            # 目录靠前的标题若出现得更早，优先；已按 j 递增，
-            # 若后面标题出现位置更靠前（乱序）才替换
-        return best
+        nxt = next_catalog_title(catalog_titles, cur)
+        if not nxt:
+            return None
+        before, after = split_blocks_at_chapter_start(blocks, nxt)
+        if not after:
+            return None
+        return nxt, before, after
 
     # 顶栏空：按目录顺序找第一个章首
     for title in catalog_titles:
@@ -1571,10 +1569,14 @@ async def click_catalog_list_item(page, target_title: str = "") -> str:
                 if (!t) return false;
                 if (!tgt) return true;
                 if (t === tgt) return true;
-                if (t.includes(tgt) || tgt.includes(t)) {
-                    const a = Math.min(t.length, tgt.length);
-                    const b = Math.abs(t.length - tgt.length);
-                    return a >= 2 && b <= 12;
+                const compact = (s) => String(s || '').replace(/\s+/g, '');
+                const tc = compact(t), gc = compact(tgt);
+                if (tc && gc && tc === gc) return true;
+                // 短标题只允许精确/压缩全等，避免「春日」点到「春日京中有怀」
+                if (gc.length <= 4 || tc.length <= 4) return false;
+                if (tc.startsWith(gc) || gc.startsWith(tc)) {
+                    const b = Math.abs(tc.length - gc.length);
+                    return Math.min(tc.length, gc.length) >= 4 && b <= 8;
                 }
                 return false;
             };
@@ -1629,10 +1631,16 @@ async def click_catalog_list_item(page, target_title: str = "") -> str:
     if target:
         if not raw:
             return ""
-        if raw != target and target not in raw and raw not in target:
-            return ""
-        if min(len(raw), len(target)) < 2:
-            return ""
+        rk, tk = compact_title_key(raw), compact_title_key(target)
+        exact = raw == target or (rk and tk and rk == tk)
+        if not exact:
+            # 非精确时允许较长标题的前缀包含，但短标题必须精确
+            if not rk or not tk or min(len(rk), len(tk)) <= 4:
+                return ""
+            if not (rk.startswith(tk) or tk.startswith(rk)):
+                return ""
+            if abs(len(rk) - len(tk)) > 8:
+                return ""
     try:
         x, y = float(info["x"]), float(info["y"])
         w, h = float(info.get("w") or 0), float(info.get("h") or 0)
@@ -1825,6 +1833,9 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         catalog_jump_failures = 0
         MAX_CATALOG_JUMPS = 8
         MAX_CATALOG_JUMP_FAILURES = 3
+        # 顶栏已前进但当前章仍无正文时，优先目录回跳重抓，避免空跟章丢篇
+        empty_header_resync = 0
+        MAX_EMPTY_HEADER_RESYNC = 2
 
         def reset_page_dedupe():
             """换章或目录跳转后清空页级去重状态。"""
@@ -2042,6 +2053,50 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 before, after = split_blocks_at_chapter_start(ch_blocks, new_chapter)
                 if after:
                     ch_blocks = before
+                had_text = any(
+                    b.get("type") == "text" and (b.get("text") or "").strip()
+                    for b in (ch_blocks or [])
+                )
+                # 当前章还没抓到正文，顶栏却已到下一章：目录回跳重抓，禁止空跟章丢篇
+                if (not had_text) and (not after) and catalog_titles:
+                    empty_header_resync += 1
+                    if empty_header_resync <= MAX_EMPTY_HEADER_RESYNC:
+                        print(
+                            f"    … 顶栏「{new_chapter[:20]}」超前且「"
+                            f"{(current_chapter or '')[:20]}」无正文，"
+                            f"目录回跳重抓"
+                            f"（{empty_header_resync}/{MAX_EMPTY_HEADER_RESYNC}）"
+                        )
+                        jumped = await goto_catalog_chapter(page, current_chapter)
+                        for _ in range(4):
+                            await dismiss_reader_search(page)
+                            await close_reader_catalog(page)
+                            if not await is_reader_catalog_open(page):
+                                break
+                            await asyncio.sleep(0.12)
+                        await blur_reader_inputs(page)
+                        await focus_reader_for_keyboard(page)
+                        if jumped:
+                            current_chapter = resolve_chapter_title(
+                                jumped, catalog_titles) or current_chapter
+                        reset_page_dedupe()
+                        await page.evaluate("() => window.__wr_reset()")
+                        await force_reader_repaint(page)
+                        await wait_stable(page, 0)
+                        await capture_current_page()
+                        while await split_if_next_chapter_started():
+                            if reached_end:
+                                break
+                        stale = 0
+                        turn_method_idx = 0
+                        continue
+                    print(
+                        f"    … 回跳仍无正文，放弃「"
+                        f"{(current_chapter or '')[:20]}」并跟到「"
+                        f"{new_chapter[:20]}」"
+                    )
+                    empty_header_resync = 0
+
                 is_last = is_last_catalog_chapter(current_chapter, catalog_titles)
                 n, _imgs = await commit_chapter(current_chapter, ch_blocks)
                 if chapter_saved(n, _imgs):
@@ -2051,8 +2106,27 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 page_num = 0
                 stale = 0
                 turn_method_idx = 0
+                empty_header_resync = 0
                 if not is_last and chapter_saved(n, _imgs):
                     await sleep_between_chapters(n)
+                # 空缓冲跟章后，目录落到新章，避免浏览器已更超前
+                if not after and catalog_titles:
+                    jumped = await goto_catalog_chapter(page, current_chapter)
+                    for _ in range(4):
+                        await dismiss_reader_search(page)
+                        await close_reader_catalog(page)
+                        if not await is_reader_catalog_open(page):
+                            break
+                        await asyncio.sleep(0.12)
+                    await blur_reader_inputs(page)
+                    await focus_reader_for_keyboard(page)
+                    if jumped:
+                        current_chapter = resolve_chapter_title(
+                            jumped, catalog_titles) or current_chapter
+                    reset_page_dedupe()
+                    await page.evaluate("() => window.__wr_reset()")
+                    await force_reader_repaint(page)
+                    await wait_stable(page, 0)
                 await capture_current_page()
                 # 当前页也可能继续跨到再下一章
                 while await split_if_next_chapter_started():
@@ -2092,6 +2166,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 page_num += 1  # 原先只在 split 分支 +1，导致有抓取也无页进度心跳
                 stale = 0
                 turn_method_idx = 0
+                empty_header_resync = 0
                 if page_num == 1 or page_num % 2 == 0:
                     n_lines = sum(
                         1 for b in ch_blocks if b.get("type") == "text"
@@ -2111,6 +2186,22 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     )
                 if stale >= 2:
                     turn_method_idx += 1
+
+                # 顶栏已明显超前且抓空：提前只跳「下一章」，勿跟远处顶栏
+                if stale >= 3 and catalog_titles and new_chapter:
+                    h_idx = catalog_index(catalog_titles, new_chapter)
+                    c_idx = catalog_index(catalog_titles, current_chapter)
+                    if (
+                        h_idx is not None
+                        and c_idx is not None
+                        and h_idx > c_idx + 1
+                    ):
+                        print(
+                            f"    … 顶栏超前「{new_chapter[:20]}」"
+                            f"/逻辑「{(current_chapter or '')[:20]}」，"
+                            f"提前目录跳下一章"
+                        )
+                        stale = 8  # 复用下方目录跳转（仅 next）
 
                 # 键盘翻页连续失效：才尝试目录跳章（阈值降低，避免目录卡死）
                 if stale >= 8 and catalog_titles:
