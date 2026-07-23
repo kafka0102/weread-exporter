@@ -470,24 +470,41 @@ def should_merge_soft_wrap(prev: str, cur: str) -> bool:
 
 
 def is_chapter_start_text(text: str, chapter_title: str) -> bool:
-    """判断一行文字是否为下一章起始（目录标题行或标题+词牌粘连）。"""
+    """判断一行文字是否为下一章起始（目录标题行或标题+词牌粘连）。
+
+    canvas 文本常去掉空格（「沈佺期三首」），目录却带空格（「沈佺期 三首」），
+    必须按压缩键匹配，否则会漏切章、日志停在旧章而页面已前进。
+    """
     t = (text or "").strip()
-    title = (chapter_title or "").strip()
+    title = normalize_catalog_title(chapter_title)
     if not t or not title:
         return False
     if t == title:
         return True
-    if not t.startswith(title):
+    # 压缩空白后全等
+    tk, titlek = compact_title_key(t), compact_title_key(title)
+    if tk and titlek and tk == titlek:
+        return True
+    # 前缀：原串或压缩串
+    if t.startswith(title):
+        rest = t[len(title):]
+    elif tk.startswith(titlek) and titlek:
+        # 用原串尽量切出 rest：去掉与 title 压缩匹配的前缀长度
+        # 保守：仅当 t 去空白后以 titlek 开头，rest 取压缩后的尾巴在原串中难对齐；
+        # 若整行压缩后只比标题多一点后缀，仍算章首。
+        rest_k = tk[len(titlek):]
+        if not rest_k:
+            return True
+        # 原串里从第一个非空字符对齐困难；用 rest_k 首字在 t 中定位
+        rest = rest_k  # 后续只检查首字符属性
+    else:
         return False
-    rest = t[len(title):]
     if not rest:
         return True
     if rest[0] in "，、,;；。！？":
         return False
     if _NOT_CHAPTER_START_REST.match(rest):
         return False
-    # 软折行误切：作者名出现在段中换行处，后接散文动词/虚词已在上面过滤；
-    # 其余允许「张志和渔父…」「范仲淹苏幕遮…」这类标题+词牌同行。
     return True
 
 
@@ -527,6 +544,14 @@ def normalize_catalog_title(text: str) -> str:
     return s
 
 
+def compact_title_key(text: str) -> str:
+    """用于标题比对的压缩键：去空白，降低「沈佺期 三首」vs「沈佺期三首」漏切。"""
+    s = normalize_catalog_title(text)
+    if not s:
+        return ""
+    return re.sub(r"\s+", "", s)
+
+
 def clean_catalog_titles(titles) -> list[str]:
     """清洗目录列表：去进度污染、去空、保序去重。"""
     out: list[str] = []
@@ -558,11 +583,14 @@ def catalog_index(catalog_titles, title: str):
             return list(catalog_titles).index(norm)
         except ValueError:
             pass
+        nk = compact_title_key(norm)
         for i, c in enumerate(catalog_titles):
             cn = normalize_catalog_title(c)
             if not cn:
                 continue
             if cn == norm:
+                return i
+            if nk and compact_title_key(cn) == nk:
                 return i
             # 顶栏偶发更短/更长（少了卷名前缀等）
             if len(norm) >= 2 and len(cn) >= 2 and (norm == cn or norm in cn or cn in norm):
@@ -671,20 +699,35 @@ def find_chapter_split(blocks, catalog_titles, current_title: str):
 
     返回 (next_title, before, after)；找不到则 None。
 
-    - 当前章能在目录定位时：只匹配「下一章」标题（降低正文提及误切）。
+    - 当前章能在目录定位时：按目录顺序找「之后」第一个作为章首出现的标题
+      （不限于紧邻下一章，避免中间标题被 canvas 吃掉空格时永远漏切）。
     - 当前章未知（顶栏为空）时：按目录顺序找第一个作为章首出现的标题。
     """
     if not blocks or not catalog_titles:
         return None
     cur = normalize_catalog_title(current_title)
     if cur:
-        nxt = next_catalog_title(catalog_titles, cur)
-        if not nxt:
-            return None
-        before, after = split_blocks_at_chapter_start(blocks, nxt)
-        if not after:
-            return None
-        return nxt, before, after
+        idx = catalog_index(catalog_titles, cur)
+        if idx is None:
+            # 无法定位时退化为全局按序搜索
+            start = 0
+        else:
+            start = idx + 1
+        best = None
+        best_i = None
+        for j in range(start, len(catalog_titles)):
+            title = catalog_titles[j]
+            before, after = split_blocks_at_chapter_start(blocks, title)
+            if not after:
+                continue
+            # 取在 blocks 中最早出现的那个标题
+            pos = len(blocks) - len(after)
+            if best is None or pos < best_i:
+                best = (title, before, after)
+                best_i = pos
+            # 目录靠前的标题若出现得更早，优先；已按 j 递增，
+            # 若后面标题出现位置更靠前（乱序）才替换
+        return best
 
     # 顶栏空：按目录顺序找第一个章首
     for title in catalog_titles:
@@ -1981,6 +2024,17 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 stable_count = await wait_stable(page, 0, timeout=2.0)
 
             new_chapter = await read_chapter_title(page, catalog_titles)
+            # 顶栏与逻辑章不一致时打点，方便对照「页面 vs 日志」
+            if (
+                new_chapter
+                and current_chapter
+                and compact_title_key(new_chapter) != compact_title_key(current_chapter)
+            ):
+                # 节流：仅 stale 奇数或刚切章后
+                if stale in (0, 1, 3, 5, 8):
+                    print(
+                        f"    … 顶栏「{new_chapter[:20]}」/逻辑「{(current_chapter or '')[:20]}」"
+                    )
             if new_chapter and should_follow_header_title(
                     catalog_titles, current_chapter, new_chapter):
                 # 标题栏前进：先把已窜入上一章末尾的新章内容剥回

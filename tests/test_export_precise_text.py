@@ -322,3 +322,35 @@ class TestDualCanvasSplit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestChapterStartSpaceTolerance(unittest.TestCase):
+    def test_chapter_start_ignores_spaces(self):
+        self.assertTrue(
+            export_precise.is_chapter_start_text("沈佺期三首", "沈佺期 三首")
+        )
+        self.assertTrue(
+            export_precise.is_chapter_start_text("沈佺期 三首", "沈佺期 三首")
+        )
+
+    def test_find_split_with_spaceless_canvas_title(self):
+        catalog = ["赠苏绾书记", "沈佺期 三首", "杂诗"]
+        blocks = [
+            {"type": "text", "text": "赠苏正文"},
+            {"type": "text", "text": "沈佺期三首"},
+            {"type": "text", "text": "作者简介"},
+        ]
+        found = export_precise.find_chapter_split(blocks, catalog, "赠苏绾书记")
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], "沈佺期 三首")
+
+    def test_find_split_looks_ahead_if_next_missing(self):
+        catalog = ["赠苏绾书记", "沈佺期 三首", "杂诗"]
+        blocks = [
+            {"type": "text", "text": "赠苏正文"},
+            {"type": "text", "text": "杂诗"},
+            {"type": "text", "text": "闻道黄龙戍"},
+        ]
+        found = export_precise.find_chapter_split(blocks, catalog, "赠苏绾书记")
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], "杂诗")
+
