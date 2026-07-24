@@ -477,9 +477,12 @@ MEASURE_RE = re.compile(r'^[a-zA-Z0-9`~!@#$%^&*()\-_=+\[\]{}|;:\',<.>/?\\"\s]+$'
 SENTENCE_END = set("。！？；：」）】》…—")
 # canvas 软折行合并阈值：短于此长度的行（词牌/作者名等）不与邻行粘连
 SOFT_WRAP_MIN_LEN = 16
-# 非末章正文异常膨胀：截断/丢弃缓冲并重开会话，不再中途点目录硬跳
-RUNAWAY_CHAPTER_LINES = 600
-RUNAWAY_CHAPTER_PAGES = 50
+# 软阈值：触发更积极的正文越章/切章检查（长章正常翻页也会超过此值）
+RUNAWAY_CHAPTER_LINES = 2500
+RUNAWAY_CHAPTER_PAGES = 120
+# 硬阈值：仅停滞时用于判定「脏缓冲不落盘」；有新内容时绝不因行数重开
+HARD_RUNAWAY_CHAPTER_LINES = 12000
+HARD_RUNAWAY_CHAPTER_PAGES = 400
 # 顶栏跨过「下一章」仍持续灌入新正文时，连续确认后按正文切章（不点目录）
 HEADER_MULTI_AHEAD_CONFIRM = 2
 # 标题前缀后若接这些成分，视为正文提及而非新章起始
@@ -487,6 +490,27 @@ _NOT_CHAPTER_START_REST = re.compile(
     r"^(的|与|和|在|是|了|也|都|就|还|曾|并|便|则|却|又|已|将|会|能|要|"
     r"把|被|让|从|向|对|比|因|而|但|曾经|这首|早在|不过|与他|便是)"
 )
+
+
+def chapter_text_line_count(blocks) -> int:
+    """当前章缓冲中的正文行数。"""
+    return sum(1 for b in (blocks or []) if b.get("type") == "text")
+
+
+def is_soft_runaway_chapter(n_lines: int, page_num: int) -> bool:
+    """缓冲偏大：应更积极做正文越章切分，但仍视为可能的正常长章。"""
+    return (
+        int(n_lines or 0) >= RUNAWAY_CHAPTER_LINES
+        or int(page_num or 0) >= RUNAWAY_CHAPTER_PAGES
+    )
+
+
+def is_hard_runaway_chapter(n_lines: int, page_num: int) -> bool:
+    """缓冲极大：仅用于停滞时丢弃脏数据，避免污染续传锚点。"""
+    return (
+        int(n_lines or 0) >= HARD_RUNAWAY_CHAPTER_LINES
+        or int(page_num or 0) >= HARD_RUNAWAY_CHAPTER_PAGES
+    )
 
 
 def is_title_like_line(line: str) -> bool:
@@ -2465,8 +2489,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                                 ch_blocks, catalog_titles, current_chapter
                             )
                         )
-                        or n_lines >= RUNAWAY_CHAPTER_LINES
-                        or page_num >= RUNAWAY_CHAPTER_PAGES
+                        or is_soft_runaway_chapter(n_lines, page_num)
                     )
                     if need_overrun_check:
                         while True:
@@ -2508,26 +2531,26 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         if reached_end:
                             break
 
-                    # 仍异常膨胀：丢弃脏缓冲，结束会话后重开阅读器续传
-                    n_lines = sum(
-                        1 for b in ch_blocks if b.get("type") == "text"
-                    )
+                    # 长章会超过软阈值：只要本页仍有新正文，就继续翻页，
+                    # 绝不能丢弃缓冲重开（否则会在同一长章上死循环）。
+                    n_lines = chapter_text_line_count(ch_blocks)
                     if (
-                        not is_last_catalog_chapter(current_chapter, catalog_titles)
+                        not recovered
+                        and not is_last_catalog_chapter(
+                            current_chapter, catalog_titles
+                        )
+                        and is_soft_runaway_chapter(n_lines, page_num)
                         and (
-                            n_lines >= RUNAWAY_CHAPTER_LINES
-                            or page_num >= RUNAWAY_CHAPTER_PAGES
+                            page_num == 1
+                            or page_num % 10 == 0
+                            or is_hard_runaway_chapter(n_lines, page_num)
                         )
                     ):
                         print(
-                            f"    … 本章仍异常膨胀 p={page_num} lines={n_lines} "
+                            f"    … 本章较长 p={page_num} lines={n_lines} "
                             f"「{(current_chapter or '')[:20]}」，"
-                            f"丢弃缓冲并重开阅读器续传（不点目录）"
+                            f"继续翻页抓取（不因长章重开）"
                         )
-                        ch_blocks = []
-                        reset_page_dedupe()
-                        request_reopen = True
-                        break
 
                 continue
 
@@ -2575,10 +2598,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     f"结束本会话并重开阅读器续传"
                 )
 
-            # 膨胀脏数据不落盘，避免污染续传锚点
-            if n_lines >= RUNAWAY_CHAPTER_LINES or page_num >= RUNAWAY_CHAPTER_PAGES:
+            # 仅硬阈值脏缓冲不落盘；正常长章在停滞时仍尽量落盘半成品
+            if is_hard_runaway_chapter(n_lines, page_num):
                 print(
-                    f"    … 停滞时缓冲过大 lines={n_lines} p={page_num}，丢弃不落盘"
+                    f"    … 停滞时缓冲极大 lines={n_lines} p={page_num}，丢弃不落盘"
                 )
                 ch_blocks = []
             elif ch_blocks:

@@ -563,3 +563,48 @@ class TestChapterStartSpaceTolerance(unittest.TestCase):
         ]
         found = export_precise.find_chapter_split(blocks, catalog, "赠苏绾书记")
         self.assertIsNone(found)
+
+
+class RunawayChapterThresholdTests(unittest.TestCase):
+    def test_soft_threshold_allows_long_multi_page_chapter(self):
+        # 散文长章常见 700+ 行缓冲；旧阈值 600 会误杀
+        self.assertFalse(export_precise.is_soft_runaway_chapter(721, 4))
+        self.assertFalse(export_precise.is_hard_runaway_chapter(721, 4))
+
+    def test_soft_threshold_triggers_only_when_large(self):
+        self.assertTrue(
+            export_precise.is_soft_runaway_chapter(
+                export_precise.RUNAWAY_CHAPTER_LINES, 1
+            )
+        )
+        self.assertTrue(
+            export_precise.is_soft_runaway_chapter(
+                10, export_precise.RUNAWAY_CHAPTER_PAGES
+            )
+        )
+        self.assertFalse(
+            export_precise.is_hard_runaway_chapter(
+                export_precise.RUNAWAY_CHAPTER_LINES, 1
+            )
+        )
+
+    def test_hard_threshold_for_dirty_discard_only(self):
+        self.assertTrue(
+            export_precise.is_hard_runaway_chapter(
+                export_precise.HARD_RUNAWAY_CHAPTER_LINES, 1
+            )
+        )
+        self.assertTrue(
+            export_precise.is_hard_runaway_chapter(
+                1, export_precise.HARD_RUNAWAY_CHAPTER_PAGES
+            )
+        )
+
+    def test_chapter_text_line_count(self):
+        blocks = [
+            {"type": "text", "text": "a"},
+            {"type": "img", "src": "x"},
+            {"type": "text", "text": "b"},
+        ]
+        self.assertEqual(export_precise.chapter_text_line_count(blocks), 2)
+        self.assertEqual(export_precise.chapter_text_line_count([]), 0)
