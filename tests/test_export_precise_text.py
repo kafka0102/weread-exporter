@@ -404,6 +404,103 @@ class TestShortTitleChapterStart(unittest.TestCase):
         )
 
 
+
+
+class TestHeaderMultiAheadRecovery(unittest.TestCase):
+    """顶栏跨章且正文仍在灌入时，必须能识别越位并截断后续章。"""
+
+    def test_catalog_index_delta(self):
+        catalog = [
+            "舟中晓望",
+            "春晓",
+            "王维 二十七首",
+            "渭川田家",
+        ]
+        self.assertEqual(
+            export_precise.catalog_index_delta(catalog, "舟中晓望", "渭川田家"),
+            3,
+        )
+        self.assertEqual(
+            export_precise.catalog_index_delta(catalog, "舟中晓望", "春晓"),
+            1,
+        )
+        self.assertEqual(
+            export_precise.catalog_index_delta(catalog, "舟中晓望", "舟中晓望"),
+            0,
+        )
+        self.assertIsNone(
+            export_precise.catalog_index_delta(catalog, "舟中晓望", "不存在")
+        )
+
+    def test_skipped_next_chapter_evidence(self):
+        catalog = [
+            "舟中晓望",
+            "春晓",
+            "王维 二十七首",
+            "渭川田家",
+        ]
+        blocks = [
+            {"type": "text", "text": "舟中晓望正文注释"},
+            {"type": "text", "text": "王维 二十七首"},
+            {"type": "text", "text": "渭川田家"},
+            {"type": "text", "text": "斜光照墟落"},
+        ]
+        self.assertEqual(
+            export_precise.skipped_next_chapter_evidence(
+                blocks, catalog, "舟中晓望"
+            ),
+            "王维 二十七首",
+        )
+        # 下一章若在正文出现，则不算「越过」
+        blocks_with_next = [
+            {"type": "text", "text": "舟中晓望正文"},
+            {"type": "text", "text": "春晓"},
+            {"type": "text", "text": "春眠不觉晓"},
+            {"type": "text", "text": "王维 二十七首"},
+        ]
+        self.assertEqual(
+            export_precise.skipped_next_chapter_evidence(
+                blocks_with_next, catalog, "舟中晓望"
+            ),
+            "",
+        )
+
+    def test_trim_blocks_before_future_catalog(self):
+        catalog = [
+            "舟中晓望",
+            "春晓",
+            "王维 二十七首",
+            "渭川田家",
+        ]
+        blocks = [
+            {"type": "text", "text": "挂席东南望"},
+            {"type": "text", "text": "王维 二十七首"},
+            {"type": "text", "text": "渭川田家"},
+            {"type": "text", "text": "斜光照墟落"},
+        ]
+        trimmed, hit = export_precise.trim_blocks_before_future_catalog(
+            blocks, catalog, "舟中晓望", min_ahead=1
+        )
+        self.assertEqual(hit, "王维 二十七首")
+        self.assertEqual([b["text"] for b in trimmed], ["挂席东南望"])
+
+    def test_find_chapter_split_still_only_next(self):
+        """内容切章仍只认紧邻下一章，避免误吞中间项。"""
+        catalog = [
+            "舟中晓望",
+            "春晓",
+            "王维 二十七首",
+            "渭川田家",
+        ]
+        blocks = [
+            {"type": "text", "text": "舟中晓望正文"},
+            {"type": "text", "text": "王维 二十七首"},
+            {"type": "text", "text": "作者简介"},
+        ]
+        self.assertIsNone(
+            export_precise.find_chapter_split(blocks, catalog, "舟中晓望")
+        )
+
 if __name__ == "__main__":
     unittest.main()
 
