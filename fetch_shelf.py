@@ -11,7 +11,7 @@ DOM 抓取书籍 id/title，同时通过 context 级网络拦截捕获书架接�
 用法：
     python fetch_shelf.py                 # 可见浏览器
     python fetch_shelf.py --headless      # 无头（需已缓存登录态）
-    python fetch_shelf.py --sleep 5 --max-no-new 4
+    python fetch_shelf.py --sleep 5 --max-no-new 6
     python fetch_shelf.py --no-enrich-author
 """
 from __future__ import annotations
@@ -88,15 +88,22 @@ def collect_books_from_json(obj, out=None):
 
     兼容 bookId / book_id、title / bookName / name、author / authorName 等字段名。
     原地修改 out 并返回，便于在响应回调中累积。
+
+    同 id 多次出现时合并字段：非空 title/author 优先保留，避免 bookProgress
+    等仅含 bookId 的条目把已有书名/作者覆盖成空串。
     """
     if out is None:
         out = {}
     if isinstance(obj, dict):
         bid = obj.get("bookId") or obj.get("book_id")
         if bid:
-            out[str(bid)] = {
-                "title": obj.get("title") or obj.get("bookName") or obj.get("name") or "",
-                "author": obj.get("author") or obj.get("authorName") or "",
+            bid = str(bid)
+            title = obj.get("title") or obj.get("bookName") or obj.get("name") or ""
+            author = obj.get("author") or obj.get("authorName") or ""
+            prev = out.get(bid) or {}
+            out[bid] = {
+                "title": title or prev.get("title") or "",
+                "author": author or prev.get("author") or "",
             }
         for v in obj.values():
             collect_books_from_json(v, out)
@@ -288,9 +295,52 @@ async def extract_dom_books(page):
 
 
 def _total_unique(dom_books, api_books):
-    ids = {b["id"] for b in dom_books if is_reader_book_id(b.get("id"))}
-    ids |= {bid for bid in api_books.keys() if is_reader_book_id(bid)}
+    """统计可用于停止判断的书籍量。
+
+    DOM 只计合法 reader id；API 计入全部 bookId（含纯数字短 id）。
+    shelf/syncBook 返回的多为数字 id，若只计 reader id 会把 API 增长当成 0，
+    滚动停得过早。
+    """
+    ids = {str(b["id"]) for b in (dom_books or []) if is_reader_book_id(b.get("id"))}
+    ids |= {str(bid) for bid in (api_books or {}).keys() if bid}
     return len(ids)
+
+
+def accumulate_dom_books(acc, snapshot):
+    """把本屏 DOM 快照并入累积表（按合法 reader id 去重，后写不覆盖已有非空字段）。"""
+    if acc is None:
+        acc = {}
+    for b in snapshot or []:
+        bid = str(b.get("id") or "").strip()
+        if not bid or not is_reader_book_id(bid):
+            continue
+        prev = acc.get(bid) or {}
+        title = (b.get("title") or "").strip() or (prev.get("title") or "")
+        author = (b.get("author") or "").strip() or (prev.get("author") or "")
+        acc[bid] = {"id": bid, "title": title, "author": author}
+    return acc
+
+
+SCROLL_SHELF_JS = r"""
+() => {
+    const step = Math.max(window.innerHeight * 1.2, 1000);
+    const beforeY = window.scrollY || 0;
+    const beforeH = document.documentElement.scrollHeight || 0;
+    window.scrollBy(0, step);
+    // 接近底部时直接沉底，触发最后一批懒加载
+    const maxY = Math.max(0, (document.documentElement.scrollHeight || 0) - window.innerHeight);
+    if ((window.scrollY || 0) >= maxY - 80) {
+        window.scrollTo(0, maxY + 1);
+    }
+    return {
+        beforeY,
+        afterY: window.scrollY || 0,
+        beforeH,
+        afterH: document.documentElement.scrollHeight || 0,
+        maxY,
+    };
+}
+"""
 
 
 def _author_from_api_payload(data, book_id):
@@ -406,12 +456,19 @@ async def fetch_shelf(
     *,
     headless=False,
     sleep_seconds=None,
-    max_no_new=3,
+    max_no_new=5,
     out_path=DEFAULT_OUT,
     enrich_author=True,
     author_interval=None,
+    max_scrolls=80,
 ):
-    """抓取书架书籍列表并写入 out_path，返回合并后的书籍列表。"""
+    """抓取书架书籍列表并写入 out_path，返回合并后的书籍列表。
+
+    书架按批懒加载（约每屏/每次 syncBook 100 本）。滚动过程中：
+    - 累积各屏 DOM 中的 reader id（防止虚拟列表只保留窗口内节点）
+    - 合计统计计入 API 全部 bookId（含数字短 id），避免误判「无增长」提前停
+    - 大步滚动 + 触底，连续 max_no_new 次无新书后结束
+    """
     if sleep_seconds is None:
         sleep_seconds = SLEEP_SHELF_SCROLL
     if author_interval is None:
@@ -451,28 +508,35 @@ async def fetch_shelf(
         await page.goto(SHELF_URL, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(SLEEP_SHELF_AFTER_LOAD)
 
-        dom_books = await extract_dom_books(page)
-        prev = _total_unique(dom_books, api_books)
-        print(f"  首屏: DOM {len(dom_books)} 本 / API {len(api_books)} 本 / 合计 {prev}")
+        dom_acc = {}
+        snapshot = await extract_dom_books(page)
+        accumulate_dom_books(dom_acc, snapshot)
+        prev = _total_unique(list(dom_acc.values()), api_books)
+        print(f"  首屏: DOM累计 {len(dom_acc)} 本（本屏 {len(snapshot)}） / "
+              f"API {len(api_books)} 本 / 合计 {prev}")
 
         no_new = 0
         scroll = 0
-        while no_new < max_no_new:
+        while no_new < max_no_new and scroll < max_scrolls:
             scroll += 1
-            # 慢滚动：模拟鼠标滚轮 + 滚动窗口，触发懒加载
+            # 慢滚动：滚轮 + 大步 window.scroll，接近底部时沉底以触发下一批 syncBook
             await page.mouse.move(600, 400)
-            await page.mouse.wheel(0, 900)
-            await page.evaluate("() => window.scrollBy(0, window.innerHeight)")
+            await page.mouse.wheel(0, 1600)
+            await page.evaluate(SCROLL_SHELF_JS)
             await asyncio.sleep(sleep_seconds)
-            dom_books = await extract_dom_books(page)
-            cur = _total_unique(dom_books, api_books)
+            snapshot = await extract_dom_books(page)
+            accumulate_dom_books(dom_acc, snapshot)
+            cur = _total_unique(list(dom_acc.values()), api_books)
             grew = cur - prev
-            print(f"  滚动 #{scroll}: DOM {len(dom_books)} / API {len(api_books)} / "
-                  f"合计 {cur}（+{grew}）")
+            print(f"  滚动 #{scroll}: DOM累计 {len(dom_acc)}（本屏 {len(snapshot)}） / "
+                  f"API {len(api_books)} / 合计 {cur}（+{grew}）")
             no_new = 0 if grew > 0 else no_new + 1
             prev = cur
 
-        merged = merge_books(dom_books, api_books)
+        if scroll >= max_scrolls and no_new < max_no_new:
+            print(f"  ⚠️  已达最大滚动次数 {max_scrolls}，提前结束懒加载")
+
+        merged = merge_books(list(dom_acc.values()), api_books)
         apply_existing_authors(merged, load_existing_authors(out_path))
         write_shelf_books(out_path, merged)
         with_author = sum(1 for b in merged if b["author"])
@@ -539,8 +603,10 @@ def main():
         "--sleep", type=float, default=None,
         help=f"每次滚动后暂停秒数（默认 .env SLEEP_SHELF_SCROLL={SLEEP_SHELF_SCROLL})",
     )
-    parser.add_argument("--max-no-new", type=int, default=3,
-                        help="连续无新书停止阈值（默认 3）")
+    parser.add_argument("--max-no-new", type=int, default=5,
+                        help="连续无新书停止阈值（默认 5；书架按批懒加载，过小会提前停）")
+    parser.add_argument("--max-scrolls", type=int, default=80,
+                        help="懒加载最大滚动次数（默认 80，防止死循环）")
     parser.add_argument("--out", default=DEFAULT_OUT, help="输出 txt 路径（一行一条：ID,书名,作者）")
     parser.add_argument(
         "--no-enrich-author", action="store_true",
@@ -575,6 +641,7 @@ def main():
             out_path=args.out,
             enrich_author=not args.no_enrich_author,
             author_interval=author_interval,
+            max_scrolls=args.max_scrolls,
         ))
 
 

@@ -9,7 +9,7 @@
 - **单页/双页布局**：web 阅读器视口较宽时并排两个 canvas（双页）；导出默认自动匹配本机屏幕（`READER_VIEWPORT_WIDTH/HEIGHT=0`）贴近手动全宽浏览器，并按 canvas 位置拆页。需要旧版窄视口时，用 `READER_FORCE_SINGLE_PAGE=1` 或 CLI `--force-single-page`；强制失败会恢复宽视口。
 - **左右翻页 vs 上下滚动**：微信读书桌面端可在「双栏/普通阅读」与「上下滚动阅读」间切换。上下滚动时长文档 scrollHeight 远大于视口，目录跳转易落到视口外锚点，ArrowRight 会在两页间空转且 fillText 不随 scroll 重绘。`export_precise.ensure_horizontal_paging_mode` 在会话开始检测到滚动模式时会自动点切换按钮切回左右翻页；已是左右模式时不点击，避免误切回滚动。
 - **book_id**：书籍唯一标识，出现在 reader URL 末段、书架链接 href、书架接口响应中。可用 reader id 为字母数字长串（常见 23–24 位）；shelf API 偶发的纯数字短 id（如 `3300215708`）不能打开阅读器，抓取时应丢弃。
-- **shelf API**：书架页加载时浏览器请求的接口，返回书籍列表 JSON（含 bookId / title / author / cover）。页面禁用 F12 开发者模式，但 Playwright 通过 CDP 的 `page.evaluate` / `page.on("response")` 不受影响——是作者字段的可靠来源。
+- **shelf API**：书架页懒加载时请求 `https://weread.qq.com/web/shelf/syncBook`（POST，约每批 100 本），JSON 含 bookId / title / author / cover。其中 bookId 多为纯数字短 id，不能直接打开 `/web/reader`；页面链接里的字母数字 reader id 才是导出用 id。抓取须滚动加载完全部批次，并跨屏累积 DOM。页面禁用 F12 不影响 Playwright CDP 拦截。
 - **作者补全（author enrich）**：公版书等字母数字 book_id 在 shelf API/列表 DOM 常无 author；列表合并后对空 author 逐本打开 reader 详情补全，已有作者跳过，相邻间隔由 `SLEEP_BOOK_DETAIL_INTERVAL` 控制。
 - **网页操作 sleep（.env）**：所有点击/跳转等待经 `env_config.py` 从 `.env` 读取，清单见 `AGENTS.md`。
 - **页面禁用开发者模式**：weread 网页对**手动 F12** 做了反调试（debugger / 检测 devtools）；不影响 Playwright 的 CDP 级注入与网络监听。

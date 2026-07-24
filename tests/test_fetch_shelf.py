@@ -1,6 +1,7 @@
 import unittest
 
 from fetch_shelf import (
+    accumulate_dom_books,
     apply_existing_authors,
     books_missing_author,
     collect_books_from_json,
@@ -10,6 +11,7 @@ from fetch_shelf import (
     merge_books,
     sanitize_csv_field,
     write_shelf_books,
+    _total_unique,
 )
 
 
@@ -69,6 +71,50 @@ class TestCollectBooksFromJson(unittest.TestCase):
         self.assertEqual(collect_books_from_json(None), {})
         self.assertEqual(collect_books_from_json([]), {})
 
+
+
+    def test_does_not_clobber_title_with_empty_progress_entry(self):
+        out = {}
+        collect_books_from_json(
+            {"bookId": "3300154203", "title": "古诗", "author": "张三"}, out)
+        collect_books_from_json(
+            {"bookId": "3300154203", "readUpdateTime": 1}, out)
+        self.assertEqual(out["3300154203"], {"title": "古诗", "author": "张三"})
+
+    def test_fills_missing_fields_on_later_full_entry(self):
+        out = {}
+        collect_books_from_json({"bookId": "1", "readUpdateTime": 1}, out)
+        collect_books_from_json(
+            {"bookId": "1", "title": "书", "author": "甲"}, out)
+        self.assertEqual(out["1"], {"title": "书", "author": "甲"})
+
+
+class TestAccumulateDomBooks(unittest.TestCase):
+    def test_accumulates_unique_reader_ids(self):
+        bid1 = "6b632d60813abb28bg015b4f"
+        bid2 = "4f3328d0813abbac2g0186d4"
+        acc = accumulate_dom_books({}, [{"id": bid1, "title": "A", "author": ""}])
+        acc = accumulate_dom_books(acc, [
+            {"id": bid1, "title": "A", "author": "甲"},
+            {"id": bid2, "title": "B", "author": ""},
+            {"id": "3300215708", "title": "数字id应丢弃", "author": ""},
+        ])
+        self.assertEqual(set(acc), {bid1, bid2})
+        self.assertEqual(acc[bid1]["author"], "甲")
+        self.assertEqual(acc[bid2]["title"], "B")
+
+
+class TestTotalUnique(unittest.TestCase):
+    def test_counts_numeric_api_ids(self):
+        bid = "6b632d60813abb28bg015b4f"
+        dom = [{"id": bid, "title": "A", "author": ""}]
+        api = {"3300215708": {"title": "B", "author": "乙"}, bid: {"title": "A", "author": "甲"}}
+        # DOM 1 + API 数字 id 1 + 与 DOM 重复的 reader id 不双计 = 2
+        self.assertEqual(_total_unique(dom, api), 2)
+
+    def test_api_only_numeric_counts(self):
+        api = {"1": {"title": "A", "author": ""}, "2": {"title": "B", "author": ""}}
+        self.assertEqual(_total_unique([], api), 2)
 
 class TestIsReaderBookId(unittest.TestCase):
     def test_accepts_long_alphanumeric_ids(self):

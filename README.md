@@ -90,7 +90,7 @@ python fetch_shelf.py
 python fetch_shelf.py --headless
 
 # 调整滚动节奏（默认见 .env SLEEP_SHELF_SCROLL，连续 3 次无新书停止）
-python fetch_shelf.py --sleep 5 --max-no-new 4
+python fetch_shelf.py --sleep 5 --max-no-new 6
 
 # 跳过「作者为空时打开详情补全」
 python fetch_shelf.py --no-enrich-author
@@ -99,7 +99,8 @@ python fetch_shelf.py --no-enrich-author
 python fetch_shelf.py --author-interval 8
 ```
 
-- 慢滚动触发懒加载，逐屏抓取书架上所有书籍
+- 慢滚动触发懒加载（`/web/shelf/syncBook` 约每批 100 本），跨屏**累积** DOM reader id，避免只抓到首批
+- 默认 `--max-no-new 5`；书特别多时可加大 `--max-scrolls`
 - 每本书提取 `id`、`title`、`author`，存为 `data/shelf_books.txt`（一行一条，逗号分隔：ID,书名,作者；书名/作者中的逗号替换为空格）
 - 书架页禁用 F12 不影响抓取：`id`/`title` 取自页面 DOM，`author` 优先取自拦截的书架接口；**仍为空时再打开阅读器详情补全**（已有作者的书不打开；相邻两本默认间隔 5s）
 - 参数：`--headless`、`--sleep` 滚动间隔、`--max-no-new`、`--out`、`--no-enrich-author`、`--author-interval`
