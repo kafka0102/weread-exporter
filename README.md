@@ -8,7 +8,7 @@
 
 1. **Playwright 自动化** — 启动 Chromium，持久化登录会话（扫码一次，后续自动复用）
 2. **Canvas fillText Hook** — 注入钩子拦截所有 `CanvasRenderingContext2D.fillText()` 调用，捕获每个字符的 (x, y) 坐标
-3. **全宽桌面排版优先** — 阅读器默认自动匹配本机屏幕宽度（`READER_VIEWPORT_WIDTH=0`）打开，尽量贴近手动浏览器；如需旧版单页策略，可开启 `READER_FORCE_SINGLE_PAGE=1` 或使用 `--force-single-page`（失败会自动恢复宽视口）
+3. **全宽桌面排版优先** — 阅读器默认自动匹配最大单屏宽度（`READER_VIEWPORT_WIDTH=0`，再受 `READER_VIEWPORT_MAX_*=1600x1000` 限制）打开；多显示器会优先外接大屏；如需旧版单页策略，可开启 `READER_FORCE_SINGLE_PAGE=1` 或使用 `--force-single-page`（失败会自动恢复宽视口）
 4. **Canvas 按页归组** — `fillText` 坐标是 canvas 局部坐标；若仍出现多 canvas，按屏幕 left 拆页后再分行，防止左右页同 y 交错乱码
 5. **视口图片捕获** — 每页只取当前视口内可见的 `img[class*="wr_readerImage"]`（用 `getBoundingClientRect` 过滤掉预加载的下一页/下一章图片），解决图片归属偏移
 6. **图文交错** — 把文字行和图片按屏幕 y 坐标排序，图片精确落在对应段落之间、正确章节里
@@ -37,7 +37,7 @@ python export_precise.py d31323b0813abaf26g0137c2
 # 单本强制重导（默认若 ~/data/weixin/books 已有同 id 的 json 则跳过）
 python export_precise.py d31323b0813abaf26g0137c2 --force
 
-# 临时调整阅读器视口；默认 0=自动匹配本机屏幕（.env READER_VIEWPORT_WIDTH/HEIGHT）
+# 临时调整阅读器视口；默认 0=自动匹配最大单屏（.env READER_VIEWPORT_WIDTH/HEIGHT，受 MAX 上限）
 python export_precise.py d31323b0813abaf26g0137c2 --reader-width 0 --reader-height 0
 python export_precise.py d31323b0813abaf26g0137c2 --reader-width 1470 --reader-height 900
 
@@ -61,7 +61,7 @@ python export_precise.py d31323b0813abaf26g0137c2 --headless
 
 - 首次运行会弹出浏览器要求扫码登录，会话自动保存在 `cache/browser_profile/`，后续复用
 - `--headless`：cache 有登录痕迹才启用无头；无头下若出现登录页会报错并立即终止（需去掉 `--headless` 重新扫码）
-- 阅读器默认自动匹配本机屏幕宽度，检测到双页时按 canvas 拆页抓取；`--force-single-page` / `--no-force-single-page` 可临时覆盖 `.env` 的 `READER_FORCE_SINGLE_PAGE`（强制失败会恢复宽视口）
+- 阅读器默认自动匹配最大单屏宽度（可 `READER_VIEWPORT_MAX_*` 限制），检测到双页时按 canvas 拆页抓取；`--force-single-page` / `--no-force-single-page` 可临时覆盖 `.env` 的 `READER_FORCE_SINGLE_PAGE`（强制失败会恢复宽视口）
 - 自动跳到全书开头（原生点击目录首项），逐页翻到全书末尾自动停止
 - **自动续传**：中途卡住会重开浏览器，从上次章节继续；中间产物在 `output/<book_id>/`
 - **全书成功后**才写入 `~/data/weixin/books/<book_id>_<书名>.json`（字段对齐 dedao/json：纯文本 content、`has_content`、空元数据键；可用 `BOOKS_DIR` / `--out-dir` 覆盖）

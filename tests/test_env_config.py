@@ -102,6 +102,42 @@ class TestEnvConfig(unittest.TestCase):
         self.assertGreaterEqual(mixed["width"], 800)
         self.assertEqual(mixed["height"], 800)
 
+    def test_parse_ns_screens_and_preferred(self):
+        raw = (
+            "0,0,1024x666|vis:0,26,1024x583;"
+            "-578,-1080,1920x1080|vis:-578,-1080,1920x1080"
+        )
+        screens = env_config._parse_ns_screens(raw)
+        self.assertEqual(len(screens), 2)
+        best = max(screens, key=lambda s: s["width"] * s["height"])
+        self.assertEqual((best["width"], best["height"]), (1920, 1080))
+        self.assertEqual(best["left"], -578)
+        self.assertEqual(best["top"], -1080)
+
+    def test_resolve_reader_viewport_applies_max_only_for_auto(self):
+        auto = env_config.resolve_reader_viewport(0, 0)
+        if env_config.READER_VIEWPORT_MAX_WIDTH > 0:
+            self.assertLessEqual(auto["width"], env_config.READER_VIEWPORT_MAX_WIDTH)
+        if env_config.READER_VIEWPORT_MAX_HEIGHT > 0:
+            self.assertLessEqual(auto["height"], env_config.READER_VIEWPORT_MAX_HEIGHT)
+        fixed = env_config.resolve_reader_viewport(1800, 1200)
+        self.assertEqual(fixed, {"width": 1800, "height": 1200})
+
+    def test_preferred_window_bounds_on_largest_screen(self):
+        bounds = env_config.preferred_window_bounds(1600, 1000)
+        self.assertGreaterEqual(bounds["width"], 800)
+        self.assertGreaterEqual(bounds["height"], 500)
+        screens = env_config.detect_host_screens()
+        if len(screens) >= 2:
+            best = max(screens, key=lambda s: s["width"] * s["height"])
+            # 窗口应落在最大屏的可视矩形附近（允许居中偏移）
+            self.assertGreaterEqual(bounds["left"], best["left"] - 8)
+            self.assertLess(bounds["left"], best["left"] + best["width"])
+            self.assertGreaterEqual(bounds["top"], best["top"] - 8)
+            self.assertLess(bounds["top"], best["top"] + best["height"])
+
+
+
 
 if __name__ == "__main__":
     unittest.main()

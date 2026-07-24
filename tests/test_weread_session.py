@@ -142,7 +142,7 @@ class TestEnsureBrowserWindowSize(unittest.IsolatedAsyncioTestCase):
 
     async def test_resizes_short_window_and_maximizes_if_needed(self):
         page = MagicMock()
-        # 1) initial short  2) after set bounds still short  3) final after maximize
+        # 1) initial short  2) after first set still short  3) final after re-place+maximize
         page.evaluate = AsyncMock(
             side_effect=[
                 {"width": 1024, "height": 496},
@@ -154,7 +154,8 @@ class TestEnsureBrowserWindowSize(unittest.IsolatedAsyncioTestCase):
         client.send = AsyncMock(
             side_effect=[
                 {"windowId": 7},
-                None,  # set normal bounds
+                None,  # set normal bounds (+ position)
+                None,  # re-place before maximize
                 None,  # maximize
             ]
         )
@@ -164,7 +165,7 @@ class TestEnsureBrowserWindowSize(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch("weread_session.asyncio.sleep", new=AsyncMock()) as sleep:
             out = await weread_session.ensure_browser_window_size(
-                page, {"width": 1920, "height": 1746}
+                page, {"width": 1600, "height": 1000}
             )
 
         self.assertEqual(out, {"width": 1800, "height": 1100})
@@ -172,13 +173,15 @@ class TestEnsureBrowserWindowSize(unittest.IsolatedAsyncioTestCase):
         calls = [c.args[0] for c in client.send.await_args_list]
         self.assertEqual(calls[0], "Browser.getWindowForTarget")
         self.assertEqual(calls[1], "Browser.setWindowBounds")
-        self.assertEqual(calls[2], "Browser.setWindowBounds")
+        self.assertEqual(calls[-1], "Browser.setWindowBounds")
         bounds1 = client.send.await_args_list[1].args[1]["bounds"]
         self.assertEqual(bounds1["windowState"], "normal")
-        self.assertGreaterEqual(bounds1["width"], 1920)
-        self.assertGreaterEqual(bounds1["height"], 1746)
-        bounds2 = client.send.await_args_list[2].args[1]["bounds"]
-        self.assertEqual(bounds2["windowState"], "maximized")
+        self.assertIn("left", bounds1)
+        self.assertIn("top", bounds1)
+        self.assertGreaterEqual(bounds1["width"], 800)
+        self.assertGreaterEqual(bounds1["height"], 500)
+        bounds_last = client.send.await_args_list[-1].args[1]["bounds"]
+        self.assertEqual(bounds_last["windowState"], "maximized")
         client.detach.assert_awaited()
 
     async def test_set_bounds_only_when_target_reached(self):

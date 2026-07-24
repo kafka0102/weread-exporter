@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -86,7 +87,8 @@ load_dotenv()
 DEFAULT_BOOKS_DIR_RAW = "~/data/weixin/books"
 BOOKS_DIR = env_path("BOOKS_DIR", DEFAULT_BOOKS_DIR_RAW)
 
-# 阅读器视口：0 表示自动匹配本机主屏可用逻辑像素，尽量贴近手动全宽浏览器。
+# 阅读器视口：0 表示自动匹配本机「最大单块屏幕」可用逻辑像素。
+# 多显示器时不会使用虚拟桌面并集（避免窗口又高又怪、落在笔记本小屏上）。
 # 若需要旧版单页策略，可开启 READER_FORCE_SINGLE_PAGE。
 # 宽/高任一为 0 时，在 resolve_reader_viewport() 中用 detect_host_screen_size() 补齐。
 READER_VIEWPORT_WIDTH = env_int("READER_VIEWPORT_WIDTH", 0)
@@ -97,73 +99,284 @@ READER_FORCE_SINGLE_PAGE = env_bool("READER_FORCE_SINGLE_PAGE", False)
 _FALLBACK_SCREEN_WIDTH = 1200
 _FALLBACK_SCREEN_HEIGHT = 900
 
+# 外接大屏时默认视口上限：足够导出稳定，又不会整屏铺满外接显示器。
+# 0=不限制（用满最大单屏）。可用 CLI --reader-width/--reader-height 覆盖。
+READER_VIEWPORT_MAX_WIDTH = env_int("READER_VIEWPORT_MAX_WIDTH", 1600)
+READER_VIEWPORT_MAX_HEIGHT = env_int("READER_VIEWPORT_MAX_HEIGHT", 1000)
 
-def detect_host_screen_size() -> tuple[int, int]:
-    """探测本机主屏可用逻辑像素 (width, height)。
 
-    macOS 优先用 Finder desktop bounds（CSS/逻辑像素，非 Retina 物理像素）。
-    失败时回退 1200x900。
+def _screen_dict(
+    *,
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+    visible_left: int | None = None,
+    visible_top: int | None = None,
+    visible_width: int | None = None,
+    visible_height: int | None = None,
+) -> dict[str, int]:
+    """规范化单块屏幕几何（逻辑像素，原点在主屏左上，y 向下）。"""
+    w = max(0, int(width))
+    h = max(0, int(height))
+    vw = max(0, int(visible_width if visible_width is not None else w))
+    vh = max(0, int(visible_height if visible_height is not None else h))
+    return {
+        "left": int(left),
+        "top": int(top),
+        "width": w,
+        "height": h,
+        "visible_left": int(visible_left if visible_left is not None else left),
+        "visible_top": int(visible_top if visible_top is not None else top),
+        "visible_width": vw if vw >= 800 else w,
+        "visible_height": vh if vh >= 500 else h,
+    }
+
+
+def _parse_ns_screens(raw: str) -> list[dict[str, int]]:
+    """解析 NSScreen 探测脚本输出。
+
+    格式：left,top,widthxheight|vis:vleft,vtop,vwidthxvheight;...
+    坐标已是主屏左上原点、y 向下的 CSS/逻辑像素。
     """
-    # macOS: "0, 0, 1470, 956"
+    screens: list[dict[str, int]] = []
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(
+            r"(-?\d+),(-?\d+),(\d+)x(\d+)\|vis:(-?\d+),(-?\d+),(\d+)x(\d+)$",
+            part,
+        )
+        if not m:
+            continue
+        screens.append(
+            _screen_dict(
+                left=int(m.group(1)),
+                top=int(m.group(2)),
+                width=int(m.group(3)),
+                height=int(m.group(4)),
+                visible_left=int(m.group(5)),
+                visible_top=int(m.group(6)),
+                visible_width=int(m.group(7)),
+                visible_height=int(m.group(8)),
+            )
+        )
+    return screens
+
+
+_NS_SCREEN_SCRIPT = """
+use framework "AppKit"
+use scripting additions
+set arr to current application's NSScreen's screens()
+if (count of arr) is 0 then return ""
+set mainH to 0
+try
+  set mf to current application's NSScreen's mainScreen()'s frame()
+  set mainH to ((item 2 of (item 2 of mf)) as number)
+end try
+set out to {}
+repeat with s in arr
+  set f to s's frame()
+  set o to item 1 of f
+  set sz to item 2 of f
+  set ox to (item 1 of o) as number
+  set oy to (item 2 of o) as number
+  set w to (item 1 of sz) as number
+  set h to (item 2 of sz) as number
+  set topY to mainH - (oy + h)
+  set vf to s's visibleFrame()
+  set vo to item 1 of vf
+  set vsz to item 2 of vf
+  set vox to (item 1 of vo) as number
+  set voy to (item 2 of vo) as number
+  set vw to (item 1 of vsz) as number
+  set vh to (item 2 of vsz) as number
+  set vTop to mainH - (voy + vh)
+  set entry to ((ox as integer as text) & "," & (topY as integer as text) & "," & (w as integer as text) & "x" & (h as integer as text) & "|vis:" & (vox as integer as text) & "," & (vTop as integer as text) & "," & (vw as integer as text) & "x" & (vh as integer as text))
+  set end of out to entry
+end repeat
+set AppleScript's text item delimiters to ";"
+return out as text
+"""
+
+
+_HOST_SCREENS_CACHE: tuple[float, list[dict[str, int]]] | None = None
+_HOST_SCREENS_TTL_SEC = 30.0
+
+
+def detect_host_screens(*, force_refresh: bool = False) -> list[dict[str, int]]:
+    """探测本机各块物理屏幕的逻辑像素几何。
+
+    macOS：NSScreen.screens（逐屏，含位置），避免 Finder desktop bounds
+    在多显示器下返回虚拟桌面并集（宽/高被夸大）。
+    失败时尽量退回单屏探测。结果短缓存，避免频繁 osascript。
+    """
+    global _HOST_SCREENS_CACHE
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and _HOST_SCREENS_CACHE is not None
+        and (now - _HOST_SCREENS_CACHE[0]) < _HOST_SCREENS_TTL_SEC
+    ):
+        return [dict(s) for s in _HOST_SCREENS_CACHE[1]]
+
+    screens: list[dict[str, int]] = []
     try:
         out = subprocess.check_output(
-            [
-                "osascript",
-                "-e",
-                'tell application "Finder" to get bounds of window of desktop',
-            ],
+            ["osascript", "-e", _NS_SCREEN_SCRIPT],
             text=True,
-            timeout=5,
+            timeout=8,
             stderr=subprocess.DEVNULL,
         ).strip()
-        nums = [int(x) for x in re.findall(r"-?\d+", out)]
-        if len(nums) >= 4:
-            w = nums[2] - nums[0]
-            h = nums[3] - nums[1]
-            if w >= 800 and h >= 600:
-                return w, h
+        parsed = _parse_ns_screens(out)
+        screens = [s for s in parsed if s["width"] >= 800 and s["height"] >= 500]
     except Exception:
-        pass
+        screens = []
 
-    # Linux: xdpyinfo
-    try:
-        out = subprocess.check_output(
-            ["xdpyinfo"],
-            text=True,
-            timeout=5,
-            stderr=subprocess.DEVNULL,
-        )
-        m = re.search(r"dimensions:\s*(\d+)x(\d+)", out)
-        if m:
-            w, h = int(m.group(1)), int(m.group(2))
-            if w >= 800 and h >= 600:
-                return w, h
-    except Exception:
-        pass
+    # macOS / 通用兜底：Finder desktop bounds 在单屏时可用；多屏是并集，仅作最后手段
+    if not screens:
+        try:
+            out = subprocess.check_output(
+                [
+                    "osascript",
+                    "-e",
+                    'tell application "Finder" to get bounds of window of desktop',
+                ],
+                text=True,
+                timeout=5,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            nums = [int(x) for x in re.findall(r"-?\d+", out)]
+            if len(nums) >= 4:
+                left, top, right, bottom = nums[0], nums[1], nums[2], nums[3]
+                w = right - left
+                h = bottom - top
+                if w >= 800 and h >= 600:
+                    screens = [_screen_dict(left=left, top=top, width=w, height=h)]
+        except Exception:
+            pass
 
+    # Linux: xdpyinfo（多为虚拟桌面尺寸；多屏场景精度有限）
+    if not screens:
+        try:
+            out = subprocess.check_output(
+                ["xdpyinfo"],
+                text=True,
+                timeout=5,
+                stderr=subprocess.DEVNULL,
+            )
+            m = re.search(r"dimensions:\s*(\d+)x(\d+)", out)
+            if m:
+                w, h = int(m.group(1)), int(m.group(2))
+                if w >= 800 and h >= 600:
+                    screens = [_screen_dict(left=0, top=0, width=w, height=h)]
+        except Exception:
+            pass
+
+    _HOST_SCREENS_CACHE = (now, [dict(s) for s in screens])
+    return [dict(s) for s in screens]
+
+
+def preferred_host_screen() -> dict[str, int] | None:
+    """返回面积最大的单块屏幕；无探测结果时 None。"""
+    screens = detect_host_screens()
+    if not screens:
+        return None
+    return max(
+        screens,
+        key=lambda s: (
+            int(s.get("visible_width") or s["width"])
+            * int(s.get("visible_height") or s["height"]),
+            int(s["width"]) * int(s["height"]),
+        ),
+    )
+
+
+def detect_host_screen_size() -> tuple[int, int]:
+    """探测本机用于阅读器的目标屏幕可用逻辑像素 (width, height)。
+
+    多显示器时取「面积最大的单块屏幕」可视区域，而不是虚拟桌面并集。
+    失败时回退 1200x900。
+    """
+    best = preferred_host_screen()
+    if best is not None:
+        w = int(best.get("visible_width") or best["width"])
+        h = int(best.get("visible_height") or best["height"])
+        if w >= 800 and h >= 500:
+            return w, h
     return _FALLBACK_SCREEN_WIDTH, _FALLBACK_SCREEN_HEIGHT
+
+
+def preferred_window_bounds(
+    width: int | None = None,
+    height: int | None = None,
+    *,
+    chrome_w: int = 16,
+    chrome_h: int = 96,
+) -> dict[str, int]:
+    """为浏览器窗口计算 outer bounds（尽量落在最大单屏可视区内）。
+
+    返回 left/top/width/height，可供 CDP Browser.setWindowBounds 使用。
+    """
+    vp = resolve_reader_viewport(width, height)
+    outer_w = max(360, int(vp["width"]) + int(chrome_w))
+    outer_h = max(480, int(vp["height"]) + int(chrome_h))
+    screen = preferred_host_screen()
+    if screen is None:
+        return {"left": 0, "top": 0, "width": outer_w, "height": outer_h}
+
+    area_w = int(screen.get("visible_width") or screen["width"])
+    area_h = int(screen.get("visible_height") or screen["height"])
+    area_left = int(screen.get("visible_left", screen["left"]))
+    area_top = int(screen.get("visible_top", screen["top"]))
+
+    # 留一点边，避免贴边/被刘海/Dock 裁切
+    margin = 8
+    max_w = max(800, area_w - margin * 2)
+    max_h = max(500, area_h - margin * 2)
+    outer_w = min(outer_w, max_w)
+    outer_h = min(outer_h, max_h)
+    left = area_left + max(0, (area_w - outer_w) // 2)
+    top = area_top + max(margin, (area_h - outer_h) // 2)
+    return {
+        "left": int(left),
+        "top": int(top),
+        "width": int(outer_w),
+        "height": int(outer_h),
+    }
 
 
 def resolve_reader_viewport(
     width: int | None = None,
     height: int | None = None,
 ) -> dict[str, int]:
-    """解析阅读器视口；宽/高为 0/None 时自动匹配本机屏幕。
+    """解析阅读器视口；宽/高为 0/None 时自动匹配最大单屏。
 
     显式传入正整数优先生效；模块配置 0 表示 auto。
+    auto 时会再按 READER_VIEWPORT_MAX_* 做上限裁剪（默认 1600x1000），
+    让外接大屏上的微信读书窗口够大但不至于整屏铺满。
     """
     w = READER_VIEWPORT_WIDTH if width is None else int(width)
     h = READER_VIEWPORT_HEIGHT if height is None else int(height)
-    if w <= 0 or h <= 0:
+    auto_w = w <= 0
+    auto_h = h <= 0
+    if auto_w or auto_h:
         sw, sh = detect_host_screen_size()
-        if w <= 0:
+        if auto_w:
             w = sw
-        if h <= 0:
+        if auto_h:
             h = sh
+    # 仅自动探测尺寸时应用上限；用户显式写死宽高时尊重原值
+    if auto_w and READER_VIEWPORT_MAX_WIDTH > 0:
+        w = min(int(w), int(READER_VIEWPORT_MAX_WIDTH))
+    if auto_h and READER_VIEWPORT_MAX_HEIGHT > 0:
+        h = min(int(h), int(READER_VIEWPORT_MAX_HEIGHT))
     return {
         "width": max(360, int(w)),
         "height": max(480, int(h)),
     }
+
 
 # --- 网页操作 sleep（秒）---
 # 命名约定：SLEEP_<场景>_<动作>
