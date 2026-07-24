@@ -413,16 +413,24 @@ async def ensure_reader_layout(page, viewport, *, force_single_page=False):
 CANVAS_HOOK = r"""
 (function() {
     window.__wr_chars = [];
+    window.__wr_canvas_seq = window.__wr_canvas_seq || 0;
     var origFill = CanvasRenderingContext2D.prototype.fillText;
     CanvasRenderingContext2D.prototype.fillText = function(text, x, y) {
         if (text && String(text).trim()) {
-            var cl = 0, ct = 0, s = null;
+            var cl = 0, ct = 0, s = null, cid = 0;
             try {
                 var canvas = this.canvas;
-                if (canvas && canvas.getBoundingClientRect) {
-                    var r = canvas.getBoundingClientRect();
-                    cl = Math.round(r.left);
-                    ct = Math.round(r.top);
+                if (canvas) {
+                    if (canvas.__wr_cid == null) {
+                        window.__wr_canvas_seq += 1;
+                        canvas.__wr_cid = window.__wr_canvas_seq;
+                    }
+                    cid = canvas.__wr_cid || 0;
+                    if (canvas.getBoundingClientRect) {
+                        var r = canvas.getBoundingClientRect();
+                        cl = Math.round(r.left);
+                        ct = Math.round(r.top);
+                    }
                 }
             } catch (e) {}
             try {
@@ -435,6 +443,7 @@ CANVAS_HOOK = r"""
                 y: Math.round(y * 10) / 10,
                 cl: cl,
                 ct: ct,
+                cid: cid,
                 s: s
             });
         }
@@ -516,7 +525,7 @@ def is_hard_runaway_chapter(n_lines: int, page_num: int) -> bool:
 # 本章内长行去重阈值：短行（标点/诗题）允许重复，长行重复多半是翻页空转
 CHAPTER_LINE_DEDUPE_MIN_LEN = 12
 # 同一章内重复命中已抓页指纹的次数，达到后视为翻页空转
-MAX_PAGE_CYCLE_HITS = 2
+MAX_PAGE_CYCLE_HITS = 3
 
 
 def chapter_text_line_set(blocks) -> set[str]:
@@ -983,13 +992,48 @@ def infer_title_for_blocks_before(next_title: str, catalog_titles, current_title
 
 
 def group_chars_by_canvas(chars):
-    """按 canvas 屏幕 left(cl) 把字符分到各页，从左到右返回。
+    """按 canvas 把字符分到各页，从左到右返回。
 
     fillText 的 x/y 是 canvas 局部坐标；双页时左右页 y 区间重叠，
     若不按 canvas 拆开再分行，会把左右页同一 y 的字交错拼成乱码。
+
+    优先用 hook 写入的 canvas 稳定 id(cid)；否则回退屏幕 left(cl)。
+    cid 能避免两页 cl 都读成 0/相近时被合成一桶。
     """
     if not chars:
         return []
+
+    # --- 优先 cid ---
+    by_cid: dict[int, list] = {}
+    no_cid = []
+    for c in chars:
+        cid = c.get("cid")
+        try:
+            cid_v = int(cid) if cid is not None else 0
+        except (TypeError, ValueError):
+            cid_v = 0
+        if cid_v > 0:
+            by_cid.setdefault(cid_v, []).append(c)
+        else:
+            no_cid.append(c)
+
+    if len(by_cid) >= 2:
+        def cid_left(cid_chars):
+            vals = []
+            for ch in cid_chars:
+                try:
+                    vals.append(float(ch.get("cl") or 0))
+                except (TypeError, ValueError):
+                    pass
+            return min(vals) if vals else 0.0
+
+        ordered = sorted(by_cid.items(), key=lambda kv: (cid_left(kv[1]), kv[0]))
+        pages = [lst for _, lst in ordered]
+        if no_cid:
+            pages[0].extend(no_cid)
+        return pages
+
+    # --- 回退 cl 聚类 ---
     buckets: dict[int | None, list] = {}
     for c in chars:
         cl = c.get("cl")
@@ -1014,7 +1058,6 @@ def group_chars_by_canvas(chars):
     pages = [buckets[k] for k in ordered_keys]
     if None in buckets:
         if pages:
-            # 无 cl 的旧数据：并入左页，避免丢字
             pages[0].extend(buckets[None])
         else:
             pages = [buckets[None]]
@@ -1263,6 +1306,59 @@ async def read_chapter_title(page, catalog_titles=None, *, fallback: str = "") -
     if fb:
         return fb
     return ""
+
+
+def reader_chapter_matches(header_title: str, target_title: str, catalog_titles=None) -> bool:
+    """顶栏章名是否已落到目标章（允许双页顶栏偶发显示紧邻下一章）。"""
+    if not target_title:
+        return False
+    target = resolve_chapter_title(target_title, catalog_titles or []) or normalize_catalog_title(target_title)
+    header = resolve_chapter_title(header_title, catalog_titles or []) or normalize_catalog_title(header_title)
+    if not target:
+        return False
+    if not header:
+        return False
+    if compact_title_key(header) == compact_title_key(target):
+        return True
+    # 双页时顶栏可能已是下一章
+    delta = catalog_index_delta(catalog_titles or [], target, header)
+    return delta is not None and delta == 1
+
+
+async def verify_reader_on_chapter(page, target_title: str, catalog_titles=None, *, retries: int = 4) -> bool:
+    """目录点击后确认阅读器是否落到目标章附近。"""
+    target = resolve_chapter_title(target_title, catalog_titles or []) or normalize_catalog_title(target_title)
+    if not target:
+        return False
+    tkey = compact_title_key(target)
+    for i in range(max(1, int(retries))):
+        await asyncio.sleep(max(0.2, float(SLEEP_READER_PAGE_RENDER)))
+        header = await read_chapter_title(page, catalog_titles)
+        if reader_chapter_matches(header, target, catalog_titles):
+            return True
+        try:
+            chars = await page.evaluate("() => (window.__wr_chars || []).slice(0, 500)")
+        except Exception:
+            chars = []
+        if chars:
+            sample = "".join(str(c.get("t") or "") for c in chars[:400])
+            if tkey and tkey in compact_title_key(sample):
+                return True
+            try:
+                rects = await page.evaluate(CANVAS_RECTS_JS)
+            except Exception:
+                rects = []
+            blocks = build_page_blocks(chars, [], rects, set())
+            for b in blocks[:16]:
+                if b.get("type") == "text" and is_chapter_start_text(b.get("text") or "", target):
+                    return True
+        if i + 1 < retries:
+            try:
+                await force_reader_repaint(page)
+                await wait_stable(page, 0, timeout=1.5)
+            except Exception:
+                pass
+    return False
 
 
 async def fetch_book_title(page):
@@ -1890,10 +1986,10 @@ async def click_catalog_list_item(page, target_title: str = "") -> str:
     return raw
 
 
-async def goto_catalog_chapter(page, target_title: str) -> str:
+async def goto_catalog_chapter(page, target_title: str, catalog_titles=None) -> str:
     """打开目录并点击目标章名；成功返回实际点到的清洗标题，失败返回空串。
 
-    用于键盘翻页失效/同页空转时，强制跳到目录中的下一章，打破死循环。
+    点击后必须校验顶栏/正文已落到目标章，避免“点了但还在上一章”。
     失败时务必关闭目录，避免侧栏常开挡住翻页。
     """
     target = normalize_catalog_title(target_title)
@@ -1930,10 +2026,33 @@ async def goto_catalog_chapter(page, target_title: str) -> str:
                     await dismiss_reader_search(page)
                     await close_reader_catalog(page)
                     await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
-                    for _ in range(3):
+                    for _ in range(4):
                         if not await is_reader_catalog_open(page):
                             break
                         await close_reader_catalog(page)
+                        await asyncio.sleep(0.12)
+                    # 点击成功 ≠ 真正跳转成功：必须校验顶栏/正文
+                    try:
+                        await page.evaluate("() => window.__wr_reset && window.__wr_reset()")
+                    except Exception:
+                        pass
+                    await force_reader_repaint(page)
+                    await recover_reader_text_after_nav(page, allow_nudge=False)
+                    landed = await verify_reader_on_chapter(
+                        page, target, catalog_titles, retries=3
+                    )
+                    if not landed:
+                        header = await read_chapter_title(page, catalog_titles)
+                        print(
+                            f"    … 目录点击后未落到「{target[:20]}」"
+                            f"（顶栏「{(header or '空')[:20]}」），关闭目录后重试点击"
+                        )
+                        # 不立刻滚走：同一项再点一轮（Vue 偶发丢点击）
+                        await close_reader_catalog(page)
+                        await asyncio.sleep(0.2)
+                        if not await open_reader_catalog(page):
+                            continue
+                        continue
                     return hit or target
 
             moved = await page.evaluate(
@@ -2039,7 +2158,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         f"（接在「{(anchor or '')[:24]}」后；"
                         f"顶栏曾是「{(current_chapter or '')[:20]}」）"
                     )
-                    jumped = await goto_catalog_chapter(page, nxt)
+                    jumped = await goto_catalog_chapter(page, nxt, catalog_titles)
                     for _ in range(3):
                         await close_reader_catalog(page)
                         if not await is_reader_catalog_open(page):
@@ -2204,7 +2323,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 f"    … 目录重定位「{target[:24]}」"
                 f"（{reason}；{catalog_jump_count}/{MAX_CATALOG_JUMPS}）"
             )
-            jumped = await goto_catalog_chapter(page, target)
+            jumped = await goto_catalog_chapter(page, target, catalog_titles)
             for _ in range(3):
                 await close_reader_catalog(page)
                 if not await is_reader_catalog_open(page):
@@ -2215,6 +2334,9 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if not jumped:
                 catalog_jump_failures += 1
                 return ""
+            # goto 已校验落地；再关一次目录，防止侧栏残留
+            if await is_reader_catalog_open(page):
+                await close_reader_catalog(page)
             page_num = 0
             stale = 0
             turn_method_idx = 0
@@ -2226,9 +2348,14 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             return resolve_chapter_title(jumped, catalog_titles) or target
 
         async def break_page_cycle_or_lag() -> bool:
-            """翻页空转/顶栏错位时：落盘当前章并跳下一章，或重定位当前章。
+            """翻页空转/顶栏错位时的有限纠偏。
 
-            返回 True 表示已处理并应 continue 主循环。
+            原则：
+            - 绝不在定位未核验时把脏缓冲当成下一章落盘并跳章
+            - 顶栏落后：最多重定位当前逻辑章 1 次
+            - 仍空转：请求会话重开续传（保留未完成章缓冲到 reopen 路径处理）
+
+            返回 True 表示已处理并应 continue/break 主循环。
             """
             nonlocal current_chapter, ch_idx, page_num, stale, reached_end
             nonlocal page_cycle_hits, header_lag_resync_used, request_reopen
@@ -2239,72 +2366,59 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             cyc = page_cycle_hits >= MAX_PAGE_CYCLE_HITS
             lag = (
                 delta is not None and delta < 0
-                and page_num >= 4
+                and page_num >= 3
                 and header_lag_resync_used < 1
             )
 
-            # 顶栏停在上一章：优先重跳逻辑章一次（续传点目录失败的常见表现）
+            # 顶栏停在更早章节：目录重跳「当前逻辑章」一次
             if lag and current_chapter:
                 header_lag_resync_used += 1
+                print(
+                    f"    … 顶栏「{(header_now or '')[:16]}」落后逻辑"
+                    f"「{(current_chapter or '')[:16]}」，尝试目录重定位"
+                )
                 landed = await jump_catalog_and_reanchor(
-                    current_chapter, reason="顶栏落后重定位"
+                    current_chapter,
+                    reason="顶栏落后重定位",
+                    clear_buffer=True,
                 )
                 if landed:
                     current_chapter = landed
+                    page_cycle_hits = 0
                     await capture_current_page()
                     while await split_if_next_chapter_started():
                         if reached_end:
                             break
                     return True
+                # 跳不过去：重开，避免带着错误页继续灌
+                print("    … 重定位失败，结束会话重开续传")
+                request_reopen = True
+                return True
 
             if not cyc and page_cycle_hits < 1:
                 return False
 
-            # 页指纹循环：本章已抓过的 spread 再次出现 → 落盘并进下一章
-            if not current_chapter:
-                return False
-            if is_last_catalog_chapter(current_chapter, catalog_titles):
-                await commit_chapter(
-                    current_chapter, ch_blocks, note_suffix=" [翻页空转·末章]",
-                    allow_empty=True,
-                )
-                reached_end = True
-                return True
-
-            nxt = next_catalog_title(catalog_titles, current_chapter)
+            # 页指纹循环：只说明键盘/点击没把页面推到新内容。
+            # 若顶栏已是下一章，交给 should_follow_header；否则重开，不跳章吞内容。
             n_lines_now = chapter_text_line_count(ch_blocks)
             print(
                 f"    … 检测到翻页空转 cycle={page_cycle_hits} "
                 f"p={page_num} lines={n_lines_now} "
                 f"「{(current_chapter or '')[:20]}」"
+                f"/顶栏「{(header_now or '')[:16]}」→ 重开续传（不跳章）"
             )
-            if ch_blocks:
+            # 半成品尽量落盘，便于续传锚点前进；但绝不目录硬跳下一章
+            if ch_blocks and not is_hard_runaway_chapter(n_lines_now, page_num):
                 n, _imgs, saved = await commit_chapter(
-                    current_chapter, ch_blocks, note_suffix=" [翻页空转切章]"
+                    current_chapter, ch_blocks, note_suffix=" [会话中断·空转]"
                 )
                 if saved:
                     ch_idx += 1
-                    await sleep_between_chapters(n)
             adopt_chapter_blocks([])
-            if not nxt:
+            if is_last_catalog_chapter(current_chapter, catalog_titles):
                 reached_end = True
-                return True
-            if catalog_jump_count >= MAX_CATALOG_JUMPS:
+            else:
                 request_reopen = True
-                return True
-            landed = await jump_catalog_and_reanchor(
-                nxt, reason="翻页空转进下一章"
-            )
-            if landed:
-                current_chapter = landed
-                page_cycle_hits = 0
-                await capture_current_page()
-                while await split_if_next_chapter_started():
-                    if reached_end:
-                        break
-                return True
-            # 跳转失败：交给外层重开
-            request_reopen = True
             return True
 
         async def commit_chapter(title, blocks, *, note_suffix="", allow_empty=False):

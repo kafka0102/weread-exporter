@@ -302,6 +302,39 @@ class TestDualCanvasSplit(unittest.TestCase):
         self.assertEqual(left, "左页")
         self.assertEqual(right, "右页")
 
+
+    def test_group_chars_by_canvas_id_orders_left_to_right(self):
+        # cl 都是 0 时旧逻辑会交错；cid 应仍能左右拆开
+        chars = []
+        for i, ch in enumerate("左页字"):
+            chars.append({"t": ch, "x": 10 + i * 18, "y": 100, "cl": 0, "cid": 2})
+        for i, ch in enumerate("右页字"):
+            chars.append({"t": ch, "x": 10 + i * 18, "y": 100, "cl": 0, "cid": 1})
+        # cid=1 若 cl 同为 0，按 cid 次序不稳定；给 cid1 更大 cl 模拟右页
+        for c in chars:
+            if c["cid"] == 1:
+                c["cl"] = 600
+            else:
+                c["cl"] = 100
+        pages = export_precise.group_chars_by_canvas(chars)
+        self.assertEqual(len(pages), 2)
+        left = "".join(c["t"] for c in sorted(pages[0], key=lambda c: c["x"]))
+        right = "".join(c["t"] for c in sorted(pages[1], key=lambda c: c["x"]))
+        self.assertEqual(left, "左页字")
+        self.assertEqual(right, "右页字")
+
+    def test_reader_chapter_matches_allows_next_header(self):
+        catalog = ["秦王破阵", "玄武喋血", "致治贞观"]
+        self.assertTrue(
+            export_precise.reader_chapter_matches("玄武喋血", "玄武喋血", catalog)
+        )
+        self.assertTrue(
+            export_precise.reader_chapter_matches("致治贞观", "玄武喋血", catalog)
+        )
+        self.assertFalse(
+            export_precise.reader_chapter_matches("秦王破阵", "玄武喋血", catalog)
+        )
+
     def test_build_page_blocks_does_not_interleave_spread(self):
         # 模拟：左页正文「至异…」，右页正文「萧史…」同一 y
         left_text = "至异"
