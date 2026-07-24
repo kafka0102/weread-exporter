@@ -52,11 +52,11 @@
 
 | 变量 | 默认 | 使用位置 | 含义 |
 |------|------|----------|------|
-| `READER_VIEWPORT_WIDTH` | **1200** | `export_precise.py` | 阅读器视口宽；默认贴近桌面浏览器排版 |
-| `READER_VIEWPORT_HEIGHT` | 900 | `export_precise.py` | 阅读器视口高 |
+| `READER_VIEWPORT_WIDTH` | **0（自动）** | `export_precise.py` | 阅读器视口宽；`0`=匹配本机主屏宽度 |
+| `READER_VIEWPORT_HEIGHT` | **0（自动）** | `export_precise.py` | 阅读器视口高；`0`=匹配本机主屏高度 |
 | `READER_FORCE_SINGLE_PAGE` | 0 | `export_precise.py` | 检测到双页时是否自动收窄视口强制单页 |
 
-默认保持桌面宽度；若检测到 ≥2 个正文 canvas，按 canvas 位置拆页抓取。只有 `READER_FORCE_SINGLE_PAGE=1` 或 CLI `--force-single-page` 时，才会逐步把宽度收到 720/640/560/480 并刷新，尽量落到单页。
+默认自动匹配本机主屏可用逻辑像素（macOS 用 Finder desktop bounds），让有头窗口尽量和电脑宽度一致。也可写死正整数（如 `1440`）或 CLI `--reader-width` / `--reader-height` 覆盖。若检测到 ≥2 个正文 canvas，按 canvas 位置拆页抓取。只有 `READER_FORCE_SINGLE_PAGE=1` 或 CLI `--force-single-page` 时，才会逐步把宽度收到 720/640/560/480 并刷新；**若仍为双页，必须恢复原始宽视口**，避免窄 CSS 视口留在宽窗口中造成「左侧一条、右侧大片空白」。
 
 ### 实现入口
 

@@ -78,12 +78,29 @@ class TestEnvConfig(unittest.TestCase):
         self.assertFalse(str(env_config.BOOKS_DIR).startswith("~"))
 
     def test_reader_viewport_defaults(self):
-        self.assertGreaterEqual(env_config.READER_VIEWPORT_WIDTH, 360)
-        self.assertGreaterEqual(env_config.READER_VIEWPORT_HEIGHT, 480)
+        # 0 表示自动匹配本机屏幕；显式正整数仍合法
+        self.assertGreaterEqual(env_config.READER_VIEWPORT_WIDTH, 0)
+        self.assertGreaterEqual(env_config.READER_VIEWPORT_HEIGHT, 0)
         self.assertFalse(env_config.READER_FORCE_SINGLE_PAGE)
-        # 代码默认使用桌面宽度，避免微信读书进入窄屏排版
-        self.assertEqual(env_config.env_int("READER_VIEWPORT_WIDTH_UNSET_X", 1200), 1200)
-        self.assertEqual(env_config.env_int("READER_VIEWPORT_HEIGHT_UNSET_X", 900), 900)
+        # 代码默认 0=auto；未设置时 env_int 回退由调用方指定
+        self.assertEqual(env_config.env_int("READER_VIEWPORT_WIDTH_UNSET_X", 0), 0)
+        self.assertEqual(env_config.env_int("READER_VIEWPORT_HEIGHT_UNSET_X", 0), 0)
+
+    def test_detect_host_screen_size_returns_reasonable_pair(self):
+        w, h = env_config.detect_host_screen_size()
+        self.assertGreaterEqual(w, 800)
+        self.assertGreaterEqual(h, 600)
+
+    def test_resolve_reader_viewport_auto_and_explicit(self):
+        auto = env_config.resolve_reader_viewport(0, 0)
+        self.assertGreaterEqual(auto["width"], 800)
+        self.assertGreaterEqual(auto["height"], 600)
+        fixed = env_config.resolve_reader_viewport(1280, 720)
+        self.assertEqual(fixed, {"width": 1280, "height": 720})
+        # 仅宽 auto
+        mixed = env_config.resolve_reader_viewport(0, 800)
+        self.assertGreaterEqual(mixed["width"], 800)
+        self.assertEqual(mixed["height"], 800)
 
 
 if __name__ == "__main__":

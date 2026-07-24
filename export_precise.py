@@ -34,6 +34,7 @@ from env_config import (
     READER_FORCE_SINGLE_PAGE,
     READER_VIEWPORT_HEIGHT,
     READER_VIEWPORT_WIDTH,
+    resolve_reader_viewport,
     SLEEP_BOOK_INTERVAL,
     SLEEP_CHAPTER_MAX,
     SLEEP_CHAPTER_MIN,
@@ -76,10 +77,8 @@ DEFAULT_NEW_BOOKS = Path("data") / "new_books.txt"
 
 
 def reader_viewport(width=None, height=None):
-    """导出用阅读器视口。默认使用桌面宽度，避免微信读书进入窄屏排版。"""
-    w = max(360, int(width if width is not None else (READER_VIEWPORT_WIDTH or 1200)))
-    h = max(480, int(height if height is not None else (READER_VIEWPORT_HEIGHT or 900)))
-    return {"width": w, "height": h}
+    """导出用阅读器视口。宽/高 0 或未配置时自动匹配本机屏幕。"""
+    return resolve_reader_viewport(width, height)
 
 
 def viewport_focus_point(viewport=None):
@@ -105,7 +104,13 @@ async def page_viewport(page, fallback=None):
 
 
 async def ensure_configured_viewport(page, viewport):
-    """确保页面使用配置的阅读器视口；有头窗口缩小时强制 set_viewport_size。"""
+    """确保页面使用配置的阅读器视口。
+
+    有头模式常见：窗口宽度已达标，但高度因浏览器外壳略小于配置值。
+    此时接受实际视口，避免 set_viewport_size 把 CSS 视口固定成
+    「窗口很大、内容区很窄/很高」的错位布局。
+    仅当宽度明显偏小（或高度严重不足）时才强制。
+    """
     desired = {
         "width": int(viewport["width"]),
         "height": int(viewport["height"]),
@@ -113,6 +118,16 @@ async def ensure_configured_viewport(page, viewport):
     actual = await page_viewport(page, desired)
     if actual == desired:
         return desired
+
+    width_ok = actual["width"] >= desired["width"] - 8
+    height_ok = actual["height"] >= max(480, int(desired["height"] * 0.7))
+    if width_ok and height_ok:
+        print(
+            f"  🪟 页面视口: {actual['width']}x{actual['height']} "
+            f"（配置 {desired['width']}x{desired['height']}），"
+            f"接受实际窗口尺寸"
+        )
+        return actual
 
     print(
         f"  🪟 页面视口: {actual['width']}x{actual['height']} "
@@ -377,8 +392,16 @@ async def ensure_reader_layout(page, viewport, *, force_single_page=False):
 
     微信读书 web 在宽视口下会并排渲染左右两页（两个 canvas）。
     返回实际采用的 viewport。
+
+    重要：强制单页若全部失败，必须恢复原始桌面视口。
+    否则会停留在最后一次尝试的窄 CSS 视口（如 480），
+    而浏览器窗口仍很宽，页面呈现「左侧一条内容、右侧大片空白」。
     """
-    vp = dict(viewport)
+    original = {
+        "width": int(viewport["width"]),
+        "height": int(viewport["height"]),
+    }
+    vp = dict(original)
     n = await count_reader_canvases(page)
     if n <= 1:
         if n == 1:
@@ -390,11 +413,17 @@ async def ensure_reader_layout(page, viewport, *, force_single_page=False):
         return vp
 
     print(f"  ⚠️  检测到双页布局（canvas={n}），尝试收窄视口强制单页…")
+    narrowed = False
     for w in (720, 640, 560, 480):
-        if w >= int(vp.get("width") or 0):
+        if w >= original["width"]:
             continue
-        vp = {"width": w, "height": int(vp.get("height") or 900)}
-        await page.set_viewport_size(vp)
+        vp = {"width": w, "height": original["height"]}
+        narrowed = True
+        try:
+            await page.set_viewport_size(vp)
+        except Exception as e:
+            print(f"    set_viewport_size({w}) 失败: {e}")
+            continue
         try:
             await page.reload(wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
@@ -407,7 +436,22 @@ async def ensure_reader_layout(page, viewport, *, force_single_page=False):
             return vp
 
     print(f"  ⚠️  仍为双页（canvas={n}），将依赖按 canvas 拆页兜底")
-    return vp
+    if narrowed and vp != original:
+        print(
+            f"  🪟 恢复桌面视口 {original['width']}x{original['height']}，"
+            f"避免窄 CSS 视口留在宽窗口中"
+        )
+        try:
+            await page.set_viewport_size(original)
+        except Exception as e:
+            print(f"    恢复 set_viewport_size 失败: {e}")
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            print(f"    恢复 reload 异常: {e}")
+        await asyncio.sleep(SLEEP_READER_AFTER_LOAD)
+        return original
+    return original
 
 
 CANVAS_HOOK = r"""
@@ -3206,13 +3250,19 @@ def parse_args(argv=None):
         "--reader-width",
         type=int,
         default=READER_VIEWPORT_WIDTH,
-        help=f"阅读器视口宽度（默认 {READER_VIEWPORT_WIDTH}，来自 .env READER_VIEWPORT_WIDTH）",
+        help=(
+            f"阅读器视口宽度（默认 {READER_VIEWPORT_WIDTH}，"
+            "0=自动匹配本机屏幕宽度；来自 .env READER_VIEWPORT_WIDTH）"
+        ),
     )
     parser.add_argument(
         "--reader-height",
         type=int,
         default=READER_VIEWPORT_HEIGHT,
-        help=f"阅读器视口高度（默认 {READER_VIEWPORT_HEIGHT}，来自 .env READER_VIEWPORT_HEIGHT）",
+        help=(
+            f"阅读器视口高度（默认 {READER_VIEWPORT_HEIGHT}，"
+            "0=自动匹配本机屏幕高度；来自 .env READER_VIEWPORT_HEIGHT）"
+        ),
     )
     parser.add_argument(
         "--force-single-page",

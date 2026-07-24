@@ -232,6 +232,20 @@ class TestExportPreciseCli(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_ensure_configured_viewport_accepts_chrome_height_diff(self):
+        async def run():
+            page = mock.AsyncMock()
+            # 宽度已达标，高度因浏览器外壳略小
+            page.evaluate.return_value = {"width": 1470, "height": 762}
+            desired = {"width": 1470, "height": 900}
+
+            vp = await export_precise.ensure_configured_viewport(page, desired)
+
+            self.assertEqual(vp, {"width": 1470, "height": 762})
+            page.set_viewport_size.assert_not_called()
+
+        asyncio.run(run())
+
     def test_turn_reader_page_focuses_without_clicking_content(self):
         async def run():
             page = mock.AsyncMock()
@@ -305,6 +319,48 @@ class TestExportPreciseCli(unittest.TestCase):
             self.assertEqual(actual, vp)
             page.set_viewport_size.assert_not_called()
             page.reload.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_reader_layout_restores_width_when_force_single_fails(self):
+        async def run():
+            page = mock.AsyncMock()
+            # count_reader_canvases always dual-page
+            page.evaluate.return_value = 2
+            page.set_viewport_size = mock.AsyncMock()
+            page.reload = mock.AsyncMock()
+            original = {"width": 1470, "height": 900}
+
+            with mock.patch.object(export_precise.asyncio, "sleep", new=mock.AsyncMock()):
+                actual = await export_precise.ensure_reader_layout(
+                    page, original, force_single_page=True)
+
+            self.assertEqual(actual, original)
+            # 收窄若干次后应恢复原始视口
+            self.assertEqual(
+                page.set_viewport_size.await_args_list[-1].args[0],
+                original,
+            )
+            self.assertGreaterEqual(page.reload.await_count, 1)
+
+        asyncio.run(run())
+
+    def test_reader_layout_returns_narrow_when_force_succeeds(self):
+        async def run():
+            page = mock.AsyncMock()
+            # first count=2, after narrow count=1
+            page.evaluate.side_effect = [2, 1]
+            page.set_viewport_size = mock.AsyncMock()
+            page.reload = mock.AsyncMock()
+            original = {"width": 1470, "height": 900}
+
+            with mock.patch.object(export_precise.asyncio, "sleep", new=mock.AsyncMock()):
+                actual = await export_precise.ensure_reader_layout(
+                    page, original, force_single_page=True)
+
+            self.assertEqual(actual, {"width": 720, "height": 900})
+            page.set_viewport_size.assert_awaited_once_with(
+                {"width": 720, "height": 900})
 
         asyncio.run(run())
 

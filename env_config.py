@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -84,11 +86,84 @@ load_dotenv()
 DEFAULT_BOOKS_DIR_RAW = "~/data/weixin/books"
 BOOKS_DIR = env_path("BOOKS_DIR", DEFAULT_BOOKS_DIR_RAW)
 
-# 阅读器视口：默认使用桌面宽度，尽量贴近手动浏览器排版。
+# 阅读器视口：0 表示自动匹配本机主屏可用逻辑像素，尽量贴近手动全宽浏览器。
 # 若需要旧版单页策略，可开启 READER_FORCE_SINGLE_PAGE。
-READER_VIEWPORT_WIDTH = env_int("READER_VIEWPORT_WIDTH", 1200)
-READER_VIEWPORT_HEIGHT = env_int("READER_VIEWPORT_HEIGHT", 900)
+# 宽/高任一为 0 时，在 resolve_reader_viewport() 中用 detect_host_screen_size() 补齐。
+READER_VIEWPORT_WIDTH = env_int("READER_VIEWPORT_WIDTH", 0)
+READER_VIEWPORT_HEIGHT = env_int("READER_VIEWPORT_HEIGHT", 0)
 READER_FORCE_SINGLE_PAGE = env_bool("READER_FORCE_SINGLE_PAGE", False)
+
+# 无法探测本机屏幕时的兜底视口
+_FALLBACK_SCREEN_WIDTH = 1200
+_FALLBACK_SCREEN_HEIGHT = 900
+
+
+def detect_host_screen_size() -> tuple[int, int]:
+    """探测本机主屏可用逻辑像素 (width, height)。
+
+    macOS 优先用 Finder desktop bounds（CSS/逻辑像素，非 Retina 物理像素）。
+    失败时回退 1200x900。
+    """
+    # macOS: "0, 0, 1470, 956"
+    try:
+        out = subprocess.check_output(
+            [
+                "osascript",
+                "-e",
+                'tell application "Finder" to get bounds of window of desktop',
+            ],
+            text=True,
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        nums = [int(x) for x in re.findall(r"-?\d+", out)]
+        if len(nums) >= 4:
+            w = nums[2] - nums[0]
+            h = nums[3] - nums[1]
+            if w >= 800 and h >= 600:
+                return w, h
+    except Exception:
+        pass
+
+    # Linux: xdpyinfo
+    try:
+        out = subprocess.check_output(
+            ["xdpyinfo"],
+            text=True,
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        )
+        m = re.search(r"dimensions:\s*(\d+)x(\d+)", out)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            if w >= 800 and h >= 600:
+                return w, h
+    except Exception:
+        pass
+
+    return _FALLBACK_SCREEN_WIDTH, _FALLBACK_SCREEN_HEIGHT
+
+
+def resolve_reader_viewport(
+    width: int | None = None,
+    height: int | None = None,
+) -> dict[str, int]:
+    """解析阅读器视口；宽/高为 0/None 时自动匹配本机屏幕。
+
+    显式传入正整数优先生效；模块配置 0 表示 auto。
+    """
+    w = READER_VIEWPORT_WIDTH if width is None else int(width)
+    h = READER_VIEWPORT_HEIGHT if height is None else int(height)
+    if w <= 0 or h <= 0:
+        sw, sh = detect_host_screen_size()
+        if w <= 0:
+            w = sw
+        if h <= 0:
+            h = sh
+    return {
+        "width": max(360, int(w)),
+        "height": max(480, int(h)),
+    }
 
 # --- 网页操作 sleep（秒）---
 # 命名约定：SLEEP_<场景>_<动作>
