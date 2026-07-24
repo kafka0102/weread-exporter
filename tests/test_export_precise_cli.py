@@ -201,12 +201,26 @@ class TestExportPreciseCli(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_ensure_configured_viewport_forces_mismatch(self):
+    def test_ensure_configured_viewport_accepts_smaller_usable_window(self):
+        """有头窗口小于屏幕配置时，接受实际视口，禁止放大 CSS。"""
         async def run():
             page = mock.AsyncMock()
-            # first read: mismatch; after set_viewport_size: match
+            page.evaluate.return_value = {"width": 1024, "height": 497}
+            desired = {"width": 1920, "height": 1746}
+
+            vp = await export_precise.ensure_configured_viewport(page, desired)
+
+            self.assertEqual(vp, {"width": 1024, "height": 497})
+            page.set_viewport_size.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_ensure_configured_viewport_forces_tiny_window(self):
+        async def run():
+            page = mock.AsyncMock()
+            # 过小异常视口才强制
             page.evaluate.side_effect = [
-                {"width": 1024, "height": 497},
+                {"width": 400, "height": 300},
                 {"width": 1200, "height": 900},
             ]
             desired = {"width": 1200, "height": 900}
@@ -214,7 +228,7 @@ class TestExportPreciseCli(unittest.TestCase):
             with mock.patch.object(export_precise.asyncio, "sleep", new=mock.AsyncMock()):
                 vp = await export_precise.ensure_configured_viewport(page, desired)
 
-            self.assertEqual(vp, desired)
+            self.assertEqual(vp, {"width": 1200, "height": 900})
             page.set_viewport_size.assert_awaited_once_with(desired)
 
         asyncio.run(run())
@@ -222,13 +236,13 @@ class TestExportPreciseCli(unittest.TestCase):
     def test_ensure_configured_viewport_falls_back_on_set_error(self):
         async def run():
             page = mock.AsyncMock()
-            page.evaluate.return_value = {"width": 1024, "height": 497}
+            page.evaluate.return_value = {"width": 400, "height": 300}
             page.set_viewport_size.side_effect = RuntimeError("boom")
             desired = {"width": 1200, "height": 900}
 
             vp = await export_precise.ensure_configured_viewport(page, desired)
 
-            self.assertEqual(vp, {"width": 1024, "height": 497})
+            self.assertEqual(vp, {"width": 400, "height": 300})
 
         asyncio.run(run())
 

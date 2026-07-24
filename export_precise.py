@@ -104,12 +104,17 @@ async def page_viewport(page, fallback=None):
 
 
 async def ensure_configured_viewport(page, viewport):
-    """确保页面使用配置的阅读器视口。
+    """对齐阅读器视口与真实窗口。
 
-    有头模式常见：窗口宽度已达标，但高度因浏览器外壳略小于配置值。
-    此时接受实际视口，避免 set_viewport_size 把 CSS 视口固定成
-    「窗口很大、内容区很窄/很高」的错位布局。
-    仅当宽度明显偏小（或高度严重不足）时才强制。
+    有头模式（no_viewport）下窗口常小于「本机屏幕配置值」。
+    若仍 set_viewport_size 到更大 CSS 尺寸，会出现：
+    - 正文 canvas 不渲染（canvas≈0）
+    - 黑屏、目录侧栏关不掉、跳转校验永远失败
+
+    规则：
+    - 实际视口已接近配置：接受实际
+    - 实际可用（宽≥800 且 高≥480）但小于配置：接受实际，绝不强行放大
+    - 实际过小（异常）时才尝试 set_viewport_size 到配置
     """
     desired = {
         "width": int(viewport["width"]),
@@ -129,24 +134,39 @@ async def ensure_configured_viewport(page, viewport):
         )
         return actual
 
+    # 窗口比配置小但已可用：有头模式常见，接受窗口，禁止放大 CSS 视口
+    usable = actual["width"] >= 800 and actual["height"] >= 480
+    smaller_than_desired = (
+        actual["width"] < desired["width"] - 8
+        or actual["height"] < desired["height"] - 8
+    )
+    if usable and smaller_than_desired:
+        print(
+            f"  🪟 页面视口: {actual['width']}x{actual['height']} "
+            f"（配置 {desired['width']}x{desired['height']}），"
+            f"接受实际窗口（不强行放大 CSS 视口）"
+        )
+        return actual
+
     print(
         f"  🪟 页面视口: {actual['width']}x{actual['height']} "
-        f"（配置 {desired['width']}x{desired['height']}），尝试强制配置值"
+        f"（配置 {desired['width']}x{desired['height']}），"
+        f"实际过小，尝试强制配置值"
     )
     try:
         await page.set_viewport_size(desired)
         await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
-        actual = await page_viewport(page, desired)
-        if actual == desired:
+        forced = await page_viewport(page, desired)
+        if forced["width"] >= 800 and forced["height"] >= 480:
             print(
-                f"  ✅ 已强制视口 {desired['width']}x{desired['height']}"
+                f"  ✅ 已强制视口 {forced['width']}x{forced['height']}"
             )
-            return desired
+            return forced
         print(
-            f"  ⚠️  强制后视口仍为 {actual['width']}x{actual['height']}，"
-            f"继续按配置 {desired['width']}x{desired['height']} 处理"
+            f"  ⚠️  强制后视口仍为 {forced['width']}x{forced['height']}，"
+            f"改用实际 {actual['width']}x{actual['height']}"
         )
-        return desired
+        return actual
     except Exception as e:
         print(f"  ⚠️  强制视口失败: {e}，改用实际 {actual['width']}x{actual['height']}")
         return actual
@@ -456,6 +476,22 @@ async def ensure_horizontal_paging_mode(page) -> str:
     """
     geo = await inspect_reader_geometry(page)
     mode = classify_reader_paging_mode(geo)
+    n0 = len(geo.get("canvases") or [])
+    if n0 == 0:
+        # 视口错位或尚未绘制：短等 + 重绘后再测，避免 canvas≈0 时误判
+        try:
+            await force_reader_repaint(page)
+            await asyncio.sleep(max(0.3, float(SLEEP_READER_PAGE_RENDER)))
+            geo = await inspect_reader_geometry(page)
+            mode = classify_reader_paging_mode(geo)
+            n0 = len(geo.get("canvases") or [])
+        except Exception:
+            pass
+        if n0 == 0:
+            print(
+                "  ⚠️  未检测到正文 canvas（可能视口/加载异常），"
+                "稍后目录跳转可能失败"
+            )
     if mode == "horizontal":
         n = len(geo.get("canvases") or [])
         print(f"  📖 翻页模式: 左右/双页（canvas≈{n}，非长文滚动）")
@@ -2297,6 +2333,7 @@ async def goto_catalog_chapter(page, target_title: str, catalog_titles=None) -> 
             await close_reader_catalog(page)
             return ""
 
+        land_fails = 0
         for _ in range(60):
             # 目录内若误入搜索态，先退回列表
             await dismiss_reader_search(page)
@@ -2337,19 +2374,25 @@ async def goto_catalog_chapter(page, target_title: str, catalog_titles=None) -> 
                     landed = await verify_reader_on_chapter(
                         page, target, catalog_titles, retries=3
                     )
-                    if not landed:
-                        header = await read_chapter_title(page, catalog_titles)
+                    if landed:
+                        return hit or target
+                    header = await read_chapter_title(page, catalog_titles)
+                    land_fails += 1
+                    print(
+                        f"    … 目录点击后未落到「{target[:20]}」"
+                        f"（顶栏「{(header or '空')[:20]}」），"
+                        f"关闭目录后重试（{land_fails}/3）"
+                    )
+                    await close_reader_catalog(page)
+                    await asyncio.sleep(0.2)
+                    if land_fails >= 3:
                         print(
-                            f"    … 目录点击后未落到「{target[:20]}」"
-                            f"（顶栏「{(header or '空')[:20]}」），关闭目录后重试点击"
+                            f"  ⚠️  目录跳转「{target[:20]}」连续未落地，放弃并关闭目录"
                         )
-                        # 不立刻滚走：同一项再点一轮（Vue 偶发丢点击）
-                        await close_reader_catalog(page)
-                        await asyncio.sleep(0.2)
-                        if not await open_reader_catalog(page):
-                            continue
+                        break
+                    if not await open_reader_catalog(page):
                         continue
-                    return hit or target
+                    continue
 
             moved = await page.evaluate(
                 """() => {
@@ -2469,13 +2512,29 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         current_chapter = resolve_chapter_title(
                             jumped, catalog_titles) or nxt
                     else:
-                        # 未落地时仍以目标章为逻辑名，但首页必须出现章首/顶栏对齐，
-                        # 否则会在错误页上灌文；后面 bootstrap 后会检查。
+                        # 未落地：不要假装已在目标章（会把附录正文灌进末章）。
+                        # 保留阅读器当前章，后续靠正文切章/翻页前进；末章则重开或收尾。
                         print(
                             f"  ⚠️  续传目录未确认落到「{nxt[:24]}」，"
-                            f"将校验首页正文是否含章名"
+                            f"保持当前位置「{(current_chapter or '空')[:20]}」并关闭目录"
                         )
-                        current_chapter = nxt
+                        for _ in range(5):
+                            await close_reader_catalog(page)
+                            if not await is_reader_catalog_open(page):
+                                break
+                            await page.keyboard.press("Escape")
+                            await asyncio.sleep(0.15)
+                        # 若当前已在目标前一章，逻辑仍对准 nxt，靠线性翻页进入
+                        cur_now = resolve_chapter_title(
+                            await read_chapter_title(page, catalog_titles) or current_chapter,
+                            catalog_titles,
+                        )
+                        if cur_now and compact_title_key(cur_now) == compact_title_key(nxt):
+                            current_chapter = nxt
+                        elif cur_now:
+                            current_chapter = cur_now
+                        else:
+                            current_chapter = nxt
                 else:
                     current_chapter = nxt
         print(f"  📖 {book_title} — {book_author}")
