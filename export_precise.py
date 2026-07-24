@@ -525,7 +525,7 @@ def is_hard_runaway_chapter(n_lines: int, page_num: int) -> bool:
 # 本章内长行去重阈值：短行（标点/诗题）允许重复，长行重复多半是翻页空转
 CHAPTER_LINE_DEDUPE_MIN_LEN = 12
 # 同一章内重复命中已抓页指纹的次数，达到后视为翻页空转
-MAX_PAGE_CYCLE_HITS = 3
+MAX_PAGE_CYCLE_HITS = 6
 
 
 def chapter_text_line_set(blocks) -> set[str]:
@@ -2171,6 +2171,12 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         current_chapter = resolve_chapter_title(
                             jumped, catalog_titles) or nxt
                     else:
+                        # 未落地时仍以目标章为逻辑名，但首页必须出现章首/顶栏对齐，
+                        # 否则会在错误页上灌文；后面 bootstrap 后会检查。
+                        print(
+                            f"  ⚠️  续传目录未确认落到「{nxt[:24]}」，"
+                            f"将校验首页正文是否含章名"
+                        )
                         current_chapter = nxt
                 else:
                     current_chapter = nxt
@@ -2294,14 +2300,16 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 last_page_lines = page_line_set
                 if added > 0:
                     seen_page_fps.add(page_fp)
+                    # 有真实新正文时清零空转计数
+                    page_cycle_hits = 0
                     return True
-                # 本页有字但全部被本章去重挡下：视为翻页空转（折行抖动换指纹）
-                if page_line_set:
-                    if page_fp in seen_page_fps:
-                        page_cycle_hits += 1
-                    else:
-                        seen_page_fps.add(page_fp)
-                        page_cycle_hits += 1
+                # 本页有字但全被去重挡下：
+                # - 仅当「同一页指纹再次出现」才算空转
+                # - 新指纹但无新长行：常见于双页半页重叠/折行，不算 cycle
+                if page_line_set and page_fp in seen_page_fps:
+                    page_cycle_hits += 1
+                elif page_line_set:
+                    seen_page_fps.add(page_fp)
                 return False
             return added > 0
 
@@ -2348,12 +2356,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             return resolve_chapter_title(jumped, catalog_titles) or target
 
         async def break_page_cycle_or_lag() -> bool:
-            """翻页空转/顶栏错位时的有限纠偏。
+            """翻页空转/顶栏严重错位时的有限纠偏。
 
             原则：
-            - 绝不在定位未核验时把脏缓冲当成下一章落盘并跳章
-            - 顶栏落后：最多重定位当前逻辑章 1 次
-            - 仍空转：请求会话重开续传（保留未完成章缓冲到 reopen 路径处理）
+            - 双页顶栏滞后很常见，不能仅凭顶栏落后就重定位/重开
+            - 同一页指纹反复出现才算空转；半页重叠去重不算
+            - 空转时不落盘半成品（否则续传会跳过本章剩余正文）
+            - 只重开会话，让外层从上一完整章后重新定位当前章
 
             返回 True 表示已处理并应 continue/break 主循环。
             """
@@ -2363,23 +2372,25 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
 
             header_now = await read_chapter_title(page, catalog_titles)
             delta = catalog_index_delta(catalog_titles, current_chapter, header_now)
-            cyc = page_cycle_hits >= MAX_PAGE_CYCLE_HITS
+            # 需要连续多次「整页指纹重复」才认定空转
+            cyc = page_cycle_hits >= MAX_PAGE_CYCLE_HITS and page_num >= 4
+            # 顶栏落后 ≥2 章且已有若干页仍无前进时才重定位（双页滞后 1 章很常见）
             lag = (
-                delta is not None and delta < 0
-                and page_num >= 3
+                delta is not None and delta <= -2
+                and page_num >= 6
+                and page_cycle_hits >= 2
                 and header_lag_resync_used < 1
             )
 
-            # 顶栏停在更早章节：目录重跳「当前逻辑章」一次
             if lag and current_chapter:
                 header_lag_resync_used += 1
                 print(
                     f"    … 顶栏「{(header_now or '')[:16]}」落后逻辑"
-                    f"「{(current_chapter or '')[:16]}」，尝试目录重定位"
+                    f"「{(current_chapter or '')[:16]}」Δ={delta}，尝试目录重定位"
                 )
                 landed = await jump_catalog_and_reanchor(
                     current_chapter,
-                    reason="顶栏落后重定位",
+                    reason="顶栏严重落后重定位",
                     clear_buffer=True,
                 )
                 if landed:
@@ -2390,32 +2401,26 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         if reached_end:
                             break
                     return True
-                # 跳不过去：重开，避免带着错误页继续灌
-                print("    … 重定位失败，结束会话重开续传")
+                print("    … 重定位失败，丢弃未完成缓冲并重开（不落盘半章）")
+                adopt_chapter_blocks([])
                 request_reopen = True
                 return True
 
-            if not cyc and page_cycle_hits < 1:
+            if not cyc:
                 return False
 
-            # 页指纹循环：只说明键盘/点击没把页面推到新内容。
-            # 若顶栏已是下一章，交给 should_follow_header；否则重开，不跳章吞内容。
             n_lines_now = chapter_text_line_count(ch_blocks)
             print(
                 f"    … 检测到翻页空转 cycle={page_cycle_hits} "
                 f"p={page_num} lines={n_lines_now} "
                 f"「{(current_chapter or '')[:20]}」"
-                f"/顶栏「{(header_now or '')[:16]}」→ 重开续传（不跳章）"
+                f"/顶栏「{(header_now or '')[:16]}」"
+                f"→ 丢弃未完成缓冲并重开（不落盘半章，避免跳章）"
             )
-            # 半成品尽量落盘，便于续传锚点前进；但绝不目录硬跳下一章
-            if ch_blocks and not is_hard_runaway_chapter(n_lines_now, page_num):
-                n, _imgs, saved = await commit_chapter(
-                    current_chapter, ch_blocks, note_suffix=" [会话中断·空转]"
-                )
-                if saved:
-                    ch_idx += 1
+            # 关键：不 commit。落盘半章会让续传以为本章已完成而跳过剩余正文。
             adopt_chapter_blocks([])
             if is_last_catalog_chapter(current_chapter, catalog_titles):
+                # 末章空转：允许以已抓内容结束
                 reached_end = True
             else:
                 request_reopen = True
@@ -2559,6 +2564,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         while await split_if_next_chapter_started():
             if reached_end:
                 break
+
         # 若首页缓冲仍空但顶栏已是紧邻下一章：短章被跳过/双页顶栏超前，
         # 允许空章前进，避免重开死循环。
         if not any(
@@ -2880,10 +2886,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if stale >= 2:
                 turn_method_idx += 1
 
-            # 页指纹已循环时，不必等到 stale=8 才切章
-            if page_cycle_hits >= MAX_PAGE_CYCLE_HITS or (
-                page_cycle_hits >= 1 and stale >= 3
-            ):
+            # 仅在「足够多次整页重复」后才走空转处理；半页重叠的 stale 继续换翻页方式
+            if page_cycle_hits >= MAX_PAGE_CYCLE_HITS and stale >= 4:
                 if await break_page_cycle_or_lag():
                     if reached_end or request_reopen:
                         break
@@ -2922,18 +2926,14 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     f"结束本会话并重开阅读器续传"
                 )
 
-            # 仅硬阈值脏缓冲不落盘；正常长章在停滞时仍尽量落盘半成品
-            if is_hard_runaway_chapter(n_lines, page_num):
+            # 未完成章不落盘：续传锚点停在上一完整章，重开后重新抓本章。
+            # 否则半章落盘会让下一会话跳过本章后半。
+            if ch_blocks:
                 print(
-                    f"    … 停滞时缓冲极大 lines={n_lines} p={page_num}，丢弃不落盘"
+                    f"    … 未完成章不落盘 lines={n_lines} p={page_num} "
+                    f"「{(current_chapter or '')[:20]}」，重开后重抓"
                 )
-                adopt_chapter_blocks([])
-            elif ch_blocks:
-                n, _imgs, saved = await commit_chapter(
-                    current_chapter, ch_blocks, note_suffix=" [会话中断]")
-                if saved:
-                    ch_idx += 1
-                adopt_chapter_blocks([])
+            adopt_chapter_blocks([])
             request_reopen = True
             break
 
