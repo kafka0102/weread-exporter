@@ -608,3 +608,33 @@ class RunawayChapterThresholdTests(unittest.TestCase):
         ]
         self.assertEqual(export_precise.chapter_text_line_count(blocks), 2)
         self.assertEqual(export_precise.chapter_text_line_count([]), 0)
+
+
+class ChapterPageDedupeTests(unittest.TestCase):
+    def test_chapter_text_line_set(self):
+        blocks = [
+            {"type": "text", "text": "hello world line"},
+            {"type": "img", "src": "a"},
+            {"type": "text", "text": "  "},
+            {"type": "text", "text": "second long line here"},
+        ]
+        self.assertEqual(
+            export_precise.chapter_text_line_set(blocks),
+            {"hello world line", "second long line here"},
+        )
+
+    def test_should_skip_long_duplicate_not_short(self):
+        seen = {"这是一行足够长的正文会被去重"}
+        self.assertTrue(
+            export_precise.should_skip_chapter_line(
+                "这是一行足够长的正文会被去重", seen
+            )
+        )
+        # 短行允许重复
+        self.assertFalse(
+            export_precise.should_skip_chapter_line("是的。", {"是的。"})
+        )
+        # 未见过的长行不跳过
+        self.assertFalse(
+            export_precise.should_skip_chapter_line("全新的一行长正文内容啊", seen)
+        )
