@@ -728,3 +728,22 @@ class TestDedupeCharsByPosition(unittest.TestCase):
         ]
         out = export_precise.dedupe_chars_by_position(chars)
         self.assertEqual([c["t"] for c in out], ["刚", "落"])
+
+
+class TestEndOfBookStaleLimits(unittest.TestCase):
+    def test_last_chapter_stale_limit_stricter_than_normal(self):
+        self.assertLess(
+            export_precise.LAST_CHAPTER_STALE_LIMIT,
+            export_precise.STALE_PAGE_LIMIT,
+        )
+        self.assertGreaterEqual(export_precise.LAST_CHAPTER_EMPTY_STREAK, 1)
+
+    def test_is_last_catalog_chapter(self):
+        cat = ["序", "附录", "《唐诗选》 初版前言", "唐五代诗概述"]
+        self.assertFalse(export_precise.is_last_catalog_chapter("附录", cat))
+        self.assertFalse(
+            export_precise.is_last_catalog_chapter("《唐诗选》 初版前言", cat)
+        )
+        self.assertTrue(
+            export_precise.is_last_catalog_chapter("唐五代诗概述", cat)
+        )

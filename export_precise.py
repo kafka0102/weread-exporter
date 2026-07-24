@@ -735,6 +735,12 @@ def is_hard_runaway_chapter(n_lines: int, page_num: int) -> bool:
 CHAPTER_LINE_DEDUPE_MIN_LEN = 12
 # 同一章内重复命中已抓页指纹的次数，达到后视为翻页空转
 MAX_PAGE_CYCLE_HITS = 6
+# 普通章翻页无新内容达到此次数 → 重开会话；末章更短，见 LAST_CHAPTER_STALE_LIMIT
+STALE_PAGE_LIMIT = 8
+# 目录最后一章：更早收尾，避免书末黑屏空翻页（用户感知「停不下来」）
+LAST_CHAPTER_STALE_LIMIT = 3
+# 连续抓到 0 字（黑屏/空白页）次数：末章达此即结束
+LAST_CHAPTER_EMPTY_STREAK = 2
 
 
 def chapter_text_line_set(blocks) -> set[str]:
@@ -2479,6 +2485,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         total_chars = total_imgs = 0
         chapters_this_session = 0
         stale = 0
+        empty_page_streak = 0
         page_num = 0
         # 会话内已落盘章节指纹；重复则说明切章回退/停滞
         saved_chapter_fps: set[str] = set()
@@ -3066,6 +3073,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if got_new:
                 page_num += 1  # 原先只在 split 分支 +1，导致有抓取也无页进度心跳
                 stale = 0
+                empty_page_streak = 0
                 turn_method_idx = 0
                 empty_header_resync = 0
                 if page_num == 1 or page_num % 2 == 0:
@@ -3169,14 +3177,59 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             # ---- 本页无新内容 ----
             header_multi_ahead_hits = 0
             stale += 1
-            if stale == 1 or stale in (3, 5, 8) or stale % 2 == 0:
-                print(
-                    f"    … 翻页无新内容 stale={stale}/8 "
-                    f"当前「{(current_chapter or '')[:24]}」 "
-                    f"cycle={page_cycle_hits} key={turn_method}"
+            # 统计「完全无字」空页：书末黑屏常见，与「有字但全被去重」区分
+            try:
+                n_chars_now = int(
+                    await page.evaluate(
+                        "() => (window.__wr_chars && window.__wr_chars.length) || 0"
+                    )
+                    or 0
                 )
-            if stale >= 2:
+            except Exception:
+                n_chars_now = 0
+            if n_chars_now <= 0:
+                empty_page_streak += 1
+            else:
+                empty_page_streak = 0
+
+            is_last_now = is_last_catalog_chapter(
+                current_chapter, catalog_titles)
+            stale_limit = (
+                LAST_CHAPTER_STALE_LIMIT if is_last_now else STALE_PAGE_LIMIT
+            )
+            if (
+                stale == 1
+                or stale in (3, 5, 8)
+                or stale % 2 == 0
+                or stale >= stale_limit
+                or (is_last_now and empty_page_streak >= LAST_CHAPTER_EMPTY_STREAK)
+            ):
+                print(
+                    f"    … 翻页无新内容 stale={stale}/{stale_limit} "
+                    f"当前「{(current_chapter or '')[:24]}」 "
+                    f"cycle={page_cycle_hits} empty={empty_page_streak} "
+                    f"key={turn_method}"
+                    + (" [末章]" if is_last_now else "")
+                )
+            if stale >= 2 and not is_last_now:
                 turn_method_idx += 1
+
+            # 末章：黑屏/空白或短时无新内容 → 直接收尾，避免书末空翻页「停不下来」
+            if is_last_now and (
+                empty_page_streak >= LAST_CHAPTER_EMPTY_STREAK
+                or stale >= LAST_CHAPTER_STALE_LIMIT
+            ):
+                print(
+                    f"    … 目录末章「{(current_chapter or '')[:20]}」"
+                    f"无更多正文（stale={stale}, empty={empty_page_streak}），"
+                    f"按全书末尾收尾"
+                )
+                await commit_chapter(
+                    current_chapter, ch_blocks, note_suffix=" [全书末尾]",
+                    allow_empty=True)
+                adopt_chapter_blocks([])
+                reached_end = True
+                break
 
             # 仅在「足够多次整页重复」后才走空转处理；半页重叠的 stale 继续换翻页方式
             if page_cycle_hits >= MAX_PAGE_CYCLE_HITS and stale >= 4:
@@ -3185,14 +3238,15 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         break
                     continue
 
-            if stale < 8:
+            if stale < stale_limit:
                 continue
 
-            # stale>=8：优先判定全书结束；否则结束会话，由外层重开阅读器续传
+            # stale 达上限：优先判定全书结束；否则结束会话，由外层重开阅读器续传
             if is_last_catalog_chapter(current_chapter, catalog_titles):
                 await commit_chapter(
                     current_chapter, ch_blocks, note_suffix=" [全书末尾]",
                     allow_empty=True)
+                adopt_chapter_blocks([])
                 reached_end = True
                 break
             if not catalog_titles or catalog_index(
@@ -3200,6 +3254,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 await commit_chapter(
                     current_chapter, ch_blocks, note_suffix=" [无更多新内容]",
                     allow_empty=True)
+                adopt_chapter_blocks([])
                 reached_end = True
                 break
 
@@ -3229,13 +3284,12 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             request_reopen = True
             break
 
-        # reached_end 时把最后一章存下
+        # reached_end 时若缓冲仍有未 commit 的正文，再落盘一次（避免与上面重复）
         if reached_end and ch_blocks:
-            n, imgs = save_chapter(current_chapter, ch_blocks, ch_idx, md_dir, raw_dir)
-            if n or imgs:
-                total_chars += n; total_imgs += len(imgs)
-                print(f"  [{ch_idx:4d}] {current_chapter[:32]:32s} {n:6d}字 [末章]")
-                chapters_this_session += 1
+            n, imgs, saved = await commit_chapter(
+                current_chapter, ch_blocks, note_suffix=" [末章]", allow_empty=False)
+            if saved:
+                print(f"  [{ch_idx:4d}] {(current_chapter or '')[:32]:32s} {n:6d}字 [末章]")
 
         await page.close(); await ctx.close()
         return book_title, book_author, chapters_this_session, total_chars, ch_idx, reached_end, request_reopen
@@ -3336,6 +3390,19 @@ async def export_one_book(
         session += 1
         last_title, last_idx = get_last_chapter_title(md_dir)
         start_idx = last_idx + 1 if last_idx > 0 else 1
+        # 已落盘目录最后一章：视为全书完成，禁止再开会话空翻页
+        pre_catalog = load_catalog_titles(catalog_path) if os.path.isfile(catalog_path) else []
+        if (
+            last_title
+            and pre_catalog
+            and is_last_catalog_chapter(last_title, pre_catalog)
+        ):
+            print(f"\n--- 会话 {session} ---")
+            print(
+                f"  上次已是目录末章「{last_title[:32]}」(编号 {last_idx})，"
+                f"全书导出完成。"
+            )
+            break
         print(f"\n--- 会话 {session} ---")
         print(f"  上次: {last_title or '(无)'}, 编号: {last_idx}")
         goto_first = (session == 1 and last_idx == 0)
@@ -3353,6 +3420,15 @@ async def export_one_book(
             print("\n  ✅ 已到全书最后一章，导出完成。")
             break
         if need_reopen:
+            # 重开前再读一次末章：若已是目录最后一项，勿再空转重开
+            check_title, _check_idx = get_last_chapter_title(md_dir)
+            check_cat = load_catalog_titles(catalog_path) if os.path.isfile(catalog_path) else []
+            if check_title and check_cat and is_last_catalog_chapter(check_title, check_cat):
+                print(
+                    f"\n  ✅ 已导出目录末章「{check_title[:32]}」，"
+                    f"停止重开，全书完成。"
+                )
+                break
             stall_reopen_count += 1
             if stall_reopen_count > MAX_STALL_REOPENS:
                 raise RuntimeError(
