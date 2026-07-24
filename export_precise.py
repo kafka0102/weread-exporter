@@ -1699,12 +1699,15 @@ async def goto_first_chapter(page, catalog_path=None):
     return header
 
 
-def save_chapter(ch_title, blocks, ch_idx, md_dir, raw_dir):
+def save_chapter(ch_title, blocks, ch_idx, md_dir, raw_dir, *, allow_empty=False):
     title = display_chapter_title(ch_title, ch_idx)
     body, img_records = render_chapter_md(title, blocks, ch_idx)
     text_len = sum(len(b["text"]) for b in blocks if b["type"] == "text")
     if text_len == 0 and not img_records:
-        return 0, []
+        if not allow_empty:
+            return 0, []
+        # 故意空章（短诗被顶栏越过等）：写仅标题占位，保证续传编号前进
+        body = f"# {title}\n"
     with open(os.path.join(md_dir, f"{ch_idx:04d}.md"), "w", encoding="utf-8") as f:
         f.write(body)
     with open(os.path.join(raw_dir, f"{ch_idx:04d}.json"), "w", encoding="utf-8") as f:
@@ -1971,17 +1974,16 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             anchor = normalize_catalog_title(from_md_title or "")
             nxt = next_catalog_title(catalog_titles, anchor) if anchor else None
             if nxt:
-                cur_idx = catalog_index(catalog_titles, current_chapter or "")
-                nxt_idx = catalog_index(catalog_titles, nxt)
-                if cur_idx is None or nxt_idx is None or abs(cur_idx - nxt_idx) > 1:
+                cur_resolved = resolve_chapter_title(
+                    current_chapter or "", catalog_titles)
+                need_jump = compact_title_key(cur_resolved) != compact_title_key(nxt)
+                if need_jump:
                     print(
                         f"  … 续传定位：目录跳到「{nxt[:32]}」"
-                        f"（接在「{(anchor or '')[:24]}」后）"
+                        f"（接在「{(anchor or '')[:24]}」后；"
+                        f"顶栏曾是「{(current_chapter or '')[:20]}」）"
                     )
                     jumped = await goto_catalog_chapter(page, nxt)
-                    if jumped:
-                        current_chapter = resolve_chapter_title(
-                            jumped, catalog_titles) or jumped
                     for _ in range(3):
                         await close_reader_catalog(page)
                         if not await is_reader_catalog_open(page):
@@ -1989,6 +1991,14 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     await blur_reader_inputs(page)
                     await focus_reader_for_keyboard(page)
                     await recover_reader_text_after_nav(page)
+                    if jumped:
+                        # 以目标章为准；顶栏双页常显示下一章名，不能盲信
+                        current_chapter = resolve_chapter_title(
+                            jumped, catalog_titles) or nxt
+                    else:
+                        current_chapter = nxt
+                else:
+                    current_chapter = nxt
         print(f"  📖 {book_title} — {book_author}")
         print(f"  会话开始:「{current_chapter}」")
         ch_idx = start_idx
@@ -2019,6 +2029,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         header_multi_ahead_hits = 0
         # 中途不再依赖目录纠偏；停滞时请求外层重开阅读器续传
         request_reopen = False
+        # 首页已抓过：首轮主循环不要立刻翻走正确页
+        skip_first_turn = True
 
         def reset_page_dedupe():
             """换章或目录跳转后清空页级去重状态。"""
@@ -2077,15 +2089,15 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 last_page_fp = page_fp
             return False
 
-        async def commit_chapter(title, blocks, *, note_suffix=""):
-            """落盘一章并累计统计；返回 (text_len, imgs)。
+        async def commit_chapter(title, blocks, *, note_suffix="", allow_empty=False):
+            """落盘一章并累计统计；返回 (text_len, imgs, saved)。
 
-            若同一章同一正文指纹反复出现，视为切章死循环并中止，
-            避免像「王维」小节那样成千上万次重复落盘。
+            若同一章同一正文指纹反复出现，视为切章死循环并中止。
+            allow_empty=True 时写入仅标题占位章，保证续传能越过空章。
             """
             nonlocal total_chars, total_imgs, chapters_this_session, reached_end
             fp = chapter_blocks_fingerprint(title, blocks)
-            if fp in saved_chapter_fps:
+            if fp in saved_chapter_fps and not allow_empty:
                 dup_chapter_hits[0] += 1
                 print(
                     f"  ⚠️  重复章节内容「{(title or '')[:32]}」"
@@ -2098,10 +2110,16 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         "随后又被顶栏回退。请更新导出逻辑后清理对应 "
                         f"output 目录重试。"
                     )
-                return 0, []
-            n, imgs = save_chapter(title, blocks, ch_idx, md_dir, raw_dir)
-            if not chapter_saved(n, imgs):
-                return n, imgs
+                return 0, [], False
+            n, imgs = save_chapter(
+                title, blocks, ch_idx, md_dir, raw_dir, allow_empty=allow_empty)
+            saved = bool(chapter_saved(n, imgs) or allow_empty)
+            if allow_empty and not chapter_saved(n, imgs):
+                # 占位章：save_chapter 应已写 md；若没写则失败
+                if not os.path.exists(os.path.join(md_dir, f"{ch_idx:04d}.md")):
+                    return n, imgs, False
+            elif not saved:
+                return n, imgs, False
             saved_chapter_fps.add(fp)
             total_chars += n
             total_imgs += len(imgs)
@@ -2109,7 +2127,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             note += note_suffix
             print(f"  [{ch_idx:4d}] {title[:32]:32s} {n:6d}字 ({page_num}页){note}")
             chapters_this_session += 1
-            return n, imgs
+            return n, imgs, True
 
         async def sleep_between_chapters(n_chars):
             # 0 字（空切章/重复跳过）不等待，避免刷屏空等
@@ -2154,10 +2172,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 nxt, catalog_titles, current_chapter)
             is_last = is_last_catalog_chapter(title_to_save, catalog_titles)
             if before:
-                n, _imgs = await commit_chapter(
+                n, _imgs, saved = await commit_chapter(
                     title_to_save, before, note_suffix=" [内容切章]")
                 # 仅实际落盘成功才推进编号，避免 0 字空切制造空洞
-                if chapter_saved(n, _imgs):
+                if saved:
                     ch_idx += 1
                     if is_last:
                         ch_blocks = after
@@ -2182,13 +2200,60 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             await sync_reader_after_content_split(current_chapter)
             return True
 
-        # 首页
-        await page.evaluate("() => window.__wr_reset()")
-        await wait_stable(page, 0)
-        await capture_current_page()
+        # 首页：目录/续传跳转后 fillText 往往已在 __wr_chars，
+        # 绝不能先 __wr_reset，否则「页面有字、抓取为空」→ 空跟章死循环重开。
+        bootstrap_got = await capture_current_page()
+        if not bootstrap_got:
+            n = await recover_reader_text_after_nav(page, allow_nudge=True)
+            if n and n > 0:
+                bootstrap_got = await capture_current_page()
+            if not bootstrap_got:
+                await force_reader_repaint(page)
+                await wait_stable(page, 0, timeout=2.0)
+                bootstrap_got = await capture_current_page()
+        if bootstrap_got:
+            print(
+                f"    … 首页已抓到正文「{(current_chapter or '')[:24]}」"
+                f"（{sum(1 for b in ch_blocks if b.get('type')=='text')} 行）"
+            )
+        else:
+            print(
+                f"    … 首页暂无正文「{(current_chapter or '')[:24]}」，"
+                f"先不翻页再试一次"
+            )
+            await force_reader_repaint(page)
+            await recover_reader_text_after_nav(page, allow_nudge=True)
+            await capture_current_page()
         while await split_if_next_chapter_started():
             if reached_end:
                 break
+        # 若首页缓冲仍空但顶栏已是紧邻下一章：短章被跳过/双页顶栏超前，
+        # 允许空章前进，避免重开死循环。
+        if not any(
+            b.get("type") == "text" and (b.get("text") or "").strip()
+            for b in (ch_blocks or [])
+        ):
+            header0 = await read_chapter_title(page, catalog_titles)
+            if header0 and should_follow_header_title(
+                    catalog_titles, current_chapter, header0):
+                print(
+                    f"    … 首页空且顶栏已是下一章「{header0[:20]}」，"
+                    f"空章前进（不重开）"
+                )
+                n, _imgs, saved = await commit_chapter(
+                    current_chapter, ch_blocks,
+                    note_suffix=" [空章跳过]", allow_empty=True)
+                if saved:
+                    ch_idx += 1
+                ch_blocks = []
+                current_chapter = resolve_chapter_title(
+                    header0, catalog_titles) or header0
+                page_num = 0
+                reset_page_dedupe()
+                await capture_current_page()
+                while await split_if_next_chapter_started():
+                    if reached_end:
+                        break
 
         while not reached_end:
             # 搜索框/目录开着时方向键不会翻页，且会把字打进搜索
@@ -2219,18 +2284,23 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         pass
                     else:
                         continue
-            await page.evaluate("() => window.__wr_reset()")
-            turn_method = turn_methods[turn_method_idx % len(turn_methods)]
-            # 目录刚关不稳时优先点阅读区中右翻页，减少方向键被目录吞掉
-            if catalog_blocking:
-                turn_method = "click_midright"
-            await turn_reader_page(page, method=turn_method)
-            await asyncio.sleep(SLEEP_READER_PAGE_TURN)
+            if skip_first_turn:
+                # 首页已定位到目标章：先处理当前屏，勿立刻 ArrowRight 翻走
+                skip_first_turn = False
+                turn_method = "hold"
+            else:
+                await page.evaluate("() => window.__wr_reset()")
+                turn_method = turn_methods[turn_method_idx % len(turn_methods)]
+                # 目录刚关不稳时优先点阅读区中右翻页，减少方向键被目录吞掉
+                if catalog_blocking:
+                    turn_method = "click_midright"
+                await turn_reader_page(page, method=turn_method)
+                await asyncio.sleep(SLEEP_READER_PAGE_TURN)
             # 默认短等：诗词页常不二次 fillText，长 timeout 会让日志长时间空白
             stable_count = await wait_stable(page, 0, timeout=2.5)
             if not stable_count or stable_count <= 0:
+                # 只重绘，禁止再 reset（reset 会抹掉迟到的 fillText）
                 await force_reader_repaint(page)
-                await page.evaluate("() => window.__wr_reset()")
                 await asyncio.sleep(max(0.08, float(SLEEP_READER_PAGE_RENDER)))
                 stable_count = await wait_stable(page, 0, timeout=2.0)
 
@@ -2257,21 +2327,54 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     b.get("type") == "text" and (b.get("text") or "").strip()
                     for b in (ch_blocks or [])
                 )
-                # 当前章还没抓到正文，顶栏却已到下一章：目录回跳重抓，禁止空跟章丢篇
+                # 当前章还没抓到正文，顶栏却已到下一章：
+                # 先原地重抓；仍空则空章前进（短诗/双页顶栏常见），禁止立刻重开死循环。
                 if (not had_text) and (not after) and catalog_titles:
-                    # 线性策略：无正文且顶栏已走时，不中途点目录；重开阅读器续传
+                    empty_header_resync += 1
                     print(
                         f"    … 顶栏「{new_chapter[:20]}」超前且「"
                         f"{(current_chapter or '')[:20]}」无正文，"
-                        f"结束会话重开续传（不点目录）"
+                        f"原地重抓（{empty_header_resync}/2）"
                     )
-                    request_reopen = True
-                    break
-                    header_multi_ahead_hits = 0
+                    await force_reader_repaint(page)
+                    await recover_reader_text_after_nav(
+                        page, allow_nudge=empty_header_resync <= 1)
+                    got_retry = await capture_current_page()
+                    before2, after2 = split_blocks_at_chapter_start(
+                        ch_blocks, new_chapter)
+                    if after2:
+                        ch_blocks = before2
+                        after = after2
+                    had_text = any(
+                        b.get("type") == "text" and (b.get("text") or "").strip()
+                        for b in (ch_blocks or [])
+                    )
+                    if (not had_text) and (not after):
+                        if empty_header_resync <= 1 and not got_retry:
+                            # 再给一轮键前捕获机会：不翻页 continue 到 capture 分支不成立
+                            # 直接空章前进到顶栏章，避免卡死
+                            print(
+                                f"    … 仍无正文，空章跳过「"
+                                f"{(current_chapter or '')[:20]}」→「{new_chapter[:20]}」"
+                            )
+                        else:
+                            print(
+                                f"    … 仍无正文，空章跳过「"
+                                f"{(current_chapter or '')[:20]}」→「{new_chapter[:20]}」"
+                            )
+                        # fall through to commit empty + follow header
+                    # 若重抓到了正文，fall through 正常 commit
 
                 is_last = is_last_catalog_chapter(current_chapter, catalog_titles)
-                n, _imgs = await commit_chapter(current_chapter, ch_blocks)
-                if chapter_saved(n, _imgs):
+                # 顶栏已到下一章且当前缓冲仍空：允许写空章占位，避免续传死卡
+                n, _imgs, saved = await commit_chapter(
+                    current_chapter, ch_blocks,
+                    allow_empty=not any(
+                        b.get("type") == "text" and (b.get("text") or "").strip()
+                        for b in (ch_blocks or [])
+                    ),
+                )
+                if saved:
                     ch_idx += 1
                 ch_blocks = after
                 current_chapter = resolve_chapter_title(new_chapter, catalog_titles) or new_chapter
@@ -2378,12 +2481,12 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                                 f"→「{hit_title[:16]}」（不点目录）"
                             )
                             if before:
-                                n, _imgs = await commit_chapter(
+                                n, _imgs, saved = await commit_chapter(
                                     current_chapter,
                                     before,
                                     note_suffix=" [正文越章切分]",
                                 )
-                                if chapter_saved(n, _imgs):
+                                if saved:
                                     ch_idx += 1
                                     await sleep_between_chapters(n)
                             ch_blocks = after
@@ -2445,13 +2548,15 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             # stale>=8：优先判定全书结束；否则结束会话，由外层重开阅读器续传
             if is_last_catalog_chapter(current_chapter, catalog_titles):
                 await commit_chapter(
-                    current_chapter, ch_blocks, note_suffix=" [全书末尾]")
+                    current_chapter, ch_blocks, note_suffix=" [全书末尾]",
+                    allow_empty=True)
                 reached_end = True
                 break
             if not catalog_titles or catalog_index(
                     catalog_titles, current_chapter) is None:
                 await commit_chapter(
-                    current_chapter, ch_blocks, note_suffix=" [无更多新内容]")
+                    current_chapter, ch_blocks, note_suffix=" [无更多新内容]",
+                    allow_empty=True)
                 reached_end = True
                 break
 
@@ -2477,9 +2582,9 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 )
                 ch_blocks = []
             elif ch_blocks:
-                n, _imgs = await commit_chapter(
+                n, _imgs, saved = await commit_chapter(
                     current_chapter, ch_blocks, note_suffix=" [会话中断]")
-                if chapter_saved(n, _imgs):
+                if saved:
                     ch_idx += 1
                 ch_blocks = []
             request_reopen = True
