@@ -1,7 +1,9 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from unittest.mock import AsyncMock, MagicMock
 
 from weread_session import (
     has_cached_login_profile,
@@ -123,6 +125,85 @@ class TestLaunchOptions(unittest.TestCase):
         self.assertNotIn("no_viewport", opts)
 
 
+
+
+class TestEnsureBrowserWindowSize(unittest.IsolatedAsyncioTestCase):
+    async def test_skips_when_already_large_enough(self):
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value={"width": 1900, "height": 1700})
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock()
+
+        out = await weread_session.ensure_browser_window_size(
+            page, {"width": 1920, "height": 1746}
+        )
+        self.assertEqual(out, {"width": 1900, "height": 1700})
+        page.context.new_cdp_session.assert_not_called()
+
+    async def test_resizes_short_window_and_maximizes_if_needed(self):
+        page = MagicMock()
+        # 1) initial short  2) after set bounds still short  3) final after maximize
+        page.evaluate = AsyncMock(
+            side_effect=[
+                {"width": 1024, "height": 496},
+                {"width": 1100, "height": 520},
+                {"width": 1800, "height": 1100},
+            ]
+        )
+        client = MagicMock()
+        client.send = AsyncMock(
+            side_effect=[
+                {"windowId": 7},
+                None,  # set normal bounds
+                None,  # maximize
+            ]
+        )
+        client.detach = AsyncMock()
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock(return_value=client)
+
+        with mock.patch("weread_session.asyncio.sleep", new=AsyncMock()) as sleep:
+            out = await weread_session.ensure_browser_window_size(
+                page, {"width": 1920, "height": 1746}
+            )
+
+        self.assertEqual(out, {"width": 1800, "height": 1100})
+        self.assertTrue(sleep.await_count >= 1)
+        calls = [c.args[0] for c in client.send.await_args_list]
+        self.assertEqual(calls[0], "Browser.getWindowForTarget")
+        self.assertEqual(calls[1], "Browser.setWindowBounds")
+        self.assertEqual(calls[2], "Browser.setWindowBounds")
+        bounds1 = client.send.await_args_list[1].args[1]["bounds"]
+        self.assertEqual(bounds1["windowState"], "normal")
+        self.assertGreaterEqual(bounds1["width"], 1920)
+        self.assertGreaterEqual(bounds1["height"], 1746)
+        bounds2 = client.send.await_args_list[2].args[1]["bounds"]
+        self.assertEqual(bounds2["windowState"], "maximized")
+        client.detach.assert_awaited()
+
+    async def test_set_bounds_only_when_target_reached(self):
+        page = MagicMock()
+        page.evaluate = AsyncMock(
+            side_effect=[
+                {"width": 1024, "height": 496},
+                {"width": 1900, "height": 1700},
+                {"width": 1900, "height": 1700},
+            ]
+        )
+        client = MagicMock()
+        client.send = AsyncMock(side_effect=[{"windowId": 3}, None])
+        client.detach = AsyncMock()
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock(return_value=client)
+
+        with mock.patch("weread_session.asyncio.sleep", new=AsyncMock()):
+            out = await weread_session.ensure_browser_window_size(
+                page, {"width": 1920, "height": 1746}
+            )
+
+        self.assertEqual(out["height"], 1700)
+        self.assertEqual(client.send.await_count, 2)  # getWindow + setBounds only
+        client.detach.assert_awaited()
 
 if __name__ == "__main__":
     unittest.main()

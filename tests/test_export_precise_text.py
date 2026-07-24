@@ -729,6 +729,17 @@ class TestDedupeCharsByPosition(unittest.TestCase):
         out = export_precise.dedupe_chars_by_position(chars)
         self.assertEqual([c["t"] for c in out], ["刚", "落"])
 
+    def test_dedupe_chars_keeps_dual_page_without_cid(self):
+        # 左右页局部坐标相同，仅 cl 不同：不得互删
+        chars = [
+            {"t": "至", "x": 10, "y": 100, "cl": 190},
+            {"t": "异", "x": 28, "y": 100, "cl": 190},
+            {"t": "萧", "x": 10, "y": 100, "cl": 649},
+            {"t": "史", "x": 28, "y": 100, "cl": 649},
+        ]
+        out = export_precise.dedupe_chars_by_position(chars)
+        self.assertEqual([c["t"] for c in out], ["至", "异", "萧", "史"])
+
 
 class TestEndOfBookStaleLimits(unittest.TestCase):
     def test_last_chapter_stale_limit_stricter_than_normal(self):

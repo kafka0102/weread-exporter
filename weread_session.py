@@ -120,6 +120,98 @@ def build_launch_kwargs(
     return launch_kwargs
 
 
+async def ensure_browser_window_size(
+    page,
+    viewport: Optional[dict] = None,
+    *,
+    min_width: int = 1200,
+    min_height: int = 800,
+) -> dict:
+    """有头模式下把浏览器窗口拉到目标尺寸（CDP），避免 profile 恢复成矮窗口。
+
+    矮窗口（如 1024x496）会导致阅读器每页只有几行字，导出极慢且像「每页太少」。
+    优先按目标 viewport 设 outer bounds；仍偏小则 maximize。
+    返回调整后的 innerWidth/innerHeight；失败则返回当前值。
+    """
+    vp = normalized_viewport(viewport)
+    target_w = max(int(min_width), int(vp.get("width") or min_width))
+    target_h = max(int(min_height), int(vp.get("height") or min_height))
+    # outer bounds 含标题栏/边框；略放大以便 inner 更接近目标
+    outer_w = target_w + 16
+    outer_h = target_h + 96
+
+    async def _inner_size() -> dict:
+        try:
+            cur = await page.evaluate(
+                "() => ({width: window.innerWidth || 0, height: window.innerHeight || 0})"
+            )
+            return {
+                "width": int(cur.get("width") or 0),
+                "height": int(cur.get("height") or 0),
+            }
+        except Exception:
+            return {"width": 0, "height": 0}
+
+    sized = await _inner_size()
+    cw, ch = sized["width"], sized["height"]
+    # 已接近目标（且不低于最小可用高度）则不动
+    if (
+        cw >= target_w - 48
+        and ch >= target_h - 48
+        and cw >= min_width - 16
+        and ch >= min_height - 16
+    ):
+        return sized
+
+    client = None
+    try:
+        client = await page.context.new_cdp_session(page)
+        win = await client.send("Browser.getWindowForTarget")
+        window_id = win.get("windowId")
+        if window_id is not None:
+            # 先 normal 再设宽高；最大化在部分环境下 bounds 不可控
+            await client.send(
+                "Browser.setWindowBounds",
+                {
+                    "windowId": window_id,
+                    "bounds": {
+                        "windowState": "normal",
+                        "width": outer_w,
+                        "height": outer_h,
+                    },
+                },
+            )
+            await asyncio.sleep(0.2)
+            after = await _inner_size()
+            still_small = (
+                after["height"] < min_height - 16
+                or after["width"] < min_width - 16
+                or after["height"] < target_h * 0.55
+            )
+            if still_small:
+                await client.send(
+                    "Browser.setWindowBounds",
+                    {
+                        "windowId": window_id,
+                        "bounds": {"windowState": "maximized"},
+                    },
+                )
+                await asyncio.sleep(0.2)
+    except Exception:
+        pass
+    finally:
+        if client is not None:
+            try:
+                await client.detach()
+            except Exception:
+                pass
+
+    out = await _inner_size()
+    if out["width"] or out["height"]:
+        return out
+    return {"width": cw, "height": ch}
+
+
 async def launch_weread_context(
     playwright: Any,
     *,

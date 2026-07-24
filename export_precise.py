@@ -56,6 +56,7 @@ from weread_session import (
     launch_weread_context,
     page_needs_login,
     resolve_headless,
+    ensure_browser_window_size,
 )
 
 DEFAULT_BOOKS_DIR = BOOKS_DIR
@@ -1261,7 +1262,10 @@ def dedupe_chars_by_position(chars):
     """同一 canvas 坐标只保留最后一次 fillText。
 
     force_repaint / 双缓冲重绘时，新旧两帧会叠进 __wr_chars；
-    若 clearRect 钩子未触发，按 (cid,x,y) 去重可去掉交错叠字。
+    若 clearRect 钩子未触发，按 (page_key,x,y) 去重可去掉交错叠字。
+
+    page_key 优先用 canvas 稳定 id(cid)；无 cid 时回退屏幕 left(cl)。
+    双页左右 canvas 的局部 x/y 常重叠，若只用 (0,x,y) 会把左页字误删。
     """
     if not chars:
         return []
@@ -1273,15 +1277,22 @@ def dedupe_chars_by_position(chars):
         except (TypeError, ValueError):
             cid = 0
         try:
+            cl = round(float(c.get("cl") or 0))
+        except (TypeError, ValueError):
+            cl = 0
+        try:
             x = round(float(c.get("x") or 0), 1)
             y = round(float(c.get("y") or 0), 1)
         except (TypeError, ValueError):
             x, y = 0.0, 0.0
+        # cid>0 已能区分页；否则用 cl 区分双页，避免左右同局部坐标互删
+        page_key = ("cid", cid) if cid > 0 else ("cl", cl)
         t = c.get("t") or ""
         # 多字测量串与单字分开键，避免误伤
-        key = (cid, x, y, 1 if len(t) == 1 else 0, t if len(t) != 1 else "")
         if len(t) == 1:
-            key = (cid, x, y, 1, "")
+            key = (page_key, x, y, 1, "")
+        else:
+            key = (page_key, x, y, 0, t)
         if key not in last:
             order.append(key)
         last[key] = c
@@ -2334,7 +2345,27 @@ async def goto_catalog_chapter(page, target_title: str, catalog_titles=None) -> 
             return ""
 
         land_fails = 0
-        for _ in range(60):
+        # 长目录（数百章）按索引先粗定位，再细滚找，避免末章滚不到
+        cat_n = len(catalog_titles or [])
+        cat_i = catalog_index(catalog_titles, target) if catalog_titles else None
+        if cat_i is not None and cat_n > 1:
+            ratio = max(0.0, min(1.0, float(cat_i) / float(cat_n - 1)))
+            try:
+                await page.evaluate(
+                    """(ratio) => {
+                        const sc = document.querySelector(
+                            '.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]'
+                        );
+                        if (!sc) return;
+                        const max = Math.max(0, sc.scrollHeight - sc.clientHeight);
+                        sc.scrollTop = Math.round(max * ratio);
+                    }""",
+                    ratio,
+                )
+                await asyncio.sleep(max(0.05, float(SLEEP_READER_CATALOG_SCROLL) * 0.2))
+            except Exception:
+                pass
+        for _ in range(160):
             # 目录内若误入搜索态，先退回列表
             await dismiss_reader_search(page)
             await blur_reader_inputs(page)
@@ -2448,9 +2479,24 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         page = await ctx.new_page()
         await page.add_init_script(CANVAS_HOOK)
         print("\n  打开阅读器...")
+        # 先按目标尺寸拉窗口，避免 profile 恢复成矮窗导致每页只有几行
+        try:
+            sized = await ensure_browser_window_size(page, viewport)
+            if sized.get("width") and sized.get("height"):
+                print(
+                    f"  🪟 浏览器窗口: {sized['width']}x{sized['height']}"
+                    f"（目标 {viewport['width']}x{viewport['height']}）"
+                )
+        except Exception as e:
+            print(f"  ⚠️  调整浏览器窗口失败: {e}")
         await page.goto(f"https://weread.qq.com/web/reader/{book_id}",
                         wait_until="networkidle", timeout=30000)
         await asyncio.sleep(SLEEP_READER_AFTER_LOAD)
+        # 导航后 profile 可能再次改尺寸，再拉一次
+        try:
+            await ensure_browser_window_size(page, viewport)
+        except Exception:
+            pass
         viewport = await ensure_configured_viewport(page, viewport)
         if headless and await page_needs_login(page):
             await ctx.close()
