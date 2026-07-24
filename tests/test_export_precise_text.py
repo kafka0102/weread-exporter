@@ -671,3 +671,60 @@ class ChapterPageDedupeTests(unittest.TestCase):
         self.assertFalse(
             export_precise.should_skip_chapter_line("全新的一行长正文内容啊", seen)
         )
+
+
+class TestCatalogIndexTopBarCombined(unittest.TestCase):
+    def test_catalog_index_book_title_plus_chapter(self):
+        """顶栏「书名 章名」应解析到目录章。"""
+        catalog = [
+            "晋阳宫史",
+            "李渊来路",
+            "晋阳宫变",
+            "开国大唐",
+            "煌煌太宗业，树立甚宏达——从玄武门之变到贞观之治",
+        ]
+        raw = "三百年长歌行：唐诗中的大唐兴亡与悲欢 开国大唐"
+        self.assertEqual(export_precise.catalog_index(catalog, raw), 3)
+        self.assertEqual(
+            export_precise.resolve_chapter_title(raw, catalog),
+            "开国大唐",
+        )
+
+    def test_classify_reader_paging_mode_vertical_vs_horizontal(self):
+        vertical = {
+            "scrollHeight": 14924,
+            "innerHeight": 760,
+            "canvases": [
+                {"t": -6570, "l": 336, "w": 798, "h": 1973},
+                {"t": -4566, "l": 336, "w": 798, "h": 1958},
+            ],
+        }
+        horizontal = {
+            "scrollHeight": 760,
+            "innerHeight": 760,
+            "canvases": [
+                {"t": 73, "l": 217, "w": 469, "h": 630},
+                {"t": 73, "l": 784, "w": 469, "h": 630},
+            ],
+        }
+        self.assertEqual(
+            export_precise.classify_reader_paging_mode(vertical),
+            "vertical_scroll",
+        )
+        self.assertEqual(
+            export_precise.classify_reader_paging_mode(horizontal),
+            "horizontal",
+        )
+
+
+class TestDedupeCharsByPosition(unittest.TestCase):
+    def test_dedupe_chars_keeps_last_paint(self):
+        chars = [
+            {"t": "导", "x": 10, "y": 20, "cid": 1, "cl": 0, "ct": 0},
+            {"t": "语", "x": 30, "y": 20, "cid": 1, "cl": 0, "ct": 0},
+            # second paint overwrites same positions with other page text
+            {"t": "刚", "x": 10, "y": 20, "cid": 1, "cl": 0, "ct": 0},
+            {"t": "落", "x": 30, "y": 20, "cid": 1, "cl": 0, "ct": 0},
+        ]
+        out = export_precise.dedupe_chars_by_position(chars)
+        self.assertEqual([c["t"] for c in out], ["刚", "落"])

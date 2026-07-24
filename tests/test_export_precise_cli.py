@@ -391,3 +391,67 @@ class TestExportPreciseCli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHorizontalPagingMode(unittest.TestCase):
+    def test_ensure_horizontal_paging_mode_clicks_only_when_vertical(self):
+        async def run():
+            page = mock.AsyncMock()
+            # inspect geometry: first vertical, after click horizontal
+            vertical = {
+                "scrollHeight": 12000,
+                "innerHeight": 800,
+                "scrollY": 9000,
+                "canvases": [{"t": -1000, "l": 300, "w": 800, "h": 2000}],
+            }
+            horizontal = {
+                "scrollHeight": 800,
+                "innerHeight": 800,
+                "scrollY": 0,
+                "canvases": [
+                    {"t": 70, "l": 200, "w": 450, "h": 600},
+                    {"t": 70, "l": 700, "w": 450, "h": 600},
+                ],
+            }
+            page.evaluate = mock.AsyncMock(
+                side_effect=[
+                    vertical,
+                    {"x": 1300, "y": 500},  # mode button box
+                    horizontal,
+                ]
+            )
+            page.mouse = mock.Mock()
+            page.mouse.click = mock.AsyncMock()
+
+            with mock.patch.object(export_precise.asyncio, "sleep", new=mock.AsyncMock()):
+                with mock.patch.object(
+                    export_precise, "force_reader_repaint", new=mock.AsyncMock()
+                ):
+                    mode = await export_precise.ensure_horizontal_paging_mode(page)
+
+            self.assertEqual(mode, "horizontal")
+            page.mouse.click.assert_awaited()
+
+        asyncio.run(run())
+
+    def test_ensure_horizontal_paging_mode_skips_click_when_already_horizontal(self):
+        async def run():
+            page = mock.AsyncMock()
+            horizontal = {
+                "scrollHeight": 800,
+                "innerHeight": 800,
+                "scrollY": 0,
+                "canvases": [
+                    {"t": 70, "l": 200, "w": 450, "h": 600},
+                    {"t": 70, "l": 700, "w": 450, "h": 600},
+                ],
+            }
+            page.evaluate = mock.AsyncMock(return_value=horizontal)
+            page.mouse = mock.Mock()
+            page.mouse.click = mock.AsyncMock()
+
+            mode = await export_precise.ensure_horizontal_paging_mode(page)
+            self.assertEqual(mode, "horizontal")
+            page.mouse.click.assert_not_called()
+
+        asyncio.run(run())

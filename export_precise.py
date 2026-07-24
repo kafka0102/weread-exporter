@@ -378,6 +378,142 @@ async def recover_reader_text_after_nav(page, *, allow_nudge: bool = True) -> in
     return int(count or 0)
 
 
+def classify_reader_paging_mode(geo: dict) -> str:
+    """根据滚动高度与 canvas 几何判断翻页模式。
+
+    - horizontal: 左右翻页/双页（文档几乎不纵向滚动，或 canvas 并排）
+    - vertical_scroll: 上下滚动长文（scrollHeight 明显大于视口，或 canvas 纵向堆叠）
+    - unknown: 信息不足
+    """
+    if not isinstance(geo, dict):
+        return "unknown"
+    try:
+        scroll_h = float(geo.get("scrollHeight") or 0)
+        inner_h = float(geo.get("innerHeight") or 0)
+    except (TypeError, ValueError):
+        scroll_h, inner_h = 0.0, 0.0
+    cans = list(geo.get("canvases") or [])
+    if inner_h > 0 and scroll_h > inner_h * 2.2:
+        return "vertical_scroll"
+    if len(cans) >= 2:
+        try:
+            lefts = sorted(float(c.get("l") or 0) for c in cans)
+            tops = sorted(float(c.get("t") or 0) for c in cans)
+        except (TypeError, ValueError):
+            lefts, tops = [], []
+        if lefts and tops:
+            if lefts[-1] - lefts[0] > 120 and tops[-1] - tops[0] < 120:
+                return "horizontal"
+            if lefts[-1] - lefts[0] < 80 and tops[-1] - tops[0] > 200:
+                return "vertical_scroll"
+    if inner_h > 0 and scroll_h <= inner_h * 1.5:
+        return "horizontal"
+    return "unknown"
+
+
+async def inspect_reader_geometry(page) -> dict:
+    """读取滚动容器与正文 canvas 屏幕几何，供翻页模式判断。"""
+    try:
+        geo = await page.evaluate(
+            """() => {
+                const se = document.scrollingElement || document.documentElement;
+                const cans = Array.from(document.querySelectorAll('canvas'))
+                    .map(c => {
+                        const r = c.getBoundingClientRect();
+                        return {
+                            t: Math.round(r.top),
+                            l: Math.round(r.left),
+                            w: Math.round(r.width),
+                            h: Math.round(r.height),
+                        };
+                    })
+                    .filter(c => c.h > 200 && c.w > 80);
+                return {
+                    scrollHeight: se ? se.scrollHeight : 0,
+                    innerHeight: window.innerHeight || 0,
+                    scrollY: Math.round(window.scrollY || 0),
+                    canvases: cans,
+                };
+            }"""
+        )
+        return geo if isinstance(geo, dict) else {}
+    except Exception:
+        return {}
+
+
+async def ensure_horizontal_paging_mode(page) -> str:
+    """确保阅读器处于左右翻页（非上下长文滚动）。
+
+    上下滚动模式下：
+    - 目录跳转常滚到错误锚点，正文 canvas 落在视口外；
+    - ArrowRight 会在两页之间空转；
+    - fillText 不随 scroll 重绘，抓取大量空页。
+
+    检测到滚动模式时，点击右侧「双栏/普通阅读」切换按钮
+    （button.readerControls_item.isNormalReader）。已是左右模式时绝不点击，
+    避免误切回滚动。
+    返回最终模式：horizontal / vertical_scroll / unknown。
+    """
+    geo = await inspect_reader_geometry(page)
+    mode = classify_reader_paging_mode(geo)
+    if mode == "horizontal":
+        n = len(geo.get("canvases") or [])
+        print(f"  📖 翻页模式: 左右/双页（canvas≈{n}，非长文滚动）")
+        return mode
+    if mode != "vertical_scroll":
+        return mode
+
+    print(
+        "  ⚠️  检测到上下滚动阅读"
+        f"（scrollH={geo.get('scrollHeight')}/{geo.get('innerHeight')}），"
+        "尝试切换到左右翻页…"
+    )
+    try:
+        box = await page.evaluate(
+            """() => {
+                const btn = document.querySelector(
+                    'button.readerControls_item.isNormalReader'
+                );
+                if (!btn) return null;
+                const r = btn.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) {
+                    try { btn.click(); } catch (e) {}
+                    return {js: true};
+                }
+                return {
+                    x: r.x + r.width / 2,
+                    y: r.y + r.height / 2,
+                };
+            }"""
+        )
+    except Exception:
+        box = None
+    if not box:
+        print("  ⚠️  未找到阅读模式切换按钮，继续在滚动模式下抓取（易卡住）")
+        return mode
+    try:
+        if not box.get("js"):
+            await page.mouse.click(float(box["x"]), float(box["y"]))
+    except Exception as e:
+        print(f"  ⚠️  切换翻页模式点击失败: {e}")
+        return mode
+    await asyncio.sleep(max(1.0, float(SLEEP_READER_AFTER_LOAD) * 0.4))
+    try:
+        await force_reader_repaint(page)
+    except Exception:
+        pass
+    geo2 = await inspect_reader_geometry(page)
+    mode2 = classify_reader_paging_mode(geo2)
+    if mode2 == "horizontal":
+        print("  ✅ 已切换为左右翻页模式")
+    else:
+        print(
+            f"  ⚠️  切换后仍为 {mode2}"
+            f"（scrollH={geo2.get('scrollHeight')}/{geo2.get('innerHeight')}）"
+        )
+    return mode2
+
+
 async def count_reader_canvases(page):
     """可见正文 canvas 数量（高度足够的才算阅读页）。"""
     return await page.evaluate(
@@ -458,6 +594,20 @@ CANVAS_HOOK = r"""
 (function() {
     window.__wr_chars = [];
     window.__wr_canvas_seq = window.__wr_canvas_seq || 0;
+    function ensureCid(canvas) {
+        if (!canvas) return 0;
+        if (canvas.__wr_cid == null) {
+            window.__wr_canvas_seq += 1;
+            canvas.__wr_cid = window.__wr_canvas_seq;
+        }
+        return canvas.__wr_cid || 0;
+    }
+    function dropCid(cid) {
+        if (!cid || !window.__wr_chars || !window.__wr_chars.length) return;
+        window.__wr_chars = window.__wr_chars.filter(function(c) {
+            return (c && c.cid) !== cid;
+        });
+    }
     var origFill = CanvasRenderingContext2D.prototype.fillText;
     CanvasRenderingContext2D.prototype.fillText = function(text, x, y) {
         if (text && String(text).trim()) {
@@ -465,11 +615,7 @@ CANVAS_HOOK = r"""
             try {
                 var canvas = this.canvas;
                 if (canvas) {
-                    if (canvas.__wr_cid == null) {
-                        window.__wr_canvas_seq += 1;
-                        canvas.__wr_cid = window.__wr_canvas_seq;
-                    }
-                    cid = canvas.__wr_cid || 0;
+                    cid = ensureCid(canvas);
                     if (canvas.getBoundingClientRect) {
                         var r = canvas.getBoundingClientRect();
                         cl = Math.round(r.left);
@@ -492,6 +638,25 @@ CANVAS_HOOK = r"""
             });
         }
         return origFill.apply(this, arguments);
+    };
+    // 整页重绘前常 clearRect 全画布；丢掉该 canvas 旧字，避免 force_repaint
+    // 叠两次绘制把左右栏/新旧页字符交错拼成乱码。
+    var origClear = CanvasRenderingContext2D.prototype.clearRect;
+    CanvasRenderingContext2D.prototype.clearRect = function(x, y, w, h) {
+        try {
+            var canvas = this.canvas;
+            if (canvas) {
+                var cid = ensureCid(canvas);
+                var cw = canvas.width || 0, ch = canvas.height || 0;
+                var area = Math.abs(Number(w) * Number(h));
+                var full = cw > 0 && ch > 0 && area >= cw * ch * 0.45;
+                // 也覆盖 clearRect(0,0,huge,huge) 而未用 canvas.width 的情况
+                if (full || (Number(x) <= 0 && Number(y) <= 0 && Number(w) >= cw * 0.9 && Number(h) >= ch * 0.9)) {
+                    dropCid(cid);
+                }
+            }
+        } catch (e) {}
+        return origClear.apply(this, arguments);
     };
     window.__wr_reset = function() { window.__wr_chars = []; };
     window.__wr_count = function() { return window.__wr_chars.length; };
@@ -762,6 +927,21 @@ def catalog_index(catalog_titles, title: str):
                     return i
                 if shorter in longer and abs(len(nk) - len(ck)) <= 4 and len(shorter) >= 6:
                     return i
+        # 顶栏常见「书名 + 空格 + 章名」整串：取最长命中的目录项
+        if nk and len(nk) >= 4:
+            best_i, best_len = None, 0
+            for i, c in enumerate(catalog_titles):
+                cn = normalize_catalog_title(c)
+                if not cn:
+                    continue
+                ck = compact_title_key(cn)
+                if not ck or len(ck) < 4:
+                    continue
+                if nk == ck or nk.endswith(ck) or (len(ck) >= 6 and ck in nk):
+                    if len(ck) > best_len:
+                        best_i, best_len = i, len(ck)
+            if best_i is not None:
+                return best_i
     return None
 
 
@@ -1035,6 +1215,37 @@ def infer_title_for_blocks_before(next_title: str, catalog_titles, current_title
     return ""
 
 
+def dedupe_chars_by_position(chars):
+    """同一 canvas 坐标只保留最后一次 fillText。
+
+    force_repaint / 双缓冲重绘时，新旧两帧会叠进 __wr_chars；
+    若 clearRect 钩子未触发，按 (cid,x,y) 去重可去掉交错叠字。
+    """
+    if not chars:
+        return []
+    last = {}
+    order = []
+    for i, c in enumerate(chars):
+        try:
+            cid = int(c.get("cid") or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        try:
+            x = round(float(c.get("x") or 0), 1)
+            y = round(float(c.get("y") or 0), 1)
+        except (TypeError, ValueError):
+            x, y = 0.0, 0.0
+        t = c.get("t") or ""
+        # 多字测量串与单字分开键，避免误伤
+        key = (cid, x, y, 1 if len(t) == 1 else 0, t if len(t) != 1 else "")
+        if len(t) == 1:
+            key = (cid, x, y, 1, "")
+        if key not in last:
+            order.append(key)
+        last[key] = c
+    return [last[k] for k in order]
+
+
 def group_chars_by_canvas(chars):
     """按 canvas 把字符分到各页，从左到右返回。
 
@@ -1153,7 +1364,7 @@ def build_page_blocks(chars, images, canvas_rects, seen_imgs):
     """把一次渲染(可能双页)拆成有序块列表: [{type:'text'/'img', ...}]
        文字行和图片按屏幕 y 交错；左页整页在前，右页在后。"""
     blocks = []
-    pages = split_spread(chars)
+    pages = split_spread(dedupe_chars_by_position(chars))
 
     # 判定左右 canvas
     rects = sorted(canvas_rects, key=lambda r: r["left"])
@@ -1315,9 +1526,24 @@ async def _title(page):
 
     优先顶栏/页信息；最近有头模式改用真实窗口后，单一 class 偶发读空，
     因此多选择器兜底。仍可能为空——调用方需再用目录项兜底。
+
+    注意：关闭态 DOM 里常残留「选中」目录项 class。若盲信该节点，
+    目录点击后会把目标章名当成当前章，造成「跳转成功、正文仍在旧章」。
+    仅当选中项自身可见且可点时才作为兜底。
     """
     return await page.evaluate(
         """() => {
+            const visible = (el, minW=8, minH=8) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') return false;
+                if (parseFloat(st.opacity || '1') < 0.05) return false;
+                if (st.pointerEvents === 'none') return false;
+                const r = el.getBoundingClientRect();
+                return r.width >= minW && r.height >= minH
+                    && r.bottom > 0 && r.top < (window.innerHeight || 0)
+                    && r.right > 0 && r.left < (window.innerWidth || 0);
+            };
             const sels = [
                 '.renderTargetPageInfo_header_chapterTitle',
                 '.readerTopBar_title_chapter',
@@ -1328,14 +1554,19 @@ async def _title(page):
             for (const s of sels) {
                 const el = document.querySelector(s);
                 const t = (el?.textContent || '').trim();
-                if (t) return t;
+                if (t && visible(el, 4, 4)) return t;
+                // 顶栏节点偶发宽高为 0 但仍有文本，仍可采用
+                if (t && el) return t;
             }
-            // 目录仍打开时，取选中项
+            // 仅当目录选中项真正可见时才采用（避免关闭态残留 selected）
             const active = document.querySelector(
                 '.readerCatalog_list_item_selected, .readerCatalog_list_item.selected, .readerCatalog_list_item.isActive, [class*="readerCatalog_list_item"][class*="selected"], [class*="readerCatalog_list_item"][class*="active"]'
             );
-            const at = (active?.textContent || '').trim();
-            return at || '';
+            if (active && visible(active, 40, 12)) {
+                const at = (active.textContent || '').trim();
+                if (at) return at;
+            }
+            return '';
         }"""
     )
 
@@ -1370,32 +1601,47 @@ def reader_chapter_matches(header_title: str, target_title: str, catalog_titles=
 
 
 async def verify_reader_on_chapter(page, target_title: str, catalog_titles=None, *, retries: int = 4) -> bool:
-    """目录点击后确认阅读器是否落到目标章附近。"""
+    """目录点击后确认阅读器是否落到目标章附近。
+
+    成功条件（满足其一）：
+    - 正文出现目标章首/包含目标章名压缩键；
+    - 顶栏对齐目标章（或双页下一章）且已抓到非空正文。
+
+    禁止「仅顶栏对齐、正文为 0」即成功：滚动模式下目录点击会改顶栏/选中项，
+    但 canvas 仍停在旧章或视口外，随后 ArrowRight 会在旧区空转。
+    """
     target = resolve_chapter_title(target_title, catalog_titles or []) or normalize_catalog_title(target_title)
     if not target:
         return False
     tkey = compact_title_key(target)
     for i in range(max(1, int(retries))):
         await asyncio.sleep(max(0.2, float(SLEEP_READER_PAGE_RENDER)))
-        header = await read_chapter_title(page, catalog_titles)
-        if reader_chapter_matches(header, target, catalog_titles):
-            return True
         try:
-            chars = await page.evaluate("() => (window.__wr_chars || []).slice(0, 500)")
+            chars = await page.evaluate("() => (window.__wr_chars || []).slice(0, 800)")
         except Exception:
             chars = []
+        content_hit = False
+        has_body = bool(chars)
         if chars:
-            sample = "".join(str(c.get("t") or "") for c in chars[:400])
+            sample = "".join(str(c.get("t") or "") for c in chars[:500])
             if tkey and tkey in compact_title_key(sample):
-                return True
-            try:
-                rects = await page.evaluate(CANVAS_RECTS_JS)
-            except Exception:
-                rects = []
-            blocks = build_page_blocks(chars, [], rects, set())
-            for b in blocks[:16]:
-                if b.get("type") == "text" and is_chapter_start_text(b.get("text") or "", target):
-                    return True
+                content_hit = True
+            if not content_hit:
+                try:
+                    rects = await page.evaluate(CANVAS_RECTS_JS)
+                except Exception:
+                    rects = []
+                blocks = build_page_blocks(chars, [], rects, set())
+                for b in blocks[:20]:
+                    if b.get("type") == "text" and is_chapter_start_text(
+                            b.get("text") or "", target):
+                        content_hit = True
+                        break
+        if content_hit:
+            return True
+        header = await read_chapter_title(page, catalog_titles)
+        if has_body and reader_chapter_matches(header, target, catalog_titles):
+            return True
         if i + 1 < retries:
             try:
                 await force_reader_repaint(page)
@@ -2168,6 +2414,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             force_single_page = READER_FORCE_SINGLE_PAGE
         viewport = await ensure_reader_layout(
             page, viewport, force_single_page=force_single_page)
+        # 上下滚动会长文空转；优先切到左右翻页再抓取/续传
+        await ensure_horizontal_paging_mode(page)
 
         book_title, book_author = await fetch_book_title(page)
         bootstrap_title = ""
