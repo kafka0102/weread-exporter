@@ -501,6 +501,35 @@ class TestHeaderMultiAheadRecovery(unittest.TestCase):
             export_precise.find_chapter_split(blocks, catalog, "舟中晓望")
         )
 
+
+
+class TestContentOverrunSplit(unittest.TestCase):
+    """线性翻页：下一章缺失但后续章出现时，按正文切开且不依赖目录点击。"""
+
+    def test_overrun_when_next_missing(self):
+        catalog = ["舟中晓望", "春晓", "王维 二十七首", "渭川田家"]
+        blocks = [
+            {"type": "text", "text": "挂席东南望"},
+            {"type": "text", "text": "王维 二十七首"},
+            {"type": "text", "text": "作者简介"},
+        ]
+        hit = export_precise.content_overrun_split(blocks, catalog, "舟中晓望")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "王维 二十七首")
+        self.assertEqual(hit[1][0]["text"], "挂席东南望")
+
+    def test_no_overrun_when_next_present(self):
+        catalog = ["舟中晓望", "春晓", "王维 二十七首", "渭川田家"]
+        blocks = [
+            {"type": "text", "text": "挂席东南望"},
+            {"type": "text", "text": "春晓"},
+            {"type": "text", "text": "春眠不觉晓"},
+            {"type": "text", "text": "王维 二十七首"},
+        ]
+        self.assertIsNone(
+            export_precise.content_overrun_split(blocks, catalog, "舟中晓望")
+        )
+
 if __name__ == "__main__":
     unittest.main()
 

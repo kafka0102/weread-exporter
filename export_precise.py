@@ -477,10 +477,10 @@ MEASURE_RE = re.compile(r'^[a-zA-Z0-9`~!@#$%^&*()\-_=+\[\]{}|;:\',<.>/?\\"\s]+$'
 SENTENCE_END = set("。！？；：」）】》…—")
 # canvas 软折行合并阈值：短于此长度的行（词牌/作者名等）不与邻行粘连
 SOFT_WRAP_MIN_LEN = 16
-# 非末章正文异常膨胀时强制目录跳下一章（诗词集单篇注释通常远小于此）
-RUNAWAY_CHAPTER_LINES = 800
-RUNAWAY_CHAPTER_PAGES = 80
-# 顶栏跨过「下一章」仍持续灌入新正文时，连续确认页数后再目录纠偏
+# 非末章正文异常膨胀：截断/丢弃缓冲并重开会话，不再中途点目录硬跳
+RUNAWAY_CHAPTER_LINES = 600
+RUNAWAY_CHAPTER_PAGES = 50
+# 顶栏跨过「下一章」仍持续灌入新正文时，连续确认后按正文切章（不点目录）
 HEADER_MULTI_AHEAD_CONFIRM = 2
 # 标题前缀后若接这些成分，视为正文提及而非新章起始
 _NOT_CHAPTER_START_REST = re.compile(
@@ -856,6 +856,32 @@ def skipped_next_chapter_evidence(
     if not hit:
         return ""
     return hit[0] or ""
+
+
+def content_overrun_split(blocks, catalog_titles, current_title: str, *, max_ahead: int = 40):
+    """线性翻页策略下的正文越章恢复。
+
+    当紧邻下一章标题未出现，但更后面的目录章首已出现在正文中时，
+    在最早出现的后续章首处切开。返回 (hit_title, before, after)；否则 None。
+
+    注意：这会跳过中间未出现在正文中的目录项（通常是极短诗被 canvas 粘连/翻页越过）。
+    中途绝不为此去点目录；漏章靠重开续传或接受短缺失，避免目录乱跳污染整卷。
+    """
+    if not blocks or not catalog_titles:
+        return None
+    nxt = next_catalog_title(catalog_titles, current_title)
+    if nxt:
+        _b, after_next = split_blocks_at_chapter_start(blocks, nxt)
+        if after_next:
+            # 下一章已在正文：走常规 find_chapter_split
+            return None
+    return find_future_catalog_hit(
+        blocks,
+        catalog_titles,
+        current_title,
+        min_ahead=2 if nxt else 1,
+        max_ahead=max_ahead,
+    )
 
 
 def find_chapter_split(blocks, catalog_titles, current_title: str):
@@ -1900,7 +1926,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     "无头模式下检测到未登录/登录页，已终止。"
                     "请去掉 --headless 扫码登录，或确认 cache/browser_profile 登录态有效后重试。"
                 )
-            return "", "", 0, 0, start_idx, False
+            return "", "", 0, 0, start_idx, False, False
 
         page = await ctx.new_page()
         await page.add_init_script(CANVAS_HOOK)
@@ -1991,6 +2017,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         MAX_EMPTY_HEADER_RESYNC = 1
         # 顶栏跨过多章却仍持续抓到「新正文」时的确认计数（防止双页顶栏闪烁误跳）
         header_multi_ahead_hits = 0
+        # 中途不再依赖目录纠偏；停滞时请求外层重开阅读器续传
+        request_reopen = False
 
         def reset_page_dedupe():
             """换章或目录跳转后清空页级去重状态。"""
@@ -2097,31 +2125,19 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             await asyncio.sleep(wait_s)
 
         async def sync_reader_after_content_split(target_title: str) -> bool:
-            """内容已切章时，确保阅读器也定位到同一目录项。"""
+            """内容已切章时，线性策略不再点目录追赶阅读器。
+
+            继续 ArrowRight/点中右翻页即可；若顶栏长期落后，由正文越章切分
+            或会话重开续传处理，避免中途频繁点菜单把位置点乱。
+            """
             reader_title = await read_chapter_title(page, catalog_titles)
-            if not reader_needs_chapter_sync(
+            if reader_needs_chapter_sync(
                     catalog_titles, target_title, reader_title):
-                return True
-
-            print(
-                f"    … 内容已切到「{target_title[:20]}」，"
-                f"阅读器仍在「{(reader_title or '未知')[:20]}」，目录同步"
-            )
-            jumped = await goto_catalog_chapter(page, target_title)
-            if not jumped:
-                print(f"    ⚠️  内容切章后目录同步失败「{target_title[:20]}」")
-                return False
-
-            reset_page_dedupe()
-            for _ in range(4):
-                await dismiss_reader_search(page)
-                await close_reader_catalog(page)
-                if not await is_reader_catalog_open(page):
-                    break
-                await asyncio.sleep(0.12)
-            await blur_reader_inputs(page)
-            await focus_reader_for_keyboard(page)
-            await recover_reader_text_after_nav(page)
+                print(
+                    f"    … 内容已切到「{target_title[:20]}」，"
+                    f"阅读器仍在「{(reader_title or '未知')[:20]}」，"
+                    f"不点目录，继续线性翻页"
+                )
             return True
 
         async def split_if_next_chapter_started():
@@ -2243,42 +2259,14 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 )
                 # 当前章还没抓到正文，顶栏却已到下一章：目录回跳重抓，禁止空跟章丢篇
                 if (not had_text) and (not after) and catalog_titles:
-                    empty_header_resync += 1
-                    if empty_header_resync <= MAX_EMPTY_HEADER_RESYNC:
-                        print(
-                            f"    … 顶栏「{new_chapter[:20]}」超前且「"
-                            f"{(current_chapter or '')[:20]}」无正文，"
-                            f"目录回跳重抓"
-                            f"（{empty_header_resync}/{MAX_EMPTY_HEADER_RESYNC}）"
-                        )
-                        jumped = await goto_catalog_chapter(page, current_chapter)
-                        for _ in range(4):
-                            await dismiss_reader_search(page)
-                            await close_reader_catalog(page)
-                            if not await is_reader_catalog_open(page):
-                                break
-                            await asyncio.sleep(0.12)
-                        await blur_reader_inputs(page)
-                        await focus_reader_for_keyboard(page)
-                        if jumped:
-                            current_chapter = resolve_chapter_title(
-                                jumped, catalog_titles) or current_chapter
-                        reset_page_dedupe()
-                        # 跳转期间已 fillText：切勿先 reset
-                        await recover_reader_text_after_nav(page)
-                        await capture_current_page()
-                        while await split_if_next_chapter_started():
-                            if reached_end:
-                                break
-                        stale = 0
-                        turn_method_idx = 0
-                        continue
+                    # 线性策略：无正文且顶栏已走时，不中途点目录；重开阅读器续传
                     print(
-                        f"    … 回跳仍无正文，放弃「"
-                        f"{(current_chapter or '')[:20]}」并跟到「"
-                        f"{new_chapter[:20]}」"
+                        f"    … 顶栏「{new_chapter[:20]}」超前且「"
+                        f"{(current_chapter or '')[:20]}」无正文，"
+                        f"结束会话重开续传（不点目录）"
                     )
-                    empty_header_resync = 0
+                    request_reopen = True
+                    break
                     header_multi_ahead_hits = 0
 
                 is_last = is_last_catalog_chapter(current_chapter, catalog_titles)
@@ -2294,22 +2282,9 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 header_multi_ahead_hits = 0
                 if not is_last and chapter_saved(n, _imgs):
                     await sleep_between_chapters(n)
-                # 空缓冲跟章后，目录落到新章，避免浏览器已更超前
-                if not after and catalog_titles:
-                    jumped = await goto_catalog_chapter(page, current_chapter)
-                    for _ in range(4):
-                        await dismiss_reader_search(page)
-                        await close_reader_catalog(page)
-                        if not await is_reader_catalog_open(page):
-                            break
-                        await asyncio.sleep(0.12)
-                    await blur_reader_inputs(page)
-                    await focus_reader_for_keyboard(page)
-                    if jumped:
-                        current_chapter = resolve_chapter_title(
-                            jumped, catalog_titles) or current_chapter
+                # 空缓冲跟章：不点目录追赶，直接抓当前页；若持续空则外层重开
+                if not after:
                     reset_page_dedupe()
-                    await recover_reader_text_after_nav(page)
                 await capture_current_page()
                 # 当前页也可能继续跨到再下一章
                 while await split_if_next_chapter_started():
@@ -2350,8 +2325,6 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 turn_method_idx = 0
                 page_num += 1
                 continue
-            force_catalog_next = False
-            force_catalog_note = " [目录跳转切章]"
             n_lines = sum(
                 1 for b in ch_blocks if b.get("type") == "text"
             )
@@ -2361,204 +2334,156 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 stale = 0
                 turn_method_idx = 0
                 empty_header_resync = 0
-                header_multi_ahead_hits = 0
                 if page_num == 1 or page_num % 2 == 0:
                     print(
                         f"    … 翻页中 p={page_num} 本章约 {n_lines} 行 "
                         f"「{(current_chapter or '')[:24]}」 key={turn_method}"
                     )
 
-                # 关键路径：阅读器已越到更后面的章，但正文仍被灌进当前逻辑章。
-                # 旧逻辑只在「抓空 stale」时目录纠偏；诗词集顶栏跨章后每页仍有新正文，
-                # 会像「舟中晓望」那样上下循环灌到数万行仍不切章。
+                # 线性策略：中途不点目录。顶栏/正文显示已越过当前章时，只按正文切开。
+                recovered = False
                 if (
                     catalog_titles
                     and current_chapter
                     and not is_last_catalog_chapter(current_chapter, catalog_titles)
-                    and next_catalog_title(catalog_titles, current_chapter)
                 ):
                     delta = catalog_index_delta(
                         catalog_titles, current_chapter, new_chapter
                     )
                     if delta is not None and delta > 1:
                         header_multi_ahead_hits += 1
-                        if header_multi_ahead_hits >= HEADER_MULTI_AHEAD_CONFIRM:
-                            force_catalog_next = True
-                            force_catalog_note = " [顶栏越位纠偏]"
-                            print(
-                                f"    … 顶栏越位「{(new_chapter or '')[:20]}」"
-                                f"/逻辑「{(current_chapter or '')[:20]}」"
-                                f"（Δ={delta}），目录回跳下一章纠偏"
-                            )
                     else:
                         header_multi_ahead_hits = 0
 
-                    if not force_catalog_next:
-                        skipped = skipped_next_chapter_evidence(
-                            ch_blocks, catalog_titles, current_chapter
-                        )
-                        if skipped:
-                            force_catalog_next = True
-                            force_catalog_note = " [越过下一章纠偏]"
-                            print(
-                                f"    … 正文已出现后续章「{skipped[:20]}」"
-                                f"但未见下一章，目录回跳纠偏"
+                    need_overrun_check = (
+                        header_multi_ahead_hits >= HEADER_MULTI_AHEAD_CONFIRM
+                        or bool(
+                            skipped_next_chapter_evidence(
+                                ch_blocks, catalog_titles, current_chapter
                             )
+                        )
+                        or n_lines >= RUNAWAY_CHAPTER_LINES
+                        or page_num >= RUNAWAY_CHAPTER_PAGES
+                    )
+                    if need_overrun_check:
+                        while True:
+                            hit = content_overrun_split(
+                                ch_blocks, catalog_titles, current_chapter
+                            )
+                            if not hit:
+                                break
+                            hit_title, before, after = hit
+                            print(
+                                f"    … 正文越章：逻辑「{(current_chapter or '')[:16]}」"
+                                f"→「{hit_title[:16]}」（不点目录）"
+                            )
+                            if before:
+                                n, _imgs = await commit_chapter(
+                                    current_chapter,
+                                    before,
+                                    note_suffix=" [正文越章切分]",
+                                )
+                                if chapter_saved(n, _imgs):
+                                    ch_idx += 1
+                                    await sleep_between_chapters(n)
+                            ch_blocks = after
+                            current_chapter = resolve_chapter_title(
+                                hit_title, catalog_titles
+                            ) or hit_title
+                            page_num = 0
+                            stale = 0
+                            header_multi_ahead_hits = 0
+                            recovered = True
+                            reset_page_dedupe()
+                            if is_last_catalog_chapter(
+                                    current_chapter, catalog_titles):
+                                break
+                        while await split_if_next_chapter_started():
+                            recovered = True
+                            if reached_end:
+                                break
+                        if reached_end:
+                            break
 
+                    # 仍异常膨胀：丢弃脏缓冲，结束会话后重开阅读器续传
+                    n_lines = sum(
+                        1 for b in ch_blocks if b.get("type") == "text"
+                    )
                     if (
-                        not force_catalog_next
+                        not is_last_catalog_chapter(current_chapter, catalog_titles)
                         and (
                             n_lines >= RUNAWAY_CHAPTER_LINES
                             or page_num >= RUNAWAY_CHAPTER_PAGES
                         )
                     ):
-                        force_catalog_next = True
-                        force_catalog_note = " [章节膨胀纠偏]"
                         print(
-                            f"    … 本章异常膨胀 p={page_num} lines={n_lines} "
-                            f"「{(current_chapter or '')[:20]}」，目录回跳下一章"
+                            f"    … 本章仍异常膨胀 p={page_num} lines={n_lines} "
+                            f"「{(current_chapter or '')[:20]}」，"
+                            f"丢弃缓冲并重开阅读器续传（不点目录）"
                         )
-
-                if not force_catalog_next:
-                    continue
-            else:
-                header_multi_ahead_hits = 0
-                stale += 1
-                # 每轮空转都给短心跳，避免「浏览器在翻、终端像卡死」
-                if stale == 1 or stale in (3, 5, 8) or stale % 2 == 0:
-                    print(
-                        f"    … 翻页无新内容 stale={stale}/8 "
-                        f"当前「{(current_chapter or '')[:24]}」 key={turn_method}"
-                    )
-                if stale >= 2:
-                    turn_method_idx += 1
-
-                # 顶栏已明显超前且抓空：提前只跳「下一章」，勿跟远处顶栏
-                if stale >= 2 and catalog_titles and new_chapter:
-                    delta = catalog_index_delta(
-                        catalog_titles, current_chapter, new_chapter
-                    )
-                    if delta is not None and delta > 0:
-                        # 顶栏领先 ≥1 且本页抓空：尽快目录落到 next，少空转
-                        print(
-                            f"    … 顶栏超前「{new_chapter[:20]}」"
-                            f"/逻辑「{(current_chapter or '')[:20]}」，"
-                            f"提前目录跳下一章"
-                        )
-                        force_catalog_next = True
-                        force_catalog_note = " [顶栏超前纠偏]"
-
-                if stale >= 8:
-                    force_catalog_next = True
-                    if force_catalog_note == " [目录跳转切章]":
-                        force_catalog_note = " [目录跳转切章]"
-
-            if force_catalog_next and catalog_titles:
-                nxt = next_catalog_title(catalog_titles, current_chapter)
-                if not nxt:
-                    await commit_chapter(
-                        current_chapter, ch_blocks, note_suffix=" [全书末尾]")
-                    reached_end = True
-                    break
-                if catalog_jump_count >= MAX_CATALOG_JUMPS:
-                    raise RuntimeError(
-                        "目录强制跳转次数过多，疑似无法前进。"
-                        f"当前章「{current_chapter}」，下一章「{nxt}」。"
-                    )
-                # 丢掉已窜入的后续章正文，避免「舟中晓望」吞下王维整卷
-                trimmed, hit_title = trim_blocks_before_future_catalog(
-                    ch_blocks, catalog_titles, current_chapter, min_ahead=1
-                )
-                if hit_title:
-                    ch_blocks = trimmed
-                    print(
-                        f"    … 跳转前截断后续章「{hit_title[:20]}」之后正文"
-                    )
-                # 先确保目录不挡着；再尝试跳转。失败则不推进章名，避免跳章。
-                await close_reader_catalog(page)
-                print(
-                    f"    … 目录跳转 →「{nxt[:32]}」"
-                    f"（{catalog_jump_count + 1}/{MAX_CATALOG_JUMPS}）"
-                    f"{force_catalog_note.strip()}"
-                )
-                jumped = await goto_catalog_chapter(page, nxt)
-                catalog_jump_count += 1
-                if not jumped:
-                    catalog_jump_failures += 1
-                    print(
-                        f"    ⚠️  目录跳转失败（"
-                        f"{catalog_jump_failures}/{MAX_CATALOG_JUMP_FAILURES}），"
-                        f"保持当前「{(current_chapter or '')[:24]}」"
-                    )
-                    await close_reader_catalog(page)
-                    await close_reader_catalog(page)
-                    await dismiss_reader_overlays(page)
-                    await page.keyboard.press("Escape")
-                    # 绝不能 stale=0：否则目录打不开时会永久空转
-                    if catalog_jump_failures >= MAX_CATALOG_JUMP_FAILURES:
-                        await commit_chapter(
-                            current_chapter,
-                            ch_blocks,
-                            note_suffix=" [目录跳转失败]",
-                        )
-                        raise RuntimeError(
-                            "目录跳转连续失败，停止空转以免丢章。"
-                            f"当前章「{current_chapter}」，目标「{nxt}」。"
-                            "可重跑续传；若仍失败请检查登录态与目录是否可打开。"
-                        )
-                    # 略降 stale，再试几轮键/点右缘翻页
-                    stale = 5
-                    turn_method_idx += 1
-                    header_multi_ahead_hits = 0
-                    continue
-                catalog_jump_failures = 0
-                header_multi_ahead_hits = 0
-
-                # 跳转成功才落盘当前章并推进
-                n, _imgs = await commit_chapter(
-                    current_chapter, ch_blocks, note_suffix=force_catalog_note)
-                if chapter_saved(n, _imgs):
-                    ch_idx += 1
-                    await sleep_between_chapters(n)
-                ch_blocks = []
-                reset_page_dedupe()
-                current_chapter = resolve_chapter_title(
-                    jumped, catalog_titles) or jumped
-                stale = 0
-                page_num = 0
-                turn_method_idx = 0
-                # 跳章后面板常仍开着：硬关多轮，避免后续方向键在目录里乱跳回卷首
-                for _ in range(4):
-                    await dismiss_reader_search(page)
-                    await close_reader_catalog(page)
-                    if not await is_reader_catalog_open(page):
+                        ch_blocks = []
+                        reset_page_dedupe()
+                        request_reopen = True
                         break
-                    await asyncio.sleep(0.15)
-                await blur_reader_inputs(page)
-                await focus_reader_for_keyboard(page)
-                await recover_reader_text_after_nav(page)
-                await capture_current_page()
-                while await split_if_next_chapter_started():
-                    if reached_end:
-                        break
+
                 continue
 
-            if stale >= 8:
-                note = ""
-                if is_last_catalog_chapter(current_chapter, catalog_titles):
-                    reached_end = True
-                    note = " [全书末尾]"
-                elif not catalog_titles or catalog_index(
-                        catalog_titles, current_chapter) is None:
-                    reached_end = True
-                    note = " [无更多新内容]"
-                elif page_num >= 20:
-                    reached_end = True
-                    note = " [无更多新内容]"
-                else:
-                    note = " [翻页停滞]"
-                await commit_chapter(current_chapter, ch_blocks, note_suffix=note)
+            # ---- 本页无新内容 ----
+            header_multi_ahead_hits = 0
+            stale += 1
+            if stale == 1 or stale in (3, 5, 8) or stale % 2 == 0:
+                print(
+                    f"    … 翻页无新内容 stale={stale}/8 "
+                    f"当前「{(current_chapter or '')[:24]}」 key={turn_method}"
+                )
+            if stale >= 2:
+                turn_method_idx += 1
+
+            if stale < 8:
+                continue
+
+            # stale>=8：优先判定全书结束；否则结束会话，由外层重开阅读器续传
+            if is_last_catalog_chapter(current_chapter, catalog_titles):
+                await commit_chapter(
+                    current_chapter, ch_blocks, note_suffix=" [全书末尾]")
+                reached_end = True
                 break
+            if not catalog_titles or catalog_index(
+                    catalog_titles, current_chapter) is None:
+                await commit_chapter(
+                    current_chapter, ch_blocks, note_suffix=" [无更多新内容]")
+                reached_end = True
+                break
+
+            delta = catalog_index_delta(
+                catalog_titles, current_chapter, new_chapter
+            )
+            if delta is not None and delta > 0:
+                print(
+                    f"    … 顶栏超前「{(new_chapter or '')[:20]}」"
+                    f"/逻辑「{(current_chapter or '')[:20]}」，"
+                    f"结束本会话并重开阅读器续传（避免中途点目录）"
+                )
+            else:
+                print(
+                    f"    … 翻页停滞「{(current_chapter or '')[:20]}」，"
+                    f"结束本会话并重开阅读器续传"
+                )
+
+            # 膨胀脏数据不落盘，避免污染续传锚点
+            if n_lines >= RUNAWAY_CHAPTER_LINES or page_num >= RUNAWAY_CHAPTER_PAGES:
+                print(
+                    f"    … 停滞时缓冲过大 lines={n_lines} p={page_num}，丢弃不落盘"
+                )
+                ch_blocks = []
+            elif ch_blocks:
+                n, _imgs = await commit_chapter(
+                    current_chapter, ch_blocks, note_suffix=" [会话中断]")
+                if chapter_saved(n, _imgs):
+                    ch_idx += 1
+                ch_blocks = []
+            request_reopen = True
+            break
 
         # reached_end 时把最后一章存下
         if reached_end and ch_blocks:
@@ -2569,7 +2494,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 chapters_this_session += 1
 
         await page.close(); await ctx.close()
-        return book_title, book_author, chapters_this_session, total_chars, ch_idx, reached_end
+        return book_title, book_author, chapters_this_session, total_chars, ch_idx, reached_end, request_reopen
 
 
 def download_all_images(raw_dir, img_dir):
@@ -2661,6 +2586,8 @@ async def export_one_book(
     book_title = shelf_title or ""
     book_author = shelf_author or ""
     session = 0
+    stall_reopen_count = 0
+    MAX_STALL_REOPENS = 6
     while True:
         session += 1
         last_title, last_idx = get_last_chapter_title(md_dir)
@@ -2668,7 +2595,7 @@ async def export_one_book(
         print(f"\n--- 会话 {session} ---")
         print(f"  上次: {last_title or '(无)'}, 编号: {last_idx}")
         goto_first = (session == 1 and last_idx == 0)
-        title, author, added, chars_added, end_idx, reached_end = await run_session(
+        title, author, added, chars_added, end_idx, reached_end, need_reopen = await run_session(
             book_id, md_dir, raw_dir, start_idx, seen_imgs,
             goto_first=goto_first, catalog_path=catalog_path, headless=headless,
             reader_width=reader_width, reader_height=reader_height,
@@ -2681,12 +2608,28 @@ async def export_one_book(
         if reached_end:
             print("\n  ✅ 已到全书最后一章，导出完成。")
             break
+        if need_reopen:
+            stall_reopen_count += 1
+            if stall_reopen_count > MAX_STALL_REOPENS:
+                raise RuntimeError(
+                    f"连续重开阅读器仍无法前进（{stall_reopen_count} 次）：{book_id}。"
+                    "请检查登录态/目录，或删除最近异常章节后重试续传。"
+                )
+            print(
+                f"  会话请求重开续传"
+                f"（{stall_reopen_count}/{MAX_STALL_REOPENS}），"
+                f"{SLEEP_READER_REOPEN} 秒后重新打开电子书..."
+            )
+            await asyncio.sleep(SLEEP_READER_REOPEN)
+            continue
         if added == 0:
             # 若已有章节产物则视为完成（续传场景）
             if any(fn.endswith(".md") for fn in os.listdir(md_dir)):
                 print("\n  无新章节，按已有产物收尾。")
                 break
             raise RuntimeError(f"未能导出任何章节：{book_id}")
+        # 有进度但未到末尾：正常重开会话续传
+        stall_reopen_count = 0
         print(f"  {SLEEP_READER_REOPEN} 秒后自动重开继续...")
         await asyncio.sleep(SLEEP_READER_REOPEN)
 
