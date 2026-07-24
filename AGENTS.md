@@ -74,9 +74,9 @@
 
 | 触发场景 | skill 文件 |
 |----------|-----------|
-| 书架书去重：判断 `data/shelf_books.txt` 的书是否已在 `data/ebook-info.json`，分别落到 `data/dup_books.txt` / `data/new_books.txt` | `.agents/skills/dedupe-shelf-books/SKILL.md`（同 `.claude/skills/dedupe-shelf-books/SKILL.md`） |
+| 书架书去重：判断 `data/shelf_books.txt` 是否已在 `data/ebook-info.json` **或**本地已导出目录（默认 `~/data/weixin/books`，可 `BOOKS_DIR`），分别落到 `data/dup_books.txt` / `data/new_books.txt`；已下载的会从 new 迁到 dup | `.agents/skills/dedupe-shelf-books/SKILL.md`（同 `.claude/skills/dedupe-shelf-books/SKILL.md`） |
 
-当用户说"书架去重 / 找重复书 / 找新书 / 生成 dup_books、new_books"等，读上述 skill 并按其流程执行。
+当用户说"书架去重 / 找重复书 / 找新书 / 生成 dup_books、new_books / 剔除已下载"等，读上述 skill 并按其流程执行。
 
 ## 修改完成后必须自动提交
 
