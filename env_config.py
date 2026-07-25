@@ -411,7 +411,7 @@ SLEEP_READER_STABLE_POLL = env_float("SLEEP_READER_STABLE_POLL", 0.5)
 # 书间 / 章间节奏（批量与导出）
 # 批量导出相邻两本书之间的固定间隔
 SLEEP_BOOK_INTERVAL = env_float("SLEEP_BOOK_INTERVAL", 60.0)
-# 章完成后按字数动态等待：ceil(chars/1000)*PER_1K，再夹到 [MIN, MAX]
-SLEEP_CHAPTER_PER_1K_CHARS = env_float("SLEEP_CHAPTER_PER_1K_CHARS", 1.0)
+# 章完成后按字数动态等待：ceil(chars/2000)*PER_2K，再夹到 [MIN, MAX]
+SLEEP_CHAPTER_PER_2K_CHARS = env_float("SLEEP_CHAPTER_PER_2K_CHARS", 1.0)
 SLEEP_CHAPTER_MIN = env_float("SLEEP_CHAPTER_MIN", 1.0)
-SLEEP_CHAPTER_MAX = env_float("SLEEP_CHAPTER_MAX", 3.0)
+SLEEP_CHAPTER_MAX = env_float("SLEEP_CHAPTER_MAX", 2.0)

@@ -104,13 +104,13 @@ class TestBookJsonHelpers(unittest.TestCase):
     def test_chapter_sleep_seconds_formula(self):
         self.assertEqual(book_json.chapter_sleep_seconds(0), 2.0)
         self.assertEqual(book_json.chapter_sleep_seconds(1), 2.0)
-        self.assertEqual(book_json.chapter_sleep_seconds(1000), 2.0)
-        self.assertEqual(book_json.chapter_sleep_seconds(1001), 4.0)
-        self.assertEqual(book_json.chapter_sleep_seconds(5000), 10.0)
-        self.assertEqual(book_json.chapter_sleep_seconds(20000), 15.0)  # clamp max
+        self.assertEqual(book_json.chapter_sleep_seconds(2000), 2.0)
+        self.assertEqual(book_json.chapter_sleep_seconds(2001), 4.0)
+        self.assertEqual(book_json.chapter_sleep_seconds(5000), 6.0)
+        self.assertEqual(book_json.chapter_sleep_seconds(30000), 15.0)  # clamp max
         self.assertEqual(
-            book_json.chapter_sleep_seconds(3000, per_1k=2.0, min_seconds=2.0, max_seconds=15.0),
-            6.0,
+            book_json.chapter_sleep_seconds(3000, per_2k=2.0, min_seconds=2.0, max_seconds=15.0),
+            4.0,
         )
 
     def test_batch_list_and_filter_pending(self):

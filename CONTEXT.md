@@ -19,7 +19,7 @@
 
 - **兼容 JSON 书稿（book json）**：写出到 `~/data/weixin/books/`（可配 `BOOKS_DIR`）的单本书 JSON，字段对齐 dedao/json 样例（id/title/author/press/publication_date/isbn/word_count/body）。用于后续导入电子书库；与微信读书中间产物 `output/<book_id>/` 分离。
 - **books 目录（books dir）**：默认 `~/data/weixin/books/`（环境变量 `BOOKS_DIR` / CLI `--out-dir` 可覆盖），存放已成功导出的 book json。判断“已导出”时按文件名 `book_id_` 前缀匹配，不依赖书名是否变化。
-- **章间动态 sleep（chapter sleep）**：一章抓取完成后，按该章纯文本字数计算等待秒数：`clamp(ceil(chars/1000)*SLEEP_CHAPTER_PER_1K_CHARS, SLEEP_CHAPTER_MIN, SLEEP_CHAPTER_MAX)`，再开始下一章。
+- **章间动态 sleep（chapter sleep）**：一章抓取完成后，按该章纯文本字数计算等待秒数：`clamp(ceil(chars/2000)*SLEEP_CHAPTER_PER_2K_CHARS, SLEEP_CHAPTER_MIN, SLEEP_CHAPTER_MAX)`，再开始下一章。
 - **书间间隔（book interval）**：批量导出相邻两本书之间的固定等待，配置项 `SLEEP_BOOK_INTERVAL`（默认 60 秒）。
 
 ## 关键决策

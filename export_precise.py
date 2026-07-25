@@ -38,7 +38,7 @@ from env_config import (
     SLEEP_BOOK_INTERVAL,
     SLEEP_CHAPTER_MAX,
     SLEEP_CHAPTER_MIN,
-    SLEEP_CHAPTER_PER_1K_CHARS,
+    SLEEP_CHAPTER_PER_2K_CHARS,
     SLEEP_READER_AFTER_HOOK,
     SLEEP_READER_AFTER_LOAD,
     SLEEP_READER_CATALOG_CLICK,
@@ -2931,7 +2931,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 return
             wait_s = chapter_sleep_seconds(
                 n_chars,
-                per_1k=SLEEP_CHAPTER_PER_1K_CHARS,
+                per_2k=SLEEP_CHAPTER_PER_2K_CHARS,
                 min_seconds=SLEEP_CHAPTER_MIN,
                 max_seconds=SLEEP_CHAPTER_MAX,
             )

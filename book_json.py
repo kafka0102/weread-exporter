@@ -274,15 +274,15 @@ def write_book_json(
 def chapter_sleep_seconds(
     char_count: int,
     *,
-    per_1k: float = 2.0,
+    per_2k: float = 2.0,
     min_seconds: float = 2.0,
     max_seconds: float = 15.0,
 ) -> float:
-    """按章字数计算等待秒数：ceil(chars/1000)*per_1k，夹在 [min,max]。"""
+    """按章字数计算等待秒数：ceil(chars/2000)*per_2k，夹在 [min,max]。"""
     chars = max(0, int(char_count or 0))
-    units = max(1, math.ceil(chars / 1000)) if chars > 0 else 1
+    units = max(1, math.ceil(chars / 2000)) if chars > 0 else 1
     # 即使 0 字也至少 min（调用方在章切换后等待，避免连点）
-    raw = units * float(per_1k)
+    raw = units * float(per_2k)
     if chars == 0:
         raw = float(min_seconds)
     return float(min(max(raw, float(min_seconds)), float(max_seconds)))
