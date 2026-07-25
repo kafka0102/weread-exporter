@@ -758,3 +758,40 @@ class TestEndOfBookStaleLimits(unittest.TestCase):
         self.assertTrue(
             export_precise.is_last_catalog_chapter("唐五代诗概述", cat)
         )
+
+    def test_is_end_matter_title(self):
+        self.assertTrue(export_precise.is_end_matter_title("附录"))
+        self.assertTrue(
+            export_precise.is_end_matter_title(
+                "附录 把韵律安排得更艺术些——论传统诗歌的声调和新诗的格律性问题"
+            )
+        )
+        self.assertTrue(export_precise.is_end_matter_title("后记"))
+        self.assertTrue(export_precise.is_end_matter_title("编后记"))
+        self.assertTrue(export_precise.is_end_matter_title("致谢"))
+        self.assertFalse(export_precise.is_end_matter_title("第十讲 散曲的滋味"))
+        self.assertFalse(export_precise.is_end_matter_title("《高祖还乡》的喜剧性"))
+
+    def test_export_terminal_final_appendix_before_houji(self):
+        """最后的附录后仅剩后记：附录卡住应按书末收尾，不再反复重开。"""
+        cat = [
+            "第十讲 散曲的滋味",
+            "《高祖还乡》的喜剧性",
+            "附录 把韵律安排得更艺术些——论传统诗歌的声调和新诗的格律性问题",
+            "后记",
+        ]
+        appendix = cat[2]
+        self.assertFalse(export_precise.is_last_catalog_chapter(appendix, cat))
+        self.assertTrue(export_precise.is_export_terminal_chapter(appendix, cat))
+        self.assertTrue(export_precise.is_export_terminal_chapter("后记", cat))
+        self.assertFalse(
+            export_precise.is_export_terminal_chapter("《高祖还乡》的喜剧性", cat)
+        )
+
+    def test_export_terminal_not_when_body_follows_appendix(self):
+        """附录后还有正文时，不能当书末提前结束。"""
+        cat = ["正文一", "附录 资料", "第十一讲 续篇", "后记"]
+        self.assertFalse(
+            export_precise.is_export_terminal_chapter("附录 资料", cat)
+        )
+        self.assertTrue(export_precise.is_export_terminal_chapter("后记", cat))
