@@ -795,3 +795,23 @@ class TestEndOfBookStaleLimits(unittest.TestCase):
             export_precise.is_export_terminal_chapter("附录 资料", cat)
         )
         self.assertTrue(export_precise.is_export_terminal_chapter("后记", cat))
+
+    def test_resolve_stale_advance_target_mid_book_short_poem(self):
+        """中间短诗停滞：应前进到下一章，而不是反复重开同一章。"""
+        cat = [
+            "单父东楼秋夜送族弟沈之秦",
+            "送陆判官往琵琶峡",
+            "第二章 谪仙风华",
+            "后记",
+            "附录",
+        ]
+        self.assertEqual(
+            export_precise.resolve_stale_advance_target("送陆判官往琵琶峡", cat),
+            "第二章 谪仙风华",
+        )
+        self.assertIsNone(
+            export_precise.resolve_stale_advance_target("附录", cat)
+        )
+        self.assertIsNone(
+            export_precise.resolve_stale_advance_target("后记", cat)
+        )

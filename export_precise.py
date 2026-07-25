@@ -1044,6 +1044,18 @@ def is_export_terminal_chapter(current_title: str, catalog_titles) -> bool:
     return all(is_end_matter_title(t) for t in rest)
 
 
+def resolve_stale_advance_target(current_title: str, catalog_titles):
+    """翻页停滞时若应前进到下一章，返回目录中的下一章标题。
+
+    文末章返回 None（调用方按全书结束处理）。找不到当前章或没有下一章时也返回 None。
+    """
+    if not catalog_titles or not normalize_catalog_title(current_title or ""):
+        return None
+    if is_export_terminal_chapter(current_title, catalog_titles):
+        return None
+    return next_catalog_title(catalog_titles, current_title)
+
+
 def resolve_chapter_title(raw_title: str, catalog_titles) -> str:
     """把顶栏/目录原始文本规范到目录章名；无法对齐则返回清洗后的原文。"""
     cleaned = normalize_catalog_title(raw_title)
@@ -3389,7 +3401,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if stale < stale_limit:
                 continue
 
-            # stale 达上限：文末附录/末章直接收尾；否则结束会话由外层重开续传
+            # stale 达上限：
+            # 1) 文末章 → 落盘收尾
+            # 2) 中间章 → 落盘已抓内容并目录前进到下一章（避免同章无限重开）
+            # 3) 无法定位 → 落盘后结束
             if is_export_terminal_chapter(current_chapter, catalog_titles):
                 print(
                     f"    … 文末章「{(current_chapter or '')[:20]}」"
@@ -3410,30 +3425,71 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 reached_end = True
                 break
 
-            delta = catalog_index_delta(
-                catalog_titles, current_chapter, new_chapter
+            advance_to = resolve_stale_advance_target(
+                current_chapter, catalog_titles
             )
-            if delta is not None and delta > 0:
-                print(
-                    f"    … 顶栏超前「{(new_chapter or '')[:20]}」"
-                    f"/逻辑「{(current_chapter or '')[:20]}」，"
-                    f"结束本会话并重开阅读器续传（避免中途点目录）"
+            if advance_to:
+                delta = catalog_index_delta(
+                    catalog_titles, current_chapter, new_chapter
                 )
-            else:
-                print(
-                    f"    … 翻页停滞「{(current_chapter or '')[:20]}」，"
-                    f"结束本会话并重开阅读器续传"
+                why = (
+                    f"顶栏超前「{(new_chapter or '')[:16]}」"
+                    if delta is not None and delta > 0
+                    else "翻页无新内容"
                 )
+                print(
+                    f"    … 停滞前进：{why}，「{(current_chapter or '')[:20]}」"
+                    f"→「{advance_to[:20]}」（落盘后目录跳转，避免同章反复重开）"
+                )
+                n, _imgs, saved = await commit_chapter(
+                    current_chapter,
+                    ch_blocks,
+                    note_suffix=" [停滞前进]",
+                    allow_empty=True,
+                )
+                if saved:
+                    ch_idx += 1
+                    if chapter_saved(n, _imgs):
+                        await sleep_between_chapters(n)
+                adopt_chapter_blocks([])
+                landed = await jump_catalog_and_reanchor(
+                    advance_to,
+                    reason="停滞前进到下一章",
+                    clear_buffer=True,
+                )
+                if landed:
+                    current_chapter = landed
+                    page_num = 0
+                    stale = 0
+                    turn_method_idx = 0
+                    empty_page_streak = 0
+                    empty_header_resync = 0
+                    header_multi_ahead_hits = 0
+                    await capture_current_page()
+                    while await split_if_next_chapter_started():
+                        if reached_end:
+                            break
+                    if reached_end:
+                        break
+                    continue
+                # 已落盘：重开后外层会从下一章续传，不会再卡死在同一章
+                print(
+                    f"    … 目录跳到「{advance_to[:20]}」未确认，"
+                    f"结束本会话重开续传（本章已落盘）"
+                )
+                request_reopen = True
+                break
 
-            # 未完成章不落盘：续传锚点停在上一完整章，重开后重新抓本章。
-            # 否则半章落盘会让下一会话跳过本章后半。
-            if ch_blocks:
-                print(
-                    f"    … 未完成章不落盘 lines={n_lines} p={page_num} "
-                    f"「{(current_chapter or '')[:20]}」，重开后重抓"
-                )
+            # 无下一章可前进：按书末处理
+            print(
+                f"    … 翻页停滞且无下一章「{(current_chapter or '')[:20]}」，"
+                f"按全书末尾收尾"
+            )
+            await commit_chapter(
+                current_chapter, ch_blocks, note_suffix=" [全书末尾]",
+                allow_empty=True)
             adopt_chapter_blocks([])
-            request_reopen = True
+            reached_end = True
             break
 
         # reached_end 时若缓冲仍有未 commit 的正文，再落盘一次（避免与上面重复）
