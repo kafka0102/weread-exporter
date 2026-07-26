@@ -2813,14 +2813,17 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             原则：
             - 双页顶栏滞后很常见，不能仅凭顶栏落后就重定位/重开
             - 同一页指纹反复出现才算空转；半页重叠去重不算
-            - 空转时不落盘半成品（否则续传会跳过本章剩余正文）
-            - 只重开会话，让外层从上一完整章后重新定位当前章
+            - 文末章空转：保留缓冲并收尾，避免「抓到了又丢掉」
+            - 中间章空转：不要丢弃缓冲后重开。无新内容时再重开只会卡在同一章
+              （续传锚点未前进 → 连续重开失败）。应交外层「停滞前进」
+              落盘并跳下一章。
+            - 仅当当前章无法在目录定位时，才丢弃缓冲并重开会话
 
             返回 True 表示已处理并应 continue/break 主循环。
             """
             nonlocal current_chapter, ch_idx, page_num, stale, reached_end
             nonlocal page_cycle_hits, header_lag_resync_used, request_reopen
-            nonlocal ch_blocks, turn_method_idx
+            nonlocal ch_blocks, turn_method_idx, header_multi_ahead_hits
 
             header_now = await read_chapter_title(page, catalog_titles)
             delta = catalog_index_delta(catalog_titles, current_chapter, header_now)
@@ -2873,14 +2876,87 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 )
                 reached_end = True
                 return True
+
+            # 顶栏已跨过多章：空转前再试一次扩大窗口的正文越章，尽量切开脏缓冲
+            if (
+                catalog_titles
+                and current_chapter
+                and delta is not None
+                and delta > 1
+                and ch_blocks
+            ):
+                max_ahead = max(40, min(int(delta) + 5, 200))
+                recovered = False
+                while True:
+                    hit = content_overrun_split(
+                        ch_blocks,
+                        catalog_titles,
+                        current_chapter,
+                        max_ahead=max_ahead,
+                    )
+                    if not hit:
+                        break
+                    hit_title, before, after = hit
+                    print(
+                        f"    … 空转正文越章：逻辑「{(current_chapter or '')[:16]}」"
+                        f"→「{hit_title[:16]}」（max_ahead={max_ahead}）"
+                    )
+                    if before:
+                        n, _imgs, saved = await commit_chapter(
+                            current_chapter,
+                            before,
+                            note_suffix=" [空转正文越章]",
+                        )
+                        if saved:
+                            ch_idx += 1
+                            await sleep_between_chapters(n)
+                    adopt_chapter_blocks(after)
+                    current_chapter = resolve_chapter_title(
+                        hit_title, catalog_titles
+                    ) or hit_title
+                    page_num = 0
+                    stale = 0
+                    page_cycle_hits = 0
+                    header_multi_ahead_hits = 0
+                    recovered = True
+                    if is_export_terminal_chapter(
+                            current_chapter, catalog_titles):
+                        reached_end = True
+                        return True
+                    if is_last_catalog_chapter(
+                            current_chapter, catalog_titles):
+                        break
+                while await split_if_next_chapter_started():
+                    recovered = True
+                    if reached_end:
+                        return True
+                if recovered:
+                    return True
+
+            # 中间章空转且目录可定位：交给外层停滞前进（落盘并跳下一章）。
+            # 旧逻辑「丢弃缓冲 + 重开」会让续传锚点停在上一完整章，反复卡死同一章。
+            if (
+                catalog_titles
+                and catalog_index(catalog_titles, current_chapter) is not None
+            ):
+                print(
+                    f"    … 检测到翻页空转 cycle={page_cycle_hits} "
+                    f"p={page_num} lines={n_lines_now} "
+                    f"「{(current_chapter or '')[:20]}」"
+                    f"/顶栏「{(header_now or '')[:16]}」"
+                    f"→ 交由停滞前进落盘并跳下一章（不丢弃重开）"
+                )
+                # 抬高 stale，确保外层立刻走「停滞前进」而不是继续空翻页
+                stale = max(stale, STALE_PAGE_LIMIT)
+                return False
+
             print(
                 f"    … 检测到翻页空转 cycle={page_cycle_hits} "
                 f"p={page_num} lines={n_lines_now} "
                 f"「{(current_chapter or '')[:20]}」"
                 f"/顶栏「{(header_now or '')[:16]}」"
-                f"→ 丢弃未完成缓冲并重开（不落盘半章，避免跳章）"
+                f"→ 丢弃未完成缓冲并重开（目录无法定位）"
             )
-            # 关键：不 commit。落盘半章会让续传以为本章已完成而跳过剩余正文。
             adopt_chapter_blocks([])
             request_reopen = True
             return True
@@ -3267,9 +3343,16 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         or is_soft_runaway_chapter(n_lines, page_num)
                     )
                     if need_overrun_check:
+                        # 顶栏跨章很远时放大搜索窗口，否则默认 40 章够不到文末附录
+                        max_ahead = 40
+                        if delta is not None and delta > 1:
+                            max_ahead = max(40, min(int(delta) + 5, 200))
                         while True:
                             hit = content_overrun_split(
-                                ch_blocks, catalog_titles, current_chapter
+                                ch_blocks,
+                                catalog_titles,
+                                current_chapter,
+                                max_ahead=max_ahead,
                             )
                             if not hit:
                                 break

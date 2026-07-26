@@ -815,3 +815,51 @@ class TestEndOfBookStaleLimits(unittest.TestCase):
         self.assertIsNone(
             export_precise.resolve_stale_advance_target("后记", cat)
         )
+
+class TestFarAheadOverrunAndStaleAdvance(unittest.TestCase):
+    """顶栏跨到文末、逻辑仍停在前言时：扩大越章窗口，并允许停滞前进。"""
+
+    def _long_catalog(self):
+        # 前言后隔很多章才到附录歌曲（复现 唐诗新译初探 结构）
+        mid = [f"第{i}首" for i in range(1, 50)]
+        return ["致谢", "前言", *mid, "附录歌曲"]
+
+    def test_overrun_default_window_misses_far_appendix(self):
+        cat = self._long_catalog()
+        blocks = [
+            {"type": "text", "text": "前言正文很长"},
+            {"type": "text", "text": "附录歌曲"},
+            {"type": "text", "text": "歌词一"},
+        ]
+        self.assertIsNone(
+            export_precise.content_overrun_split(blocks, cat, "前言")
+        )
+
+    def test_overrun_far_ahead_needs_large_max_ahead(self):
+        cat = self._long_catalog()
+        blocks = [
+            {"type": "text", "text": "前言正文很长"},
+            {"type": "text", "text": "附录歌曲"},
+            {"type": "text", "text": "歌词一"},
+        ]
+        hit = export_precise.content_overrun_split(
+            blocks, cat, "前言", max_ahead=80
+        )
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "附录歌曲")
+        self.assertEqual([b["text"] for b in hit[1]], ["前言正文很长"])
+
+    def test_stale_advance_from_preface_not_terminal(self):
+        cat = self._long_catalog()
+        self.assertEqual(
+            export_precise.resolve_stale_advance_target("前言", cat),
+            "第1首",
+        )
+        self.assertFalse(
+            export_precise.is_export_terminal_chapter("前言", cat)
+        )
+        self.assertTrue(
+            export_precise.is_export_terminal_chapter("附录歌曲", cat)
+        )
+        self.assertTrue(export_precise.is_end_matter_title("附录歌曲"))
+
