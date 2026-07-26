@@ -5,5 +5,8 @@ output/
 *.log
 .DS_Store
 
-data/
+# data/ 默认忽略本地清单；forbid 模板入库
+data/*
+!data/forbid_books.txt
 .scratch/
+openspec/changes/**/.onespec.yaml

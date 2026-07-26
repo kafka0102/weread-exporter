@@ -158,6 +158,38 @@ class TestExportPreciseCli(unittest.TestCase):
                 self.assertEqual(sleeps, [])
         asyncio.run(run())
 
+    def test_batch_skips_forbidden_books(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                lst = root / "new_books.txt"
+                lst.write_text("a1,书A,作A\na2,书B,作B\n", encoding="utf-8")
+                out = root / "books"
+                out.mkdir()
+                calls = []
+
+                async def fake_export(book_id, **kwargs):
+                    calls.append(book_id)
+                    return "ok", book_id
+
+                def fake_filter(books, forbid_ids=None, forbid_path=None):
+                    return [b for b in books if b[0] != "a1"], [
+                        b for b in books if b[0] == "a1"
+                    ]
+
+                with mock.patch.object(
+                    export_precise, "export_one_book", side_effect=fake_export
+                ):
+                    with mock.patch.object(
+                        export_precise, "filter_forbidden_books", side_effect=fake_filter
+                    ):
+                        await export_precise.export_batch(
+                            list_path=lst, out_dir=out, force=True, book_interval=0
+                        )
+                self.assertEqual(calls, ["a2"])
+
+        asyncio.run(run())
+
     def test_reader_viewport_helper(self):
         vp = export_precise.reader_viewport()
         self.assertIn("width", vp)

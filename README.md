@@ -52,6 +52,7 @@ python export_precise.py d31323b0813abaf26g0137c2 --out-dir ~/data/weixin/books
 
 # 批量：不传 book_id，读取 data/new_books.txt 中尚未导出的书
 # 书与书默认间隔 60s（SLEEP_BOOK_INTERVAL）；任一本失败则停止
+# data/forbid_books.txt 中的 weread ID 会被跳过（不算失败）
 python export_precise.py
 python export_precise.py --list data/new_books.txt
 
@@ -125,6 +126,7 @@ output/
 
 data/
 ├── shelf_books.txt          # 书架书籍列表（一行一条：ID,书名,作者）
+├── forbid_books.txt         # 禁止下载的 weread ID（每行一个；批量导出跳过，去重记 dup）
 └── new_books.txt            # 去重后的新书清单（批量导出输入）
 
 ~/data/weixin/books/

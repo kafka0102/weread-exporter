@@ -329,3 +329,51 @@ def filter_pending_books(
 ) -> list[tuple[str, str, str]]:
     """剔除 out_dir 中已存在 json 的书。"""
     return [b for b in books if not book_json_exists(out_dir, b[0])]
+
+
+DEFAULT_FORBID_BOOKS = Path("data") / "forbid_books.txt"
+
+
+def load_forbid_book_ids(path: str | Path | None = None) -> set[str]:
+    """读取禁止下载的 weread book_id 集合。
+
+    - 文件不存在 → 空集合
+    - 忽略空行与 ``#`` 注释行
+    - 若行内含逗号，只取第一段作为 ID
+    """
+    list_path = Path(path) if path is not None else DEFAULT_FORBID_BOOKS
+    if not list_path.is_file():
+        return set()
+    ids: set[str] = set()
+    for line in list_path.read_text(encoding="utf-8").splitlines():
+        text = (line or "").strip()
+        if not text or text.startswith("#"):
+            continue
+        book_id = text.split(",", 1)[0].strip()
+        if book_id:
+            ids.add(book_id)
+    return ids
+
+
+def filter_forbidden_books(
+    books: Iterable[tuple[str, str, str]],
+    forbid_ids: Iterable[str] | None = None,
+    *,
+    forbid_path: str | Path | None = None,
+) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
+    """按禁止 ID 拆分：返回 (allowed, forbidden)。
+
+    ``forbid_ids`` 优先；未传则从 ``forbid_path`` / 默认 forbid 文件加载。
+    """
+    if forbid_ids is None:
+        blocked = load_forbid_book_ids(forbid_path)
+    else:
+        blocked = {str(x).strip() for x in forbid_ids if str(x).strip()}
+    allowed: list[tuple[str, str, str]] = []
+    forbidden: list[tuple[str, str, str]] = []
+    for book in books:
+        if book[0] in blocked:
+            forbidden.append(book)
+        else:
+            allowed.append(book)
+    return allowed, forbidden

@@ -132,6 +132,48 @@ class TestBookJsonHelpers(unittest.TestCase):
             pending = book_json.filter_pending_books(books, out)
             self.assertEqual([b[0] for b in pending], ["a2"])
 
+    def test_load_forbid_book_ids(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            missing = root / "nope.txt"
+            self.assertEqual(book_json.load_forbid_book_ids(missing), set())
+
+            forbid = root / "forbid_books.txt"
+            forbid.write_text(
+                "# comment\n"
+                "\n"
+                "id1\n"
+                "id2,书名,作者\n"
+                "  id3  \n"
+                "#id4\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                book_json.load_forbid_book_ids(forbid),
+                {"id1", "id2", "id3"},
+            )
+
+    def test_filter_forbidden_books(self):
+        books = [
+            ("a1", "书A", "作A"),
+            ("a2", "书B", "作B"),
+            ("a3", "书C", "作C"),
+        ]
+        allowed, forbidden = book_json.filter_forbidden_books(
+            books, forbid_ids={"a2", "a9"}
+        )
+        self.assertEqual([b[0] for b in allowed], ["a1", "a3"])
+        self.assertEqual([b[0] for b in forbidden], ["a2"])
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "forbid_books.txt"
+            path.write_text("a1\na3\n", encoding="utf-8")
+            allowed, forbidden = book_json.filter_forbidden_books(
+                books, forbid_path=path
+            )
+            self.assertEqual([b[0] for b in allowed], ["a2"])
+            self.assertEqual([b[0] for b in forbidden], ["a1", "a3"])
+
 
     def test_write_book_json_replaces_old_prefix_file(self):
         with tempfile.TemporaryDirectory() as td:

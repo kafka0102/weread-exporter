@@ -14,7 +14,8 @@
 - **网页操作 sleep（.env）**：所有点击/跳转等待经 `env_config.py` 从 `.env` 读取，清单见 `AGENTS.md`。
 - **页面禁用开发者模式**：weread 网页对**手动 F12** 做了反调试（debugger / 检测 devtools）；不影响 Playwright 的 CDP 级注入与网络监听。
 - **电子书库（ebook-info）**：外部电子书数据 `data/ebook-info.json`，JSON 数组，每条含 `id`（电子书体系整数 id）、`bookName`、`authorName` 等。其 `id` 与 weread `book_id` **不可互通**，比对只能靠书名 + 作者。
-- **去重（dedupe / dup / new）**：把书架书 `data/shelf_books.txt` 与电子书库（书名+作者语义）以及本地已导出目录（默认 `~/data/weixin/books`，按文件名 weread ID 前缀）比对——已下载或库中同一作品且作者至少一人相同判为 `dup`（落 `data/dup_books.txt`），否则 `new`（落 `data/new_books.txt`）。重跑时会把 new 里已下载的书迁到 dup。以 weread book ID 为去重 key，只追加不覆盖（清理 new 时例外）。skill 见 `.claude/skills/dedupe-shelf-books/SKILL.md`。
+- **禁止列表（forbid books）**：`data/forbid_books.txt`，每行一个 weread book ID（可空行/`#` 注释）。命中 ID 的书在书架去重时记为 `dup`（不进 `new_books.txt`）；批量导出 `export_precise.export_batch` 时直接跳过。单本 CLI 显式导出不拦截。文件缺失视为空集合。
+- **去重（dedupe / dup / new）**：把书架书 `data/shelf_books.txt` 与禁止列表、电子书库（书名+作者语义）以及本地已导出目录（默认 `~/data/weixin/books`，按文件名 weread ID 前缀）比对——禁止列表命中、已下载、或库中同一作品且作者至少一人相同判为 `dup`（落 `data/dup_books.txt`），否则 `new`（落 `data/new_books.txt`）。重跑时会把 new 里已下载的书迁到 dup。以 weread book ID 为去重 key，只追加不覆盖（清理 new 时例外）。skill 见 `.claude/skills/dedupe-shelf-books/SKILL.md`。
 
 
 - **兼容 JSON 书稿（book json）**：写出到 `~/data/weixin/books/`（可配 `BOOKS_DIR`）的单本书 JSON，字段对齐 dedao/json 样例（id/title/author/press/publication_date/isbn/word_count/body）。用于后续导入电子书库；与微信读书中间产物 `output/<book_id>/` 分离。

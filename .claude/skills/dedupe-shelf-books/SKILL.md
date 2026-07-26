@@ -1,16 +1,17 @@
 ---
 name: dedupe-shelf-books
-description: 把 data/shelf_books.txt 里的书架书与 data/ebook-info.json 电子书库、以及本地已导出微信电子书（默认 ~/data/weixin/books）比对，判断每本是「已收藏/已下载（dup）」还是「新书（new）」，分别追加到 data/dup_books.txt 与 data/new_books.txt。可重复运行，只处理未处理过的书；并会把 new_books 里已下载完成的书迁到 dup。触发场景：书架去重、找重复书 / 新书、shelf_books vs ebook-info、已下载剔除、生成 dup_books / new_books。
+description: 把 data/shelf_books.txt 里的书架书与 data/ebook-info.json 电子书库、、`data/forbid_books.txt` 禁止列表，以及本地已导出微信电子书（默认 ~/data/weixin/books）比对，判断每本是「已收藏/已下载（dup）」还是「新书（new）」，分别追加到 data/dup_books.txt 与 data/new_books.txt。可重复运行，只处理未处理过的书；并会把 new_books 里已下载完成的书迁到 dup。触发场景：书架去重、找重复书 / 新书、shelf_books vs ebook-info、已下载剔除、生成 dup_books / new_books。
 ---
 
 # Skill: 书架书去重（shelf vs ebook-info + 本地已下载）
 
 判断微信读书**书架书**（`data/shelf_books.txt`）是否：
 
-1. 已存在于**电子书库**（`data/ebook-info.json`），或
-2. 已在本机**导出完成**（默认 `~/data/weixin/books/<book_id>_*.json`），
+1. 在**禁止下载列表**（`data/forbid_books.txt`）中，或
+2. 已存在于**电子书库**（`data/ebook-info.json`），或
+3. 已在本机**导出完成**（默认 `~/data/weixin/books/<book_id>_*.json`），
 
-是则归入 `data/dup_books.txt`（已存在/已下载），否则归入 `data/new_books.txt`（待导出新书）。
+是则归入 `data/dup_books.txt`（已存在/已下载/禁止），否则归入 `data/new_books.txt`（待导出新书）。
 
 与 ebook-info 的匹配靠**你的语义判断**（书名 + 作者），不是死板正则；与本地已下载的匹配靠 **weread book ID**（文件名前缀），精确可靠。
 
@@ -19,6 +20,7 @@ description: 把 data/shelf_books.txt 里的书架书与 data/ebook-info.json �
 | 文件 / 目录 | 角色 | 格式 |
 |------|------|------|
 | `data/shelf_books.txt` | 输入：书架书 | 每行 `ID,书名,作者名`；ID 是 weread bookId；多作者用空格连写，常带 `[宋]`/`【清】` 朝代前缀和 `译注`/`评注` 等角色后缀 |
+| `data/forbid_books.txt` | 输入：禁止下载 ID | 每行一个 weread bookId；空行与 `#` 注释忽略；也可写 `ID,书名,作者`（只取逗号前 ID）。命中 → **dup**，不进 new；批量导出也会跳过 |
 | `data/ebook-info.json` | 输入：电子书库 | JSON **数组**，1333 条左右；每条取 `bookName` 和 `authorName`（其余字段如 `id`/`category` 忽略）。注意其 `id` 是电子书体系的整数 id，**与 weread bookId 不可互通** |
 | `~/data/weixin/books/`（或 `BOOKS_DIR`） | 输入：本地已导出书 | 文件名 `{weread_book_id}_{书名}.json`；**只取 `_` 前的 book_id** 组成 `downloaded_ids`。目录可用环境变量 `BOOKS_DIR` 覆盖，默认 `~/data/weixin/books`（与 `export_precise.py` / `env_config.BOOKS_DIR` 一致） |
 | `data/dup_books.txt` | 输出：已存在或已下载 | 每行 `ID,书名,作者名`；首次运行不存在则创建 |
@@ -30,24 +32,31 @@ description: 把 data/shelf_books.txt 里的书架书与 data/ebook-info.json �
 ## 处理流程
 
 1. **读输入**：把 `data/shelf_books.txt` 每行按逗号拆成三段 `{ID, 书名, 作者名}`（书名、作者名里不会再有逗号）。
-2. **读本地已下载**：扫描 `BOOKS_DIR`（默认 `~/data/weixin/books`）下所有 `*.json`，文件名按**第一个 `_`** 切开，前半段为 weread ID，汇总成 `downloaded_ids`。目录不存在 → 视为空集并在汇报里说明；不要报错中止（仍可继续与 ebook-info 比对）。
-3. **回扫清理 new_books（重要）**：读 `data/new_books.txt`（不存在则跳过）。凡行首 ID ∈ `downloaded_ids` 的行：
+2. **读禁止列表**：加载 `data/forbid_books.txt`（不存在 → 空集）。每行取 weread ID（忽略空行/`#` 注释；含逗号则取首段），汇总成 `forbid_ids`。
+3. **读本地已下载**：扫描 `BOOKS_DIR`（默认 `~/data/weixin/books`）下所有 `*.json`，文件名按**第一个 `_`** 切开，前半段为 weread ID，汇总成 `downloaded_ids`。目录不存在 → 视为空集并在汇报里说明；不要报错中止（仍可继续与 ebook-info 比对）。
+4. **回扫清理 new_books（重要）**：读 `data/new_books.txt`（不存在则跳过）。凡行首 ID ∈ `downloaded_ids` 的行：
    - 若该 ID **不在** `data/dup_books.txt` → **追加**到 `dup_books.txt`（原样行）；
    - 从 `new_books.txt` **删除**这些行（重写文件，保留其余行顺序）。
    - 这样「先标 new、后导出成功」的书会在下次去重时自动剔除，不会继续出现在待导出清单。
-4. **算"已处理集合"**：读（可能已更新的）`data/dup_books.txt` 和 `data/new_books.txt`，取每行**第一个字段**（weread ID），汇总成 `processed_ids`。
-5. **只处理新书**：从书架列表里**剔除** ID ∈ `processed_ids` 的行，剩下的才是本轮 `todo`。若 `todo` 为空 → 直接结束，汇报清理结果（若有）与「没有待处理的书」。
-6. **读电子书库**：加载 `data/ebook-info.json`，每条只用 `bookName` + `authorName`。
-7. **逐本判断**（规则见下）：`todo` 里每本判为 `dup` 或 `new`。
-8. **追加写回**（**只追加、不覆盖**，保留两个输出文件原有内容；第 3 步的清理重写除外）：
+5. **算"已处理集合"**：读（可能已更新的）`data/dup_books.txt` 和 `data/new_books.txt`，取每行**第一个字段**（weread ID），汇总成 `processed_ids`。
+6. **只处理新书**：从书架列表里**剔除** ID ∈ `processed_ids` 的行，剩下的才是本轮 `todo`。若 `todo` 为空 → 直接结束，汇报清理结果（若有）与「没有待处理的书」。
+7. **读电子书库**：加载 `data/ebook-info.json`，每条只用 `bookName` + `authorName`。
+8. **逐本判断**（规则见下）：`todo` 里每本判为 `dup` 或 `new`。
+9. **追加写回**（**只追加、不覆盖**，保留两个输出文件原有内容；第 3 步的清理重写除外）：
    - dup 的行 → 追加到 `data/dup_books.txt`
    - new 的行 → 追加到 `data/new_books.txt`
    - 写出的行格式与输入一致：`ID,书名,作者名`（原样取自该 shelf 行，不改写）。
-9. **汇报**：本地已下载 N 本；本轮从 new 迁到 dup 的 M 本；本轮处理 todo K 本，其中 dup X 本（可再区分「已下载 / 命中 ebook-info」）、new Y 本。
+10. **汇报**：禁止列表 N0 本；本地已下载 N 本；本轮从 new 迁到 dup 的 M 本；本轮处理 todo K 本，其中 dup X 本（可再区分「禁止列表 / 已下载 / 命中 ebook-info」）、new Y 本。
 
 ## 判断规则
 
 对 `todo` 里每本 shelf 书，按以下**优先级**判定（命中即停）：
+
+### 优先级 0 · 禁止列表（按 weread ID）
+
+- 若 shelf 的 `ID` ∈ `forbid_ids` → **dup**（用户标记为不需要下载；不要放入 `new_books.txt`）。
+- 只比 ID，不做书名/作者模糊匹配。
+- 文件缺失或为空 → 本关全部不命中。
 
 ### 优先级 A · 本地已下载（按 weread ID）
 
@@ -77,11 +86,12 @@ description: 把 data/shelf_books.txt 里的书架书与 data/ebook-info.json �
 
 ### 命中汇总
 
-- **A 命中 → dup**（已下载）。
+- **0 命中 → dup**（禁止下载）。
+- **否则 A 命中 → dup**（已下载）。
 - **否则 B 两关都过 → dup**（ebook-info 已有；ebook-info 里**任意一条**命中即可）。
 - **否则 → new**。
 - **拿不准时倾向 new**（仅对 B）：只有较有把握（确属同一作品 + 确有同一作者）才标 dup。漏判 dup 会让你错过想收的书，比多收一本更糟。  
-  对 A 不适用「拿不准」——ID 对得上就是已下载。
+  对 0 / A 不适用「拿不准」——ID 对得上就是禁止或已下载。
 
 ## 工作示例（均为本仓库真实数据）
 
@@ -90,6 +100,12 @@ description: 把 data/shelf_books.txt 里的书架书与 data/ebook-info.json �
 - shelf：`b4432030813abbb04g01095e,阿来讲杜甫成都诗,阿来`
 - `~/data/weixin/books/` 下有：`b4432030813abbb04g01095e_阿来讲杜甫成都诗.json`
 - ID 命中 `downloaded_ids` → **dup**（不必再查 ebook-info）。
+
+### 例 0b · dup（禁止列表）
+
+- shelf：`deadbeef0813abxxxxg012345,某本不想下的书,某人`
+- `data/forbid_books.txt` 含：`deadbeef0813abxxxxg012345`
+- ID 命中 `forbid_ids` → **dup**（不进 new；即使本地未下载、ebook-info 也不匹配）。
 
 ### 例 1 · dup（朝代标记）
 
@@ -130,4 +146,6 @@ description: 把 data/shelf_books.txt 里的书架书与 data/ebook-info.json �
   **要用**本地 books 文件名里的 weread ID 与 shelf ID 比较。
 - **作者/书名两边的字符串都很脏**（ebook-info 路径）：朝代前缀、角色后缀、多种分隔符都可能出现；按"原则"语义处理。
 - 若 `shelf_books.txt` 或 `ebook-info.json` 不存在 → 停下，提示用户先准备数据，不要凭空生成结果。
+- `data/forbid_books.txt` 不存在或为空 → 不中止，视为无禁止 ID。
+
 - 本地 books 目录缺失或为空 → 不中止，仅跳过优先级 A 与第 3 步迁移（并在汇报中写明）。

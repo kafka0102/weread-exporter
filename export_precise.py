@@ -24,6 +24,7 @@ from book_json import (
     book_json_exists,
     build_book_json_from_chapter_mds,
     chapter_sleep_seconds,
+    filter_forbidden_books,
     filter_pending_books,
     iter_batch_book_ids,
     load_chapters_from_export_dir,
@@ -3799,8 +3800,17 @@ async def export_batch(
     if not books:
         print(f"  清单为空或不存在：{list_path}")
         return 0
+    books, forbidden = filter_forbidden_books(books)
+    if forbidden:
+        print(f"  禁止列表跳过 {len(forbidden)} 本：")
+        for book_id, title, author in forbidden:
+            label = f"{title} — {author}".strip(" —")
+            if label:
+                print(f"    - {book_id}  {label}")
+            else:
+                print(f"    - {book_id}")
     pending = books if force else filter_pending_books(books, out_dir)
-    print(f"  清单 {len(books)} 本，待处理 {len(pending)} 本 → {out_dir}")
+    print(f"  清单 {len(books)} 本（已剔除禁止），待处理 {len(pending)} 本 → {out_dir}")
     if not pending:
         print("  没有待导出的书。")
         return 0
