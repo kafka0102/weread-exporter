@@ -772,6 +772,46 @@ class TestEndOfBookStaleLimits(unittest.TestCase):
         self.assertFalse(export_precise.is_end_matter_title("第十讲 散曲的滋味"))
         self.assertFalse(export_precise.is_end_matter_title("《高祖还乡》的喜剧性"))
 
+    def test_non_content_catalog_and_complete_after_back_cover(self):
+        """正文末章后仅剩封底：续传应视为全书完成，不再强跳封底。"""
+        cat = [
+            "论梦窗词气味描写的艺术",
+            "封底",
+        ]
+        last = "论梦窗词气味描写的艺术"
+        self.assertTrue(export_precise.is_non_content_catalog_title("封底"))
+        self.assertTrue(export_precise.is_non_content_catalog_title("版权页"))
+        self.assertTrue(export_precise.is_non_content_catalog_title("封面"))
+        self.assertFalse(
+            export_precise.is_non_content_catalog_title("论梦窗词气味描写的艺术")
+        )
+        self.assertFalse(export_precise.is_last_catalog_chapter(last, cat))
+        self.assertTrue(export_precise.is_export_complete_after(last, cat))
+        self.assertTrue(export_precise.is_export_terminal_chapter(last, cat))
+        self.assertIsNone(
+            export_precise.resolve_stale_advance_target(last, cat)
+        )
+        self.assertEqual(
+            export_precise.catalog_titles_after(cat, last),
+            ["封底"],
+        )
+
+    def test_export_complete_after_only_when_remaining_non_content(self):
+        cat = ["正文一", "正文二", "封底", "版权页"]
+        self.assertFalse(
+            export_precise.is_export_complete_after("正文一", cat)
+        )
+        self.assertTrue(
+            export_precise.is_export_complete_after("正文二", cat)
+        )
+        self.assertTrue(
+            export_precise.is_export_terminal_chapter("正文二", cat)
+        )
+        # 后记后剩封底：后记仍可当文末，正文中段不行
+        cat2 = ["正文", "后记", "封底"]
+        self.assertTrue(export_precise.is_export_terminal_chapter("后记", cat2))
+        self.assertTrue(export_precise.is_export_complete_after("后记", cat2))
+
     def test_export_terminal_final_appendix_before_houji(self):
         """最后的附录后仅剩后记：附录卡住应按书末收尾，不再反复重开。"""
         cat = [

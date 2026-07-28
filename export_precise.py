@@ -1015,6 +1015,13 @@ _END_MATTER_TITLE_RE = re.compile(
     r"致谢|鸣谢|参考文献|参考书目|参考资料|索引|出版后记)"
 )
 
+# 目录里常见的无正文装饰项：通常不可点跳/无抓取价值，仅剩它们时视为全书完成
+_NON_CONTENT_CATALOG_TITLE_RE = re.compile(
+    r"^(封底|封面|扉页|版权页|版权信息|书名页|出版信息|版本说明|"
+    r"空白页|勒口|腰封|插图|彩插|图版|图录|广告页)"
+    r"([：:\s].*)?$"
+)
+
 
 def is_end_matter_title(title: str) -> bool:
     """是否为文末性质章名（附录/后记/跋/致谢等）。"""
@@ -1027,10 +1034,44 @@ def is_end_matter_title(title: str) -> bool:
     return t.startswith("附录")
 
 
+def is_non_content_catalog_title(title: str) -> bool:
+    """是否为封面/封底/版权页等无正文目录项。"""
+    t = normalize_catalog_title(title)
+    if not t:
+        return False
+    return bool(_NON_CONTENT_CATALOG_TITLE_RE.match(t))
+
+
+def catalog_titles_after(catalog_titles, current_title) -> list[str]:
+    """返回 current_title 之后的目录项；找不到当前章时返回 []。"""
+    if not catalog_titles:
+        return []
+    idx = catalog_index(catalog_titles, current_title)
+    if idx is None:
+        return []
+    return list(catalog_titles[idx + 1 :])
+
+
+def is_export_complete_after(last_title: str, catalog_titles) -> bool:
+    """已导出 last_title 后，是否没有更多需要抓取的目录章。
+
+    目录末项算完成；其后仅剩封底/封面/版权页等无正文项也算完成。
+    """
+    if not last_title or not catalog_titles:
+        return False
+    if is_last_catalog_chapter(last_title, catalog_titles):
+        return True
+    rest = catalog_titles_after(catalog_titles, last_title)
+    if not rest:
+        return False
+    return all(is_non_content_catalog_title(t) for t in rest)
+
+
 def is_export_terminal_chapter(current_title: str, catalog_titles) -> bool:
-    """卡住时应按书末收尾的章：目录末项，或仅剩文末附录/后记链。
+    """卡住时应按书末收尾的章：目录末项，或仅剩文末附录/后记链/无正文装饰项。
 
     例：目录 … → 附录… → 后记；在附录上翻页停滞时，不应反复重开丢弃已抓正文。
+    例：正文末章后仅剩「封底」；续传/停滞时不要再强跳封底。
     """
     if is_last_catalog_chapter(current_title, catalog_titles):
         return True
@@ -1039,10 +1080,13 @@ def is_export_terminal_chapter(current_title: str, catalog_titles) -> bool:
     idx = catalog_index(catalog_titles, current_title)
     if idx is None:
         return False
+    rest = catalog_titles[idx + 1 :]
+    # 仅剩封底/封面等：当前正文末章按书末收尾
+    if rest and all(is_non_content_catalog_title(t) for t in rest):
+        return True
     if not is_end_matter_title(current_title):
         return False
-    rest = catalog_titles[idx + 1 :]
-    return all(is_end_matter_title(t) for t in rest)
+    return all(is_end_matter_title(t) or is_non_content_catalog_title(t) for t in rest)
 
 
 def resolve_stale_advance_target(current_title: str, catalog_titles):
@@ -2583,7 +2627,23 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         if (not goto_first) and start_idx > 1 and catalog_titles:
             from_md_title, _ = get_last_chapter_title(md_dir)
             anchor = normalize_catalog_title(from_md_title or "")
+            # 已导出正文末章后仅剩封底等无正文项：直接视为全书完成
+            if anchor and is_export_complete_after(anchor, catalog_titles):
+                rest = catalog_titles_after(catalog_titles, anchor)
+                rest_hint = "、".join((t[:12] for t in rest[:3])) if rest else "目录末"
+                print(
+                    f"  … 上次「{anchor[:24]}」后仅剩非正文目录项"
+                    f"（{rest_hint}），视为全书抓取完成"
+                )
+                await page.close(); await ctx.close()
+                return book_title, book_author, 0, 0, start_idx, True, False
             nxt = next_catalog_title(catalog_titles, anchor) if anchor else None
+            if nxt and is_non_content_catalog_title(nxt):
+                print(
+                    f"  … 下一章「{nxt[:24]}」为无正文目录项，视为全书抓取完成"
+                )
+                await page.close(); await ctx.close()
+                return book_title, book_author, 0, 0, start_idx, True, False
             if nxt:
                 cur_resolved = resolve_chapter_title(
                     current_chapter or "", catalog_titles)
@@ -2607,6 +2667,22 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         current_chapter = resolve_chapter_title(
                             jumped, catalog_titles) or nxt
                     else:
+                        # 目标为封底等无正文项，或已导出章后仅剩无正文项：未落地也算完成
+                        if is_non_content_catalog_title(nxt) or (
+                            anchor and is_export_complete_after(anchor, catalog_titles)
+                        ):
+                            print(
+                                f"  ⚠️  续传跳转「{nxt[:24]}」未落地，"
+                                f"该目标为无正文/书末项，视为全书抓取完成"
+                            )
+                            for _ in range(5):
+                                await close_reader_catalog(page)
+                                if not await is_reader_catalog_open(page):
+                                    break
+                                await page.keyboard.press("Escape")
+                                await asyncio.sleep(0.15)
+                            await page.close(); await ctx.close()
+                            return book_title, book_author, 0, 0, start_idx, True, False
                         # 未落地：不要假装已在目标章（会把附录正文灌进末章）。
                         # 保留阅读器当前章，后续靠正文切章/翻页前进；末章则重开或收尾。
                         print(
@@ -3682,18 +3758,22 @@ async def export_one_book(
         session += 1
         last_title, last_idx = get_last_chapter_title(md_dir)
         start_idx = last_idx + 1 if last_idx > 0 else 1
-        # 已落盘目录最后一章：视为全书完成，禁止再开会话空翻页
+        # 已落盘目录最后一章，或其后仅剩封底等无正文项：视为全书完成
         pre_catalog = load_catalog_titles(catalog_path) if os.path.isfile(catalog_path) else []
-        if (
-            last_title
-            and pre_catalog
-            and is_last_catalog_chapter(last_title, pre_catalog)
-        ):
+        if last_title and pre_catalog and is_export_complete_after(last_title, pre_catalog):
             print(f"\n--- 会话 {session} ---")
-            print(
-                f"  上次已是目录末章「{last_title[:32]}」(编号 {last_idx})，"
-                f"全书导出完成。"
-            )
+            if is_last_catalog_chapter(last_title, pre_catalog):
+                print(
+                    f"  上次已是目录末章「{last_title[:32]}」(编号 {last_idx})，"
+                    f"全书导出完成。"
+                )
+            else:
+                rest = catalog_titles_after(pre_catalog, last_title)
+                rest_hint = "、".join((t[:12] for t in rest[:3])) if rest else ""
+                print(
+                    f"  上次「{last_title[:32]}」(编号 {last_idx}) 后仅剩"
+                    f"非正文目录项（{rest_hint}），全书导出完成。"
+                )
             break
         print(f"\n--- 会话 {session} ---")
         print(f"  上次: {last_title or '(无)'}, 编号: {last_idx}")
@@ -3715,9 +3795,9 @@ async def export_one_book(
             # 重开前再读一次末章：若已是目录最后一项，勿再空转重开
             check_title, _check_idx = get_last_chapter_title(md_dir)
             check_cat = load_catalog_titles(catalog_path) if os.path.isfile(catalog_path) else []
-            if check_title and check_cat and is_last_catalog_chapter(check_title, check_cat):
+            if check_title and check_cat and is_export_complete_after(check_title, check_cat):
                 print(
-                    f"\n  ✅ 已导出目录末章「{check_title[:32]}」，"
+                    f"\n  ✅ 已导出「{check_title[:32]}」且无更多正文目录项，"
                     f"停止重开，全书完成。"
                 )
                 break
