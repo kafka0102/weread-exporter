@@ -82,6 +82,7 @@ class TestEnvConfig(unittest.TestCase):
         self.assertGreaterEqual(env_config.READER_VIEWPORT_WIDTH, 0)
         self.assertGreaterEqual(env_config.READER_VIEWPORT_HEIGHT, 0)
         self.assertFalse(env_config.READER_FORCE_SINGLE_PAGE)
+        self.assertTrue(env_config.READER_PREFER_LARGEST_SCREEN)
         # 代码默认 0=auto；未设置时 env_int 回退由调用方指定
         self.assertEqual(env_config.env_int("READER_VIEWPORT_WIDTH_UNSET_X", 0), 0)
         self.assertEqual(env_config.env_int("READER_VIEWPORT_HEIGHT_UNSET_X", 0), 0)
@@ -104,15 +105,31 @@ class TestEnvConfig(unittest.TestCase):
 
     def test_parse_ns_screens_and_preferred(self):
         raw = (
-            "0,0,1024x666|vis:0,26,1024x583;"
-            "-578,-1080,1920x1080|vis:-578,-1080,1920x1080"
+            "0,0,1024x666|vis:0,26,1024x583|main:1|builtin:1;"
+            "-578,-1080,1920x1080|vis:-578,-1080,1920x1080|main:0|builtin:0"
         )
         screens = env_config._parse_ns_screens(raw)
         self.assertEqual(len(screens), 2)
-        best = max(screens, key=lambda s: s["width"] * s["height"])
+        best = env_config.select_preferred_screen(screens, prefer_largest=True)
+        self.assertIsNotNone(best)
         self.assertEqual((best["width"], best["height"]), (1920, 1080))
         self.assertEqual(best["left"], -578)
         self.assertEqual(best["top"], -1080)
+        laptop = env_config.select_preferred_screen(screens, prefer_largest=False)
+        self.assertIsNotNone(laptop)
+        self.assertEqual((laptop["width"], laptop["height"]), (1024, 666))
+        self.assertEqual(laptop["is_builtin"], 1)
+        self.assertEqual(laptop["is_main"], 1)
+        # 兼容旧输出（无 main/builtin 字段）
+        legacy = env_config._parse_ns_screens(
+            "0,0,1024x666|vis:0,26,1024x583;"
+            "-578,-1080,1920x1080|vis:-578,-1080,1920x1080"
+        )
+        self.assertEqual(len(legacy), 2)
+        self.assertEqual(legacy[0]["is_builtin"], 0)
+        # 无 builtin 标记时 false 回退到面积最小屏
+        smallest = env_config.select_preferred_screen(legacy, prefer_largest=False)
+        self.assertEqual((smallest["width"], smallest["height"]), (1024, 666))
 
     def test_resolve_reader_viewport_applies_max_only_for_auto(self):
         auto = env_config.resolve_reader_viewport(0, 0)
@@ -124,17 +141,30 @@ class TestEnvConfig(unittest.TestCase):
         self.assertEqual(fixed, {"width": 1800, "height": 1200})
 
     def test_preferred_window_bounds_on_largest_screen(self):
-        bounds = env_config.preferred_window_bounds(1600, 1000)
+        bounds = env_config.preferred_window_bounds(1600, 1000, prefer_largest=True)
         self.assertGreaterEqual(bounds["width"], 800)
         self.assertGreaterEqual(bounds["height"], 500)
         screens = env_config.detect_host_screens()
         if len(screens) >= 2:
-            best = max(screens, key=lambda s: s["width"] * s["height"])
+            best = env_config.select_preferred_screen(screens, prefer_largest=True)
             # 窗口应落在最大屏的可视矩形附近（允许居中偏移）
             self.assertGreaterEqual(bounds["left"], best["left"] - 8)
             self.assertLess(bounds["left"], best["left"] + best["width"])
             self.assertGreaterEqual(bounds["top"], best["top"] - 8)
             self.assertLess(bounds["top"], best["top"] + best["height"])
+
+    def test_preferred_window_bounds_on_laptop_screen(self):
+        screens = env_config.detect_host_screens()
+        if len(screens) < 2:
+            self.skipTest("需要至少两块屏幕")
+        target = env_config.select_preferred_screen(screens, prefer_largest=False)
+        bounds = env_config.preferred_window_bounds(
+            1200, 800, prefer_largest=False
+        )
+        self.assertGreaterEqual(bounds["left"], target["left"] - 8)
+        self.assertLess(bounds["left"], target["left"] + target["width"])
+        self.assertGreaterEqual(bounds["top"], target["top"] - 8)
+        self.assertLess(bounds["top"], target["top"] + target["height"])
 
 
 

@@ -94,6 +94,9 @@ BOOKS_DIR = env_path("BOOKS_DIR", DEFAULT_BOOKS_DIR_RAW)
 READER_VIEWPORT_WIDTH = env_int("READER_VIEWPORT_WIDTH", 0)
 READER_VIEWPORT_HEIGHT = env_int("READER_VIEWPORT_HEIGHT", 0)
 READER_FORCE_SINGLE_PAGE = env_bool("READER_FORCE_SINGLE_PAGE", False)
+# 多显示器时是否优先面积最大的屏幕（通常是外接大屏）。
+# true=开在大屏；false=优先笔记本内建屏（builtin），否则主屏，再否则最小屏。
+READER_PREFER_LARGEST_SCREEN = env_bool("READER_PREFER_LARGEST_SCREEN", True)
 
 # 无法探测本机屏幕时的兜底视口
 _FALLBACK_SCREEN_WIDTH = 1200
@@ -115,6 +118,8 @@ def _screen_dict(
     visible_top: int | None = None,
     visible_width: int | None = None,
     visible_height: int | None = None,
+    is_main: int = 0,
+    is_builtin: int = 0,
 ) -> dict[str, int]:
     """规范化单块屏幕几何（逻辑像素，原点在主屏左上，y 向下）。"""
     w = max(0, int(width))
@@ -130,14 +135,16 @@ def _screen_dict(
         "visible_top": int(visible_top if visible_top is not None else top),
         "visible_width": vw if vw >= 800 else w,
         "visible_height": vh if vh >= 500 else h,
+        "is_main": 1 if int(is_main) else 0,
+        "is_builtin": 1 if int(is_builtin) else 0,
     }
 
 
 def _parse_ns_screens(raw: str) -> list[dict[str, int]]:
     """解析 NSScreen 探测脚本输出。
 
-    格式：left,top,widthxheight|vis:vleft,vtop,vwidthxvheight;...
-    坐标已是主屏左上原点、y 向下的 CSS/逻辑像素。
+    格式：left,top,widthxheight|vis:vleft,vtop,vwidthxvheight|main:0|builtin:1;...
+    main/builtin 可缺省（兼容旧输出）。坐标已是主屏左上原点、y 向下的 CSS/逻辑像素。
     """
     screens: list[dict[str, int]] = []
     for part in raw.split(";"):
@@ -145,7 +152,8 @@ def _parse_ns_screens(raw: str) -> list[dict[str, int]]:
         if not part:
             continue
         m = re.match(
-            r"(-?\d+),(-?\d+),(\d+)x(\d+)\|vis:(-?\d+),(-?\d+),(\d+)x(\d+)$",
+            r"(-?\d+),(-?\d+),(\d+)x(\d+)\|vis:(-?\d+),(-?\d+),(\d+)x(\d+)"
+            r"(?:\|main:([01]))?(?:\|builtin:([01]))?$",
             part,
         )
         if not m:
@@ -160,6 +168,8 @@ def _parse_ns_screens(raw: str) -> list[dict[str, int]]:
                 visible_top=int(m.group(6)),
                 visible_width=int(m.group(7)),
                 visible_height=int(m.group(8)),
+                is_main=int(m.group(9) or 0),
+                is_builtin=int(m.group(10) or 0),
             )
         )
     return screens
@@ -167,13 +177,19 @@ def _parse_ns_screens(raw: str) -> list[dict[str, int]]:
 
 _NS_SCREEN_SCRIPT = """
 use framework "AppKit"
+use framework "CoreGraphics"
 use scripting additions
 set arr to current application's NSScreen's screens()
 if (count of arr) is 0 then return ""
+set mainScreen to current application's NSScreen's mainScreen()
 set mainH to 0
 try
-  set mf to current application's NSScreen's mainScreen()'s frame()
+  set mf to mainScreen's frame()
   set mainH to ((item 2 of (item 2 of mf)) as number)
+end try
+set mainID to 0
+try
+  set mainID to ((mainScreen's deviceDescription()'s objectForKey:"NSScreenNumber") as integer)
 end try
 set out to {}
 repeat with s in arr
@@ -193,7 +209,17 @@ repeat with s in arr
   set vw to (item 1 of vsz) as number
   set vh to (item 2 of vsz) as number
   set vTop to mainH - (voy + vh)
-  set entry to ((ox as integer as text) & "," & (topY as integer as text) & "," & (w as integer as text) & "x" & (h as integer as text) & "|vis:" & (vox as integer as text) & "," & (vTop as integer as text) & "," & (vw as integer as text) & "x" & (vh as integer as text))
+  set displayID to 0
+  try
+    set displayID to ((s's deviceDescription()'s objectForKey:"NSScreenNumber") as integer)
+  end try
+  set isMain to 0
+  if displayID is not 0 and displayID = mainID then set isMain to 1
+  set isBuiltin to 0
+  try
+    if (current application's CGDisplayIsBuiltin(displayID) as integer) is 1 then set isBuiltin to 1
+  end try
+  set entry to ((ox as integer as text) & "," & (topY as integer as text) & "," & (w as integer as text) & "x" & (h as integer as text) & "|vis:" & (vox as integer as text) & "," & (vTop as integer as text) & "," & (vw as integer as text) & "x" & (vh as integer as text) & "|main:" & (isMain as text) & "|builtin:" & (isBuiltin as text))
   set end of out to entry
 end repeat
 set AppleScript's text item delimiters to ";"
@@ -278,28 +304,69 @@ def detect_host_screens(*, force_refresh: bool = False) -> list[dict[str, int]]:
     return [dict(s) for s in screens]
 
 
-def preferred_host_screen() -> dict[str, int] | None:
-    """返回面积最大的单块屏幕；无探测结果时 None。"""
-    screens = detect_host_screens()
-    if not screens:
-        return None
-    return max(
-        screens,
-        key=lambda s: (
-            int(s.get("visible_width") or s["width"])
-            * int(s.get("visible_height") or s["height"]),
-            int(s["width"]) * int(s["height"]),
-        ),
+def _screen_area_key(screen: dict[str, int]) -> tuple[int, int]:
+    """屏幕排序键：可视面积优先，其次整屏面积。"""
+    return (
+        int(screen.get("visible_width") or screen["width"])
+        * int(screen.get("visible_height") or screen["height"]),
+        int(screen["width"]) * int(screen["height"]),
     )
 
 
-def detect_host_screen_size() -> tuple[int, int]:
+def select_preferred_screen(
+    screens: list[dict[str, int]],
+    *,
+    prefer_largest: bool | None = None,
+) -> dict[str, int] | None:
+    """从探测到的屏幕列表中选出目标屏。
+
+    prefer_largest=True（默认）：面积最大的单屏（通常是外接大屏）。
+    prefer_largest=False：优先内建屏（笔记本），否则主屏，再否则面积最小屏。
+    """
+    if not screens:
+        return None
+    use_largest = (
+        READER_PREFER_LARGEST_SCREEN if prefer_largest is None else bool(prefer_largest)
+    )
+    if use_largest:
+        return max(screens, key=_screen_area_key)
+
+    builtins = [s for s in screens if int(s.get("is_builtin") or 0)]
+    if builtins:
+        # 多块内建极少见；取其中面积最大者更稳妥
+        return max(builtins, key=_screen_area_key)
+
+    mains = [s for s in screens if int(s.get("is_main") or 0)]
+    if mains:
+        return max(mains, key=_screen_area_key)
+
+    return min(screens, key=_screen_area_key)
+
+
+def preferred_host_screen(
+    *,
+    prefer_largest: bool | None = None,
+) -> dict[str, int] | None:
+    """返回当前配置下的目标单块屏幕；无探测结果时 None。
+
+    受 READER_PREFER_LARGEST_SCREEN 控制：默认最大屏，false 时优先笔记本内建屏。
+    """
+    return select_preferred_screen(
+        detect_host_screens(),
+        prefer_largest=prefer_largest,
+    )
+
+
+def detect_host_screen_size(
+    *,
+    prefer_largest: bool | None = None,
+) -> tuple[int, int]:
     """探测本机用于阅读器的目标屏幕可用逻辑像素 (width, height)。
 
-    多显示器时取「面积最大的单块屏幕」可视区域，而不是虚拟桌面并集。
-    失败时回退 1200x900。
+    多显示器时按 READER_PREFER_LARGEST_SCREEN 选择目标单屏可视区域，
+    而不是虚拟桌面并集。失败时回退 1200x900。
     """
-    best = preferred_host_screen()
+    best = preferred_host_screen(prefer_largest=prefer_largest)
     if best is not None:
         w = int(best.get("visible_width") or best["width"])
         h = int(best.get("visible_height") or best["height"])
@@ -314,15 +381,17 @@ def preferred_window_bounds(
     *,
     chrome_w: int = 16,
     chrome_h: int = 96,
+    prefer_largest: bool | None = None,
 ) -> dict[str, int]:
-    """为浏览器窗口计算 outer bounds（尽量落在最大单屏可视区内）。
+    """为浏览器窗口计算 outer bounds（尽量落在目标单屏可视区内）。
 
     返回 left/top/width/height，可供 CDP Browser.setWindowBounds 使用。
+    目标屏由 READER_PREFER_LARGEST_SCREEN 决定（默认最大屏）。
     """
-    vp = resolve_reader_viewport(width, height)
+    vp = resolve_reader_viewport(width, height, prefer_largest=prefer_largest)
     outer_w = max(360, int(vp["width"]) + int(chrome_w))
     outer_h = max(480, int(vp["height"]) + int(chrome_h))
-    screen = preferred_host_screen()
+    screen = preferred_host_screen(prefer_largest=prefer_largest)
     if screen is None:
         return {"left": 0, "top": 0, "width": outer_w, "height": outer_h}
 
@@ -350,10 +419,13 @@ def preferred_window_bounds(
 def resolve_reader_viewport(
     width: int | None = None,
     height: int | None = None,
+    *,
+    prefer_largest: bool | None = None,
 ) -> dict[str, int]:
-    """解析阅读器视口；宽/高为 0/None 时自动匹配最大单屏。
+    """解析阅读器视口；宽/高为 0/None 时自动匹配目标单屏。
 
     显式传入正整数优先生效；模块配置 0 表示 auto。
+    目标屏由 READER_PREFER_LARGEST_SCREEN 决定（默认最大屏）。
     auto 时会再按 READER_VIEWPORT_MAX_* 做上限裁剪（默认 1600x1000），
     让外接大屏上的微信读书窗口够大但不至于整屏铺满。
     """
@@ -362,7 +434,7 @@ def resolve_reader_viewport(
     auto_w = w <= 0
     auto_h = h <= 0
     if auto_w or auto_h:
-        sw, sh = detect_host_screen_size()
+        sw, sh = detect_host_screen_size(prefer_largest=prefer_largest)
         if auto_w:
             w = sw
         if auto_h:

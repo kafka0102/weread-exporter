@@ -52,13 +52,14 @@
 
 | 变量 | 默认 | 使用位置 | 含义 |
 |------|------|----------|------|
-| `READER_VIEWPORT_WIDTH` | **0（自动）** | `export_precise.py` | 阅读器视口宽；`0`=匹配最大单屏宽度 |
-| `READER_VIEWPORT_HEIGHT` | **0（自动）** | `export_precise.py` | 阅读器视口高；`0`=匹配最大单屏高度 |
+| `READER_VIEWPORT_WIDTH` | **0（自动）** | `export_precise.py` | 阅读器视口宽；`0`=匹配目标单屏宽度 |
+| `READER_VIEWPORT_HEIGHT` | **0（自动）** | `export_precise.py` | 阅读器视口高；`0`=匹配目标单屏高度 |
 | `READER_VIEWPORT_MAX_WIDTH` | **1600** | `export_precise.py` | 自动宽度上限；`0`=不限制；显式宽高不受限 |
 | `READER_VIEWPORT_MAX_HEIGHT` | **1000** | `export_precise.py` | 自动高度上限；`0`=不限制；显式宽高不受限 |
 | `READER_FORCE_SINGLE_PAGE` | 0 | `export_precise.py` | 检测到双页时是否自动收窄视口强制单页 |
+| `READER_PREFER_LARGEST_SCREEN` | **1（true）** | `export_precise.py` | 多显示器时是否优先外接大屏；`0`=优先笔记本内建屏 |
 
-默认自动匹配本机**面积最大的单块屏幕**可用逻辑像素（macOS 用 `NSScreen.screens`，多显示器时优先外接大屏，而不是虚拟桌面并集）。有头模式还会把窗口 `left/top` 移到该屏，避免卡在分辨率被压低的笔记本屏上。自动尺寸再按 `READER_VIEWPORT_MAX_*` 裁剪（默认 1600×1000），让微信读书窗口够大但不至于整屏铺满。也可写死正整数（如 `1440`）或 CLI `--reader-width` / `--reader-height` 覆盖。若检测到 ≥2 个正文 canvas，按 canvas 位置拆页抓取。只有 `READER_FORCE_SINGLE_PAGE=1` 或 CLI `--force-single-page` 时，才会逐步把宽度收到 720/640/560/480 并刷新；**若仍为双页，必须恢复原始宽视口**，避免窄 CSS 视口留在宽窗口中造成「左侧一条、右侧大片空白」。
+默认自动匹配本机**目标单块屏幕**可用逻辑像素（macOS 用 `NSScreen.screens`，而不是虚拟桌面并集）。`READER_PREFER_LARGEST_SCREEN=1`（默认）时优先面积最大的外接大屏；设为 `0`/`false` 时优先笔记本内建屏（`CGDisplayIsBuiltin`），找不到内建屏则回退主屏，再回退面积最小屏。有头模式还会把窗口 `left/top` 移到该目标屏。自动尺寸再按 `READER_VIEWPORT_MAX_*` 裁剪（默认 1600×1000），让微信读书窗口够大但不至于整屏铺满。也可写死正整数（如 `1440`）或 CLI `--reader-width` / `--reader-height` 覆盖。若检测到 ≥2 个正文 canvas，按 canvas 位置拆页抓取。只有 `READER_FORCE_SINGLE_PAGE=1` 或 CLI `--force-single-page` 时，才会逐步把宽度收到 720/640/560/480 并刷新；**若仍为双页，必须恢复原始宽视口**，避免窄 CSS 视口留在宽窗口中造成「左侧一条、右侧大片空白」。
 
 ### 实现入口
 
