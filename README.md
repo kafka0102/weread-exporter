@@ -8,7 +8,7 @@
 
 1. **Playwright 自动化** — 启动 Chromium，持久化登录会话（扫码一次，后续自动复用）
 2. **Canvas fillText Hook** — 注入钩子拦截所有 `CanvasRenderingContext2D.fillText()` 调用，捕获每个字符的 (x, y) 坐标
-3. **全宽桌面排版优先** — 阅读器默认自动匹配目标单屏宽度（`READER_VIEWPORT_WIDTH=0`，再受 `READER_VIEWPORT_MAX_*=1600x1000` 限制）打开；多显示器默认优先外接大屏（`READER_PREFER_LARGEST_SCREEN=1`，设为 `0` 则开在笔记本内建屏）；如需旧版单页策略，可开启 `READER_FORCE_SINGLE_PAGE=1` 或使用 `--force-single-page`（失败会自动恢复宽视口）
+3. **全宽桌面排版优先** — 阅读器默认自动匹配目标单屏宽度（`READER_VIEWPORT_WIDTH=0`，再受 `READER_VIEWPORT_MAX_*=1600x1000` 限制）打开；多显示器时**必须**用 CLI 指定目标屏：`--prefer-largest-screen`（外接大屏）或 `--no-prefer-largest-screen`（笔记本内建屏）；如需旧版单页策略，可开启 `READER_FORCE_SINGLE_PAGE=1` 或使用 `--force-single-page`（失败会自动恢复宽视口）
 4. **Canvas 按页归组** — `fillText` 坐标是 canvas 局部坐标；若仍出现多 canvas，按屏幕 left 拆页后再分行，防止左右页同 y 交错乱码
 5. **视口图片捕获** — 每页只取当前视口内可见的 `img[class*="wr_readerImage"]`（用 `getBoundingClientRect` 过滤掉预加载的下一页/下一章图片），解决图片归属偏移
 6. **图文交错** — 把文字行和图片按屏幕 y 坐标排序，图片精确落在对应段落之间、正确章节里
@@ -31,38 +31,40 @@ playwright install chromium
 
 ```bash
 # 单本：传入 reader URL（推荐）或 book_id
-python export_precise.py https://weread.qq.com/web/reader/d31323b0813abaf26g0137c2
-python export_precise.py d31323b0813abaf26g0137c2
+# 多显示器目标屏必须显式指定：--prefer-largest-screen 或 --no-prefer-largest-screen
+python export_precise.py https://weread.qq.com/web/reader/d31323b0813abaf26g0137c2 --prefer-largest-screen
+python export_precise.py d31323b0813abaf26g0137c2 --prefer-largest-screen
 
 # 单本强制重导（默认若 ~/data/weixin/books 已有同 id 的 json 则跳过）
-python export_precise.py d31323b0813abaf26g0137c2 --force
+python export_precise.py d31323b0813abaf26g0137c2 --force --prefer-largest-screen
 
-# 临时调整阅读器视口；默认 0=自动匹配目标单屏（.env READER_VIEWPORT_WIDTH/HEIGHT，受 MAX 上限；大屏/笔记本屏见 READER_PREFER_LARGEST_SCREEN）
-python export_precise.py d31323b0813abaf26g0137c2 --reader-width 0 --reader-height 0
-python export_precise.py d31323b0813abaf26g0137c2 --reader-width 1470 --reader-height 900
+# 临时调整阅读器视口；默认 0=自动匹配目标单屏（.env READER_VIEWPORT_WIDTH/HEIGHT，受 MAX 上限）
+# 目标屏用 --prefer-largest-screen（外接大屏）/ --no-prefer-largest-screen（笔记本内建屏）
+python export_precise.py d31323b0813abaf26g0137c2 --reader-width 0 --reader-height 0 --prefer-largest-screen
+python export_precise.py d31323b0813abaf26g0137c2 --reader-width 1470 --reader-height 900 --no-prefer-largest-screen
 
 # 需要强制单页时才收窄视口（失败会恢复宽视口；也可 .env READER_FORCE_SINGLE_PAGE=1）
-python export_precise.py d31323b0813abaf26g0137c2 --force-single-page
+python export_precise.py d31323b0813abaf26g0137c2 --force-single-page --prefer-largest-screen
 
 # 需要插图时再下载（默认不下载图片）
-python export_precise.py d31323b0813abaf26g0137c2 --download-images
+python export_precise.py d31323b0813abaf26g0137c2 --download-images --prefer-largest-screen
 
 # 指定 JSON 输出目录（默认 ~/data/weixin/books，可用 BOOKS_DIR 或 --out-dir 覆盖）
-python export_precise.py d31323b0813abaf26g0137c2 --out-dir ~/data/weixin/books
+python export_precise.py d31323b0813abaf26g0137c2 --out-dir ~/data/weixin/books --prefer-largest-screen
 
 # 批量：不传 book_id，读取 data/new_books.txt 中尚未导出的书
 # 书与书默认间隔 60s（SLEEP_BOOK_INTERVAL）；任一本失败则停止
 # data/forbid_books.txt 中的 weread ID 会被跳过（不算失败）
-python export_precise.py
-python export_precise.py --list data/new_books.txt
+python export_precise.py --prefer-largest-screen
+python export_precise.py --list data/new_books.txt --prefer-largest-screen
 
 # 无头导出（仅当 cache/browser_profile 已有登录信息时真正生效；否则回退有头）
-python export_precise.py d31323b0813abaf26g0137c2 --headless
+python export_precise.py d31323b0813abaf26g0137c2 --headless --prefer-largest-screen
 ```
 
 - 首次运行会弹出浏览器要求扫码登录，会话自动保存在 `cache/browser_profile/`，后续复用
 - `--headless`：cache 有登录痕迹才启用无头；无头下若出现登录页会报错并立即终止（需去掉 `--headless` 重新扫码）
-- 阅读器默认自动匹配目标单屏宽度（可 `READER_VIEWPORT_MAX_*` 限制；多显示器默认大屏，`READER_PREFER_LARGEST_SCREEN=0` 则用笔记本屏），检测到双页时按 canvas 拆页抓取；`--force-single-page` / `--no-force-single-page` 可临时覆盖 `.env` 的 `READER_FORCE_SINGLE_PAGE`（强制失败会恢复宽视口）
+- 阅读器默认自动匹配目标单屏宽度（可 `READER_VIEWPORT_MAX_*` 限制）；多显示器时必须用 `--prefer-largest-screen` / `--no-prefer-largest-screen` 指定目标屏（不传会报错提示），检测到双页时按 canvas 拆页抓取；`--force-single-page` / `--no-force-single-page` 可临时覆盖 `.env` 的 `READER_FORCE_SINGLE_PAGE`（强制失败会恢复宽视口）
 - 自动跳到全书开头（原生点击目录首项），逐页翻到全书末尾自动停止
 - **自动续传**：中途卡住会重开浏览器，从上次章节继续；中间产物在 `output/<book_id>/`
 - **全书成功后**才写入 `~/data/weixin/books/<book_id>_<书名>.json`（字段对齐 dedao/json：纯文本 content、`has_content`、空元数据键；可用 `BOOKS_DIR` / `--out-dir` 覆盖）

@@ -23,6 +23,7 @@ class TestExportPreciseCli(unittest.TestCase):
             "--reader-height",
             "900",
             "--force-single-page",
+            "--prefer-largest-screen",
         ])
         self.assertEqual(args.book, "abc123")
         self.assertTrue(args.force)
@@ -32,23 +33,37 @@ class TestExportPreciseCli(unittest.TestCase):
         self.assertEqual(args.reader_width, 1280)
         self.assertEqual(args.reader_height, 900)
         self.assertTrue(args.force_single_page)
+        self.assertTrue(args.prefer_largest_screen)
 
     def test_parse_args_reader_layout_defaults(self):
-        args = export_precise.parse_args([])
+        args = export_precise.parse_args(["--prefer-largest-screen"])
         self.assertEqual(args.reader_width, export_precise.READER_VIEWPORT_WIDTH)
         self.assertEqual(args.reader_height, export_precise.READER_VIEWPORT_HEIGHT)
         self.assertIsNone(args.force_single_page)
+        self.assertTrue(args.prefer_largest_screen)
 
     def test_parse_args_can_disable_force_single_page(self):
-        args = export_precise.parse_args(["abc123", "--no-force-single-page"])
+        args = export_precise.parse_args([
+            "abc123", "--no-force-single-page", "--prefer-largest-screen",
+        ])
         self.assertFalse(args.force_single_page)
 
+    def test_parse_args_prefer_largest_screen_required(self):
+        with self.assertRaises(SystemExit):
+            export_precise.parse_args([])
+        with self.assertRaises(SystemExit):
+            export_precise.parse_args(["abc123"])
+
+    def test_parse_args_can_prefer_laptop_screen(self):
+        args = export_precise.parse_args(["abc123", "--no-prefer-largest-screen"])
+        self.assertFalse(args.prefer_largest_screen)
+
     def test_parse_args_headless_default_false(self):
-        args = export_precise.parse_args([])
+        args = export_precise.parse_args(["--prefer-largest-screen"])
         self.assertFalse(args.headless)
 
     def test_parse_args_batch_default(self):
-        args = export_precise.parse_args([])
+        args = export_precise.parse_args(["--prefer-largest-screen"])
         self.assertIsNone(args.book)
         self.assertEqual(args.list_path, str(export_precise.DEFAULT_NEW_BOOKS))
         self.assertEqual(args.out_dir, str(export_precise.DEFAULT_BOOKS_DIR))

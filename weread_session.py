@@ -127,20 +127,22 @@ async def ensure_browser_window_size(
     *,
     min_width: int = 1200,
     min_height: int = 800,
+    prefer_largest: Optional[bool] = None,
 ) -> dict:
     """有头模式下把浏览器窗口拉到目标尺寸（CDP），避免 profile 恢复成矮窗口。
 
     矮窗口（如 1024x496）会导致阅读器每页只有几行字，导出极慢且像「每页太少」。
-    多显示器时优先落到面积最大的单块屏幕（常见为外接显示器），
-    并按目标 viewport 设 outer bounds；仍偏小则 maximize。
+    多显示器时按 prefer_largest（或 .env READER_PREFER_LARGEST_SCREEN）
+    落到目标单块屏幕，并按目标 viewport 设 outer bounds；仍偏小则 maximize。
     返回调整后的 innerWidth/innerHeight；失败则返回当前值。
     """
     vp = normalized_viewport(viewport)
     target_w = max(int(min_width), int(vp.get("width") or min_width))
     target_h = max(int(min_height), int(vp.get("height") or min_height))
-    # 优先用最大单屏几何计算 outer bounds（含 left/top），避免窗口留在笔记本小屏
+    # 按目标屏几何计算 outer bounds（含 left/top），避免窗口落错显示器
     try:
-        placed = preferred_window_bounds(target_w, target_h)
+        placed = preferred_window_bounds(
+            target_w, target_h, prefer_largest=prefer_largest)
         outer_w = int(placed["width"])
         outer_h = int(placed["height"])
         outer_left = int(placed["left"])

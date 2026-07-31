@@ -78,9 +78,9 @@ def format_elapsed(seconds):
 DEFAULT_NEW_BOOKS = Path("data") / "new_books.txt"
 
 
-def reader_viewport(width=None, height=None):
+def reader_viewport(width=None, height=None, *, prefer_largest=None):
     """导出用阅读器视口。宽/高 0 或未配置时自动匹配本机屏幕。"""
-    return resolve_reader_viewport(width, height)
+    return resolve_reader_viewport(width, height, prefer_largest=prefer_largest)
 
 
 def viewport_focus_point(viewport=None):
@@ -2551,12 +2551,13 @@ async def goto_catalog_chapter(page, target_title: str, catalog_titles=None) -> 
 async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                       goto_first=False, catalog_path=None, headless=False,
                       reader_width=None, reader_height=None,
-                      force_single_page=None):
+                      force_single_page=None, prefer_largest=None):
     reached_end = False
     catalog_titles = load_catalog_titles(catalog_path) if catalog_path else []
     last_cat_title = catalog_titles[-1] if catalog_titles else ""
     async with async_playwright() as p:
-        viewport = reader_viewport(reader_width, reader_height)
+        viewport = reader_viewport(
+            reader_width, reader_height, prefer_largest=prefer_largest)
         ctx = await launch_weread_context(
             p, headless=headless, viewport=viewport)
         if not await ensure_logged_in(
@@ -2574,7 +2575,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         print("\n  打开阅读器...")
         # 先按目标尺寸拉窗口，避免 profile 恢复成矮窗导致每页只有几行
         try:
-            sized = await ensure_browser_window_size(page, viewport)
+            sized = await ensure_browser_window_size(
+                page, viewport, prefer_largest=prefer_largest)
             if sized.get("width") and sized.get("height"):
                 print(
                     f"  🪟 浏览器窗口: {sized['width']}x{sized['height']}"
@@ -2587,7 +2589,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         await asyncio.sleep(SLEEP_READER_AFTER_LOAD)
         # 导航后 profile 可能再次改尺寸，再拉一次
         try:
-            await ensure_browser_window_size(page, viewport)
+            await ensure_browser_window_size(
+                page, viewport, prefer_largest=prefer_largest)
         except Exception:
             pass
         viewport = await ensure_configured_viewport(page, viewport)
@@ -3719,6 +3722,7 @@ async def export_one_book(
     reader_width=None,
     reader_height=None,
     force_single_page=None,
+    prefer_largest=None,
 ):
     """导出单本：中间产物写 output/<id>，成功后写 out_dir JSON。
 
@@ -3782,7 +3786,8 @@ async def export_one_book(
             book_id, md_dir, raw_dir, start_idx, seen_imgs,
             goto_first=goto_first, catalog_path=catalog_path, headless=headless,
             reader_width=reader_width, reader_height=reader_height,
-            force_single_page=force_single_page)
+            force_single_page=force_single_page,
+            prefer_largest=prefer_largest)
         if title:
             book_title = title
         if author:
@@ -3871,6 +3876,7 @@ async def export_batch(
     reader_width=None,
     reader_height=None,
     force_single_page=None,
+    prefer_largest=None,
 ):
     """批量导出 new_books：跳过已存在；失败即停。"""
     out_dir = Path(out_dir)
@@ -3908,6 +3914,7 @@ async def export_batch(
             reader_width=reader_width,
             reader_height=reader_height,
             force_single_page=force_single_page,
+            prefer_largest=prefer_largest,
         )
         if status == "ok" and i < len(pending) - 1:
             print(f"  书间等待 {interval:.0f}s ...")
@@ -3978,7 +3985,21 @@ def parse_args(argv=None):
             f".env READER_FORCE_SINGLE_PAGE={int(bool(READER_FORCE_SINGLE_PAGE))}"
         ),
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--prefer-largest-screen",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "多显示器时是否优先外接大屏（--prefer-largest-screen）"
+            "或笔记本内建屏（--no-prefer-largest-screen）；必须显式指定"
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.prefer_largest_screen is None:
+        parser.error(
+            "必须指定 --prefer-largest-screen 或 --no-prefer-largest-screen"
+        )
+    return args
 
 
 def resolve_book_id(raw: str) -> str:
@@ -4000,6 +4021,11 @@ async def async_main(argv=None):
         if args.force_single_page is None
         else bool(args.force_single_page)
     )
+    prefer_largest = bool(args.prefer_largest_screen)
+    print(
+        "  🖥️  目标屏幕: "
+        + ("优先外接大屏" if prefer_largest else "优先笔记本内建屏")
+    )
     if args.book:
         book_id = resolve_book_id(args.book)
         print(f"  Book ID: {book_id}")
@@ -4012,6 +4038,7 @@ async def async_main(argv=None):
             reader_width=args.reader_width,
             reader_height=args.reader_height,
             force_single_page=force_single_page,
+            prefer_largest=prefer_largest,
         )
         if status == "skipped":
             return 0
@@ -4026,6 +4053,7 @@ async def async_main(argv=None):
         reader_width=args.reader_width,
         reader_height=args.reader_height,
         force_single_page=force_single_page,
+        prefer_largest=prefer_largest,
     )
     return 0
 
