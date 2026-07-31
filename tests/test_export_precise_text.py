@@ -812,6 +812,52 @@ class TestEndOfBookStaleLimits(unittest.TestCase):
         self.assertTrue(export_precise.is_export_terminal_chapter("后记", cat2))
         self.assertTrue(export_precise.is_export_complete_after("后记", cat2))
 
+    def test_non_content_wenhou_variants_complete_export(self):
+        """诗词选集末尾「文后1/文后2」视为无正文；正文末章后应直接完成。"""
+        cat = [
+            "黄昏登高徒惆怅",
+            "相见时难别亦难",
+            "文后1",
+            "文后2",
+        ]
+        last = "相见时难别亦难"
+        self.assertTrue(export_precise.is_non_content_catalog_title("文后"))
+        self.assertTrue(export_precise.is_non_content_catalog_title("文后1"))
+        self.assertTrue(export_precise.is_non_content_catalog_title("文后2"))
+        self.assertTrue(export_precise.is_non_content_catalog_title("文前"))
+        self.assertTrue(export_precise.is_non_content_catalog_title("文前1"))
+        self.assertFalse(export_precise.is_non_content_catalog_title(last))
+        self.assertTrue(export_precise.is_export_complete_after(last, cat))
+        self.assertTrue(export_precise.is_export_terminal_chapter(last, cat))
+        self.assertIsNone(
+            export_precise.resolve_stale_advance_target(last, cat)
+        )
+        self.assertTrue(export_precise.is_non_content_catalog_title(
+            export_precise.next_catalog_title(cat, last)
+        ))
+
+    def test_parse_reader_progress_percent(self):
+        self.assertEqual(
+            export_precise.parse_reader_progress_percent("王国维当前读到 99%"),
+            99,
+        )
+        self.assertEqual(
+            export_precise.parse_reader_progress_percent("已读到100%"),
+            100,
+        )
+        self.assertEqual(
+            export_precise.parse_reader_progress_percent("进度 87%"),
+            87,
+        )
+        self.assertIsNone(
+            export_precise.parse_reader_progress_percent("无进度")
+        )
+        self.assertIsNone(
+            export_precise.parse_reader_progress_percent("读到 101%")
+        )
+        self.assertEqual(export_precise.NEAR_END_PROGRESS_PERCENT, 99)
+        self.assertGreaterEqual(export_precise.NEAR_END_FAIL_LIMIT, 2)
+
     def test_export_terminal_final_appendix_before_houji(self):
         """最后的附录后仅剩后记：附录卡住应按书末收尾，不再反复重开。"""
         cat = [

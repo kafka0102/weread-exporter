@@ -1016,9 +1016,11 @@ _END_MATTER_TITLE_RE = re.compile(
 )
 
 # 目录里常见的无正文装饰项：通常不可点跳/无抓取价值，仅剩它们时视为全书完成
+# 「文前/文后/文前1/文后2」等为微信读书常见书衣装饰项
 _NON_CONTENT_CATALOG_TITLE_RE = re.compile(
     r"^(封底|封面|扉页|版权页|版权信息|书名页|出版信息|版本说明|"
-    r"空白页|勒口|腰封|插图|彩插|图版|图录|广告页)"
+    r"空白页|勒口|腰封|插图|彩插|图版|图录|广告页|"
+    r"文前\d*|文后\d*)"
     r"([：:\s].*)?$"
 )
 
@@ -1040,6 +1042,35 @@ def is_non_content_catalog_title(title: str) -> bool:
     if not t:
         return False
     return bool(_NON_CONTENT_CATALOG_TITLE_RE.match(t))
+
+
+# 近书末：阅读进度很高且连续失败时按完成收尾，避免目录/空章死循环
+NEAR_END_PROGRESS_PERCENT = 99
+NEAR_END_FAIL_LIMIT = 3
+
+_PROGRESS_PERCENT_RE = re.compile(
+    r"(?:当前读到|已读到|读到)\s*(\d{1,3})\s*%"
+)
+_BARE_PERCENT_RE = re.compile(r"(?<!\d)(\d{1,3})\s*%")
+
+
+def parse_reader_progress_percent(text: str):
+    """从文本解析全书阅读进度百分比；无效返回 None。"""
+    s = str(text or "")
+    if not s:
+        return None
+    m = _PROGRESS_PERCENT_RE.search(s)
+    if not m:
+        m = _BARE_PERCENT_RE.search(s)
+    if not m:
+        return None
+    try:
+        pct = int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    if 0 <= pct <= 100:
+        return pct
+    return None
 
 
 def catalog_titles_after(catalog_titles, current_title) -> list[str]:
@@ -1729,6 +1760,56 @@ async def read_chapter_title(page, catalog_titles=None, *, fallback: str = "") -
     return ""
 
 
+async def read_reader_progress_percent(page):
+    """读取阅读器当前全书进度百分比；读不到返回 None。"""
+    try:
+        raw = await page.evaluate(
+            r"""() => {
+                const texts = [];
+                const push = (s) => {
+                    const t = String(s || '').replace(/\s+/g, ' ').trim();
+                    if (t) texts.push(t);
+                };
+                document.querySelectorAll(
+                    '.readerCatalog_list_item_selected, .readerCatalog_list_item.selected, '
+                    + '.readerCatalog_list_item.isActive, [class*="readerCatalog_list_item"][class*="selected"], '
+                    + '[class*="readerCatalog_list_item"][class*="active"]'
+                ).forEach(el => push(el.textContent));
+                document.querySelectorAll(
+                    '[class*="progress"], [class*="Progress"], '
+                    + '[class*="readerFooter"], [class*="readerBottom"], '
+                    + '[class*="readerControl"], [class*="percent"]'
+                ).forEach(el => push(el.textContent));
+                for (const t of texts) {
+                    const m = t.match(/(?:当前读到|已读到|读到)\s*(\d{1,3})\s*%/);
+                    if (m) return parseInt(m[1], 10);
+                }
+                for (const t of texts) {
+                    const m = t.match(/(?<!\d)(\d{1,3})\s*%/);
+                    if (m) {
+                        const n = parseInt(m[1], 10);
+                        if (n >= 0 && n <= 100) return n;
+                    }
+                }
+                const body = (document.body && document.body.innerText) || '';
+                const bm = body.match(/(?:当前读到|已读到|读到)\s*(\d{1,3})\s*%/);
+                if (bm) return parseInt(bm[1], 10);
+                return null;
+            }"""
+        )
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        pct = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= pct <= 100:
+        return pct
+    return None
+
+
 def reader_chapter_matches(header_title: str, target_title: str, catalog_titles=None) -> bool:
     """顶栏章名是否已落到目标章（允许双页顶栏偶发显示紧邻下一章）。"""
     if not target_title:
@@ -1751,7 +1832,8 @@ async def verify_reader_on_chapter(page, target_title: str, catalog_titles=None,
 
     成功条件（满足其一）：
     - 正文出现目标章首/包含目标章名压缩键；
-    - 顶栏对齐目标章（或双页下一章）且已抓到非空正文。
+    - 顶栏对齐目标章（或双页下一章）且已抓到非空正文；
+    - 目标为封底/文后等无正文装饰项且顶栏已对齐（允许正文为空）。
 
     禁止「仅顶栏对齐、正文为 0」即成功：滚动模式下目录点击会改顶栏/选中项，
     但 canvas 仍停在旧章或视口外，随后 ArrowRight 会在旧区空转。
@@ -1786,8 +1868,12 @@ async def verify_reader_on_chapter(page, target_title: str, catalog_titles=None,
         if content_hit:
             return True
         header = await read_chapter_title(page, catalog_titles)
-        if has_body and reader_chapter_matches(header, target, catalog_titles):
-            return True
+        if reader_chapter_matches(header, target, catalog_titles):
+            # 无正文装饰项：顶栏对齐即可（文后/封底常无 canvas 字）
+            if is_non_content_catalog_title(target):
+                return True
+            if has_body:
+                return True
         if i + 1 < retries:
             try:
                 await force_reader_repaint(page)
@@ -2698,6 +2784,15 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                                 break
                             await page.keyboard.press("Escape")
                             await asyncio.sleep(0.15)
+                        # 近书末：续传跳转失败且进度≥99%，直接收尾
+                        pct = await read_reader_progress_percent(page)
+                        if pct is not None and pct >= NEAR_END_PROGRESS_PERCENT:
+                            print(
+                                f"  … 阅读进度 {pct}% 且续传跳转失败，"
+                                f"视为全书抓取完成"
+                            )
+                            await page.close(); await ctx.close()
+                            return book_title, book_author, 0, 0, start_idx, True, False
                         # 若当前已在目标前一章，逻辑仍对准 nxt，靠线性翻页进入
                         cur_now = resolve_chapter_title(
                             await read_chapter_title(page, catalog_titles) or current_chapter,
@@ -2719,6 +2814,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         chapters_this_session = 0
         stale = 0
         empty_page_streak = 0
+        near_end_fail_streak = 0
         page_num = 0
         # 会话内已落盘章节指纹；重复则说明切章回退/停滞
         saved_chapter_fps: set[str] = set()
@@ -3221,6 +3317,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 if await is_reader_catalog_open(page):
                     catalog_blocking = True
                     stale += 1
+                    near_end_fail_streak += 1
                     if stale in (3, 5, 8):
                         print(
                             f"    … 目录未关闭，跳过翻页键 stale={stale}/8 "
@@ -3230,6 +3327,23 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     await page.keyboard.press("Escape")
                     await blur_reader_inputs(page)
                     await asyncio.sleep(0.15)
+                    # 近书末连续失败：进度≥99% 则视为结束，避免目录关不掉死循环
+                    if near_end_fail_streak >= NEAR_END_FAIL_LIMIT:
+                        pct = await read_reader_progress_percent(page)
+                        if pct is not None and pct >= NEAR_END_PROGRESS_PERCENT:
+                            print(
+                                f"    … 阅读进度 {pct}% 且连续失败"
+                                f"{near_end_fail_streak} 次（目录未关），"
+                                f"视为全书结束"
+                            )
+                            await commit_chapter(
+                                current_chapter, ch_blocks,
+                                note_suffix=" [近书末连续失败收尾]",
+                                allow_empty=True,
+                            )
+                            adopt_chapter_blocks([])
+                            reached_end = True
+                            break
                     # 绝不在目录仍开时 ArrowRight
                     if stale >= 8 and catalog_titles:
                         # 落到后面的目录跳转逻辑（复用）
@@ -3390,6 +3504,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 page_num += 1  # 原先只在 split 分支 +1，导致有抓取也无页进度心跳
                 stale = 0
                 empty_page_streak = 0
+                near_end_fail_streak = 0
                 turn_method_idx = 0
                 empty_header_resync = 0
                 if page_num == 1 or page_num % 2 == 0:
@@ -3565,9 +3680,27 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 continue
 
             # stale 达上限：
+            # 0) 近书末：进度≥99% 且连续失败 → 直接收尾
             # 1) 文末章 → 落盘收尾
             # 2) 中间章 → 落盘已抓内容并目录前进到下一章（避免同章无限重开）
             # 3) 无法定位 → 落盘后结束
+            near_end_fail_streak += 1
+            if near_end_fail_streak >= NEAR_END_FAIL_LIMIT:
+                pct = await read_reader_progress_percent(page)
+                if pct is not None and pct >= NEAR_END_PROGRESS_PERCENT:
+                    print(
+                        f"    … 阅读进度 {pct}% 且连续失败"
+                        f"{near_end_fail_streak} 次（翻页停滞），"
+                        f"视为全书结束"
+                    )
+                    await commit_chapter(
+                        current_chapter, ch_blocks,
+                        note_suffix=" [近书末连续失败收尾]",
+                        allow_empty=True,
+                    )
+                    adopt_chapter_blocks([])
+                    reached_end = True
+                    break
             if is_export_terminal_chapter(current_chapter, catalog_titles):
                 print(
                     f"    … 文末章「{(current_chapter or '')[:20]}」"
