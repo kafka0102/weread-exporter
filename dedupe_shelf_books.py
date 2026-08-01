@@ -144,41 +144,13 @@ def load_ebook_title_keys(path: Path) -> dict[str, list[dict]]:
     return index
 
 
-def migrate_downloaded_from_new(
-    new_path: Path,
-    dup_path: Path,
-    downloaded_ids: set[str],
-    *,
-    dry_run: bool = False,
-) -> list[str]:
-    """把 new 中已下载的书迁到 dup，返回迁出的原始行。"""
-    if not new_path.is_file() or not downloaded_ids:
-        return []
-    lines = new_path.read_text(encoding="utf-8").splitlines()
-    keep: list[str] = []
-    moved: list[str] = []
-    for line in lines:
-        parsed = parse_shelf_line(line)
-        if parsed and parsed[0] in downloaded_ids:
-            moved.append(line.rstrip("\n"))
-        else:
-            keep.append(line.rstrip("\n"))
-    if not moved:
-        return []
-
-    if dry_run:
-        return moved
-
-    # 写回 new
-    new_text = "\n".join(keep)
-    if keep:
-        new_text += "\n"
-    new_path.write_text(new_text, encoding="utf-8")
-
-    # 追加到 dup（跳过已有 ID）
+def _append_dup_lines(dup_path: Path, lines: list[str]) -> None:
+    """把行追加到 dup（跳过已有 ID）。"""
+    if not lines:
+        return
     existing_dup = load_id_set_from_lines(dup_path) if dup_path.is_file() else set()
-    to_append = []
-    for line in moved:
+    to_append: list[str] = []
+    for line in lines:
         parsed = parse_shelf_line(line)
         if not parsed:
             continue
@@ -190,7 +162,74 @@ def migrate_downloaded_from_new(
         with dup_path.open("a", encoding="utf-8") as f:
             for line in to_append:
                 f.write(line + "\n")
+
+
+def migrate_stale_from_new(
+    new_path: Path,
+    dup_path: Path,
+    *,
+    forbid_ids: set[str],
+    downloaded_ids: set[str],
+    ebook_keys: dict[str, list[dict]],
+    dry_run: bool = False,
+) -> list[tuple[str, str]]:
+    """把 new 中按当前规则已属 dup 的书迁到 dup。
+
+    返回 [(raw_line, reason), ...]。
+    """
+    if not new_path.is_file():
+        return []
+    lines = new_path.read_text(encoding="utf-8").splitlines()
+    keep: list[str] = []
+    moved: list[tuple[str, str]] = []
+    for line in lines:
+        parsed = parse_shelf_line(line)
+        if not parsed:
+            keep.append(line.rstrip("\n"))
+            continue
+        book_id, title, _author = parsed
+        bucket, reason = classify_book(
+            book_id,
+            title,
+            forbid_ids=forbid_ids,
+            downloaded_ids=downloaded_ids,
+            ebook_keys=ebook_keys,
+        )
+        if bucket == "dup":
+            moved.append((line.rstrip("\n"), reason))
+        else:
+            keep.append(line.rstrip("\n"))
+    if not moved:
+        return []
+
+    if dry_run:
+        return moved
+
+    new_text = "\n".join(keep)
+    if keep:
+        new_text += "\n"
+    new_path.write_text(new_text, encoding="utf-8")
+    _append_dup_lines(dup_path, [line for line, _ in moved])
     return moved
+
+
+def migrate_downloaded_from_new(
+    new_path: Path,
+    dup_path: Path,
+    downloaded_ids: set[str],
+    *,
+    dry_run: bool = False,
+) -> list[str]:
+    """兼容旧接口：仅按本地已下载 ID 迁移 new → dup。"""
+    moved = migrate_stale_from_new(
+        new_path,
+        dup_path,
+        forbid_ids=set(),
+        downloaded_ids=downloaded_ids,
+        ebook_keys={},
+        dry_run=dry_run,
+    )
+    return [line for line, _ in moved]
 
 
 def classify_book(
@@ -241,13 +280,21 @@ def run(
     downloaded_ids = load_downloaded_ids(books_dir)
     ebook_keys = load_ebook_title_keys(ebook_path)
 
-    moved = migrate_downloaded_from_new(
-        new_path, dup_path, downloaded_ids, dry_run=dry_run
+    moved_pairs = migrate_stale_from_new(
+        new_path,
+        dup_path,
+        forbid_ids=forbid_ids,
+        downloaded_ids=downloaded_ids,
+        ebook_keys=ebook_keys,
+        dry_run=dry_run,
     )
+    moved = [line for line, _ in moved_pairs]
+    moved_reasons: dict[str, int] = {}
+    for _line, reason in moved_pairs:
+        moved_reasons[reason] = moved_reasons.get(reason, 0) + 1
 
     processed = load_id_set_from_lines(dup_path) | load_id_set_from_lines(new_path)
-    # dry-run 时 migrate 未写盘，processed 需把即将迁出的 new 视作仍在 new
-    # 且迁移目标应视为已处理
+    # dry-run 时 migrate 未写盘，processed 需把即将迁出的 new 视作已处理
     if dry_run and moved:
         for line in moved:
             parsed = parse_shelf_line(line)
@@ -287,6 +334,7 @@ def run(
         "forbid_count": len(forbid_ids),
         "downloaded_count": len(downloaded_ids),
         "migrated_new_to_dup": len(moved),
+        "migrated_reasons": moved_reasons,
         "todo": len(todo),
         "dup": len(dup_lines),
         "new": len(new_lines),
@@ -306,6 +354,10 @@ def _print_report(result: dict) -> None:
     )
     print(f"books_dir: {result['books_dir']}")
     print(f"本轮 new→dup 迁移: {result['migrated_new_to_dup']} 本")
+    mr = result.get("migrated_reasons") or {}
+    if mr:
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(mr.items()))
+        print(f"  迁移原因: {detail}")
     if result["migrated_samples"]:
         for s in result["migrated_samples"]:
             print(f"  migrate: {s}")

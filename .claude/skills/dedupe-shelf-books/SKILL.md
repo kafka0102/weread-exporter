@@ -67,7 +67,7 @@ python dedupe_shelf_books.py --dry-run
 ## 处理流程（与脚本一致）
 
 1. 读 `shelf_books.txt`、`forbid_books.txt`、本地 books 目录、`ebook-info.json`
-2. **回扫 new_books**：ID 已在本地 books → 迁入 `dup_books`（若尚未在），并从 new 删除
+2. **回扫 new_books**：按当前规则（forbid / 本地已下载 / 归一化书名命中 ebook-info）再判一次；已属 dup 的迁入 `dup_books` 并从 new 删除
 3. 已出现在 `dup_books` 或 `new_books` 的 ID → 跳过（可重复运行）
 4. 对剩余 todo 按上面规则分类，**追加**写入（不覆盖已有内容）
 5. 汇报：forbid 数、本地已下载数、new→dup 迁移数、本轮 dup/new 及原因拆分
