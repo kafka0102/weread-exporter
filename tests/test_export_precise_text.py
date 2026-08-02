@@ -597,6 +597,47 @@ class TestChapterStartSpaceTolerance(unittest.TestCase):
         found = export_precise.find_chapter_split(blocks, catalog, "赠苏绾书记")
         self.assertIsNone(found)
 
+    def test_chapter_start_strips_zero_width_space(self):
+        """canvas 标题中的 U+200B 不得阻断切章。"""
+        title = "士与商：“贱商之子”李白与唐代政经制度"
+        glued = "士与商：​“贱商之子”李白与唐代政经制度《大唐李白》出版以来"
+        self.assertTrue(export_precise.is_chapter_start_text(glued, title))
+        self.assertEqual(
+            export_precise.normalize_catalog_title(
+                "士与商：​“贱商之子”李白与唐代政经制度"
+            ),
+            title,
+        )
+        self.assertEqual(
+            export_precise.compact_title_key("士与商：​“贱商之子”李白与唐代政经制度"),
+            export_precise.compact_title_key(title),
+        )
+
+    def test_split_long_title_across_canvas_lines(self):
+        """长目录标题被拆成多行时仍应在首行处切开。"""
+        title = "士与商：“贱商之子”李白与唐代政经制度"
+        catalog = [
+            "附录 李白的学习年代与漫游年代",
+            title,
+            "仙与凡：“太白星”李白与道教上清派理想",
+        ]
+        blocks = [
+            {"type": "text", "text": "从而解决成长小说的故事性、虚构性与时间的问题。"},
+            {"type": "text", "text": "士与商：​“贱商之子”"},
+            {
+                "type": "text",
+                "text": "李白与唐代政经制度《大唐李白》出版以来有三大讨论焦点",
+            },
+        ]
+        before, after = export_precise.split_blocks_at_chapter_start(blocks, title)
+        self.assertEqual(len(before), 1)
+        self.assertEqual(after[0]["text"], "士与商：​“贱商之子”")
+        found = export_precise.find_chapter_split(
+            blocks, catalog, "附录 李白的学习年代与漫游年代"
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], title)
+
 
 class RunawayChapterThresholdTests(unittest.TestCase):
     def test_soft_threshold_allows_long_multi_page_chapter(self):

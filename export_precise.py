@@ -837,10 +837,13 @@ def is_chapter_start_text(text: str, chapter_title: str) -> bool:
     canvas 文本常去掉空格（「沈佺期三首」），目录却带空格（「沈佺期 三首」），
     必须按压缩键匹配，否则会漏切章、日志停在旧章而页面已前进。
 
+    canvas/DOM 偶发插入零宽字符（U+200B 等），例如
+    「士与商：\u200b“贱商之子”…」；比较前必须剔除，否则长标题永远无法切章。
+
     极短标题（≤2 字压缩键，如「云」「雪」「雁」）只允许整行精确/压缩全等，
     禁止前缀命中正文「云破月来花弄影」等，否则会窜到目录后部短章名。
     """
-    t = (text or "").strip()
+    t = strip_format_chars((text or "").strip())
     title = normalize_catalog_title(chapter_title)
     if not t or not title:
         return False
@@ -876,15 +879,38 @@ def split_blocks_at_chapter_start(blocks, chapter_title: str):
     """在 blocks 中按 chapter_title 章首切分为 (before, after)。
 
     after 为空表示未找到章首；before 可能为空（整页已属新章）。
+
+    长标题在 canvas 上常被拆成多行，例如：
+      「士与商：“贱商之子”」+「李白与唐代政经制度…」
+    单行匹配会漏切；因此还会拼接后续若干文本块再判定章首。
     """
-    title = (chapter_title or "").strip()
+    title = normalize_catalog_title(chapter_title)
     if not title or not blocks:
         return list(blocks or []), []
-    for i, b in enumerate(blocks):
-        if b.get("type") != "text":
+    n = len(blocks)
+    titlek = compact_title_key(title)
+    max_join = 8 if titlek and len(titlek) >= 8 else 4
+    for i in range(n):
+        if blocks[i].get("type") != "text":
             continue
-        if is_chapter_start_text(b.get("text") or "", title):
-            return blocks[:i], blocks[i:]
+        joined = ""
+        for j in range(i, min(n, i + max_join)):
+            b = blocks[j]
+            if b.get("type") != "text":
+                if joined:
+                    break
+                continue
+            piece = strip_format_chars((b.get("text") or "").strip())
+            if not piece:
+                continue
+            joined = piece if not joined else (joined + piece)
+            if is_chapter_start_text(joined, title):
+                return blocks[:i], blocks[i:]
+            jk = compact_title_key(joined)
+            # 已比标题长仍不是章首前缀，停止向后拼
+            if jk and titlek and len(jk) > len(titlek) + 24:
+                if not jk.startswith(titlek):
+                    break
     return list(blocks), []
 
 
@@ -893,15 +919,25 @@ _CATALOG_PROGRESS_RE = re.compile(
     r"(当前读到|已读到|读到)\s*\d+\s*%?\s*$"
 )
 _CATALOG_PERCENT_RE = re.compile(r"\s*\d+\s*%\s*$")
+# canvas/DOM 偶发插入的格式字符；不剔除会导致长章名切章/校验失败
+_FORMAT_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\ufeff\u2060]")
+
+
+def strip_format_chars(text: str) -> str:
+    """去掉零宽空格等格式字符。"""
+    if not text:
+        return ""
+    return _FORMAT_CHARS_RE.sub("", text)
 
 
 def normalize_catalog_title(text: str) -> str:
-    """清洗目录/顶栏章名：去进度文案与首尾空白。"""
-    s = (text or "").strip()
+    """清洗目录/顶栏章名：去进度文案、零宽字符与首尾空白。"""
+    s = strip_format_chars((text or "").strip())
     if not s:
         return ""
     s = _CATALOG_PROGRESS_RE.sub("", s).strip()
     s = _CATALOG_PERCENT_RE.sub("", s).strip()
+    s = strip_format_chars(s).strip()
     # 仅剩 # 之类无意义标记时视为空
     if s in {"#", "·", "-", "—"}:
         return ""
@@ -909,7 +945,7 @@ def normalize_catalog_title(text: str) -> str:
 
 
 def compact_title_key(text: str) -> str:
-    """用于标题比对的压缩键：去空白，降低「沈佺期 三首」vs「沈佺期三首」漏切。"""
+    """用于标题比对的压缩键：去空白/零宽字符，降低「沈佺期 三首」vs「沈佺期三首」漏切。"""
     s = normalize_catalog_title(text)
     if not s:
         return ""
@@ -2407,6 +2443,7 @@ async def click_catalog_list_item(page, target_title: str = "") -> str:
     info = await page.evaluate(
         r"""(target) => {
             const strip = (s) => String(s || '')
+                .replace(/[\u200b\u200c\u200d\ufeff\u2060]/g, '')
                 .replace(/(当前读到|已读到|读到)\s*\d+\s*%?\s*$/g, '')
                 .replace(/\s*\d+\s*%\s*$/g, '')
                 .trim();
@@ -2424,7 +2461,7 @@ async def click_catalog_list_item(page, target_title: str = "") -> str:
                 if (!t) return false;
                 if (!tgt) return true;
                 if (t === tgt) return true;
-                const compact = (s) => String(s || '').replace(/\s+/g, '');
+                const compact = (s) => String(s || '').replace(/[\u200b\u200c\u200d\ufeff\u2060]/g, '').replace(/\s+/g, '');
                 const tc = compact(t), gc = compact(tgt);
                 if (tc && gc && tc === gc) return true;
                 // 短标题只允许精确/压缩全等，避免「春日」点到「春日京中有怀」
@@ -2820,6 +2857,23 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         saved_chapter_fps: set[str] = set()
         dup_chapter_hits = [0]
         MAX_DUP_CHAPTER_HITS = 5
+        # 跨会话也识别「同一章同一正文」：续传重开后避免附录重复落盘
+        try:
+            for name in sorted(
+                f for f in os.listdir(md_dir) if f.endswith(".md")
+            )[-12:]:
+                md_path = os.path.join(md_dir, name)
+                with open(md_path, encoding="utf-8") as mf:
+                    body = mf.read()
+                title_line = ""
+                for line in body.splitlines():
+                    if line.startswith("#"):
+                        title_line = normalize_catalog_title(line.lstrip("#").strip())
+                        break
+                payload = ((title_line or "") + "\n" + body).encode("utf-8")
+                saved_chapter_fps.add(hashlib.md5(payload).hexdigest())
+        except Exception:
+            pass
         # 去重策略：
         # - 上一页行集合：挡住双页半页重叠
         # - 本章已抓页指纹：挡住翻页空转把同一 spread 反复灌入
@@ -3145,7 +3199,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             """
             nonlocal total_chars, total_imgs, chapters_this_session, reached_end
             fp = chapter_blocks_fingerprint(title, blocks)
-            if fp in saved_chapter_fps and not allow_empty:
+            # 停滞前进也用 allow_empty=True 落盘；若仍放行重复指纹，会把同一附录
+            # 写成 0039/0040/... 无限编号。有正文时无论是否 allow_empty 都去重。
+            has_text = any(
+                b.get("type") == "text" and (b.get("text") or "").strip()
+                for b in (blocks or [])
+            )
+            if fp in saved_chapter_fps and (has_text or not allow_empty):
                 dup_chapter_hits[0] += 1
                 print(
                     f"  ⚠️  重复章节内容「{(title or '')[:32]}」"
@@ -3155,8 +3215,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     raise RuntimeError(
                         "章节进度疑似死循环：相同标题与正文反复出现。"
                         "常见原因是顶栏停在卷/作者名而内容切章已前进，"
-                        "随后又被顶栏回退。请更新导出逻辑后清理对应 "
-                        f"output 目录重试。"
+                        "随后又被顶栏回退；或长标题含零宽字符导致无法切到下一章。"
+                        "请更新导出逻辑后清理对应 output 目录重试。"
                     )
                 return 0, [], False
             n, imgs = save_chapter(
