@@ -433,5 +433,6 @@ async def open_logged_in_page(
         return None, None
     page = await context.new_page()
     if url:
-        await page.goto(url, wait_until="networkidle", timeout=30000)
+        # 与书架/阅读器打开策略一致：避免 networkidle 因持续请求而超时。
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
     return context, page

@@ -2707,8 +2707,12 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 )
         except Exception as e:
             print(f"  ⚠️  调整浏览器窗口失败: {e}")
-        await page.goto(f"https://weread.qq.com/web/reader/{book_id}",
-                        wait_until="networkidle", timeout=30000)
+        # 用 domcontentloaded + 固定等待，避免阅读器页长连接/轮询导致 networkidle 永不触发而超时。
+        await page.goto(
+            f"https://weread.qq.com/web/reader/{book_id}",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
         await asyncio.sleep(SLEEP_READER_AFTER_LOAD)
         # 导航后 profile 可能再次改尺寸，再拉一次
         try:
