@@ -808,6 +808,7 @@ class TestEndOfBookStaleLimits(unittest.TestCase):
             )
         )
         self.assertTrue(export_precise.is_end_matter_title("后记"))
+        self.assertTrue(export_precise.is_end_matter_title("补记"))
         self.assertTrue(export_precise.is_end_matter_title("编后记"))
         self.assertTrue(export_precise.is_end_matter_title("致谢"))
         self.assertFalse(export_precise.is_end_matter_title("第十讲 散曲的滋味"))
@@ -876,6 +877,51 @@ class TestEndOfBookStaleLimits(unittest.TestCase):
         self.assertTrue(export_precise.is_non_content_catalog_title(
             export_precise.next_catalog_title(cat, last)
         ))
+
+    def test_non_content_endpaper_and_complete_after_buji(self):
+        """正文后「后折页/封底」为书衣；补记后应直接完成，不再跳后折页。"""
+        cat = [
+            "主要参考文献",
+            "后记",
+            "补记",
+            "后折页",
+            "封底",
+        ]
+        self.assertTrue(export_precise.is_non_content_catalog_title("后折页"))
+        self.assertTrue(export_precise.is_non_content_catalog_title("前折页"))
+        self.assertTrue(export_precise.is_non_content_catalog_title("环衬"))
+        self.assertTrue(export_precise.is_non_content_catalog_title("前环衬"))
+        self.assertTrue(export_precise.is_non_content_catalog_title("后环衬"))
+        self.assertTrue(export_precise.is_non_content_catalog_title("衬页"))
+        self.assertFalse(export_precise.is_non_content_catalog_title("补记"))
+        self.assertTrue(export_precise.is_export_complete_after("补记", cat))
+        self.assertTrue(export_precise.is_export_terminal_chapter("补记", cat))
+        self.assertIsNone(
+            export_precise.resolve_stale_advance_target("补记", cat)
+        )
+        self.assertTrue(
+            export_precise.is_non_content_catalog_title(
+                export_precise.next_catalog_title(cat, "补记")
+            )
+        )
+        # 后记后还有补记：后记本身不是全书完成点
+        self.assertFalse(export_precise.is_export_complete_after("后记", cat))
+        self.assertTrue(export_precise.is_export_terminal_chapter("后记", cat))
+
+    def test_image_only_near_end_limits(self):
+        """书末纯图页：少次无字空抓即收尾，不必等普通章 8 次。"""
+        self.assertLessEqual(
+            export_precise.IMAGE_ONLY_NEAR_END_EMPTY_STREAK,
+            export_precise.LAST_CHAPTER_EMPTY_STREAK,
+        )
+        self.assertEqual(
+            export_precise.IMAGE_ONLY_NEAR_END_STALE_LIMIT,
+            export_precise.LAST_CHAPTER_STALE_LIMIT,
+        )
+        self.assertLess(
+            export_precise.IMAGE_ONLY_NEAR_END_STALE_LIMIT,
+            export_precise.STALE_PAGE_LIMIT,
+        )
 
     def test_parse_reader_progress_percent(self):
         self.assertEqual(

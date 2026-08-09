@@ -777,8 +777,11 @@ MAX_PAGE_CYCLE_HITS = 6
 STALE_PAGE_LIMIT = 8
 # 目录最后一章：更早收尾，避免书末黑屏空翻页（用户感知「停不下来」）
 LAST_CHAPTER_STALE_LIMIT = 3
-# 连续抓到 0 字（黑屏/空白页）次数：末章达此即结束
+# 连续抓到 0 字（黑屏/空白页/纯图页）次数：末章达此即结束
 LAST_CHAPTER_EMPTY_STREAK = 2
+# 近书末纯图页：canvas 无字且无新内容时，少次重试即收尾（避免双页图来回翻）
+IMAGE_ONLY_NEAR_END_EMPTY_STREAK = 2
+IMAGE_ONLY_NEAR_END_STALE_LIMIT = 3
 
 
 def chapter_text_line_set(blocks) -> set[str]:
@@ -1047,7 +1050,7 @@ def is_last_catalog_chapter(current_title: str, catalog_titles) -> bool:
 
 # 文末性质标题：书末附录/后记等；卡住时按全书完成收尾，避免无限重开
 _END_MATTER_TITLE_RE = re.compile(
-    r"^(附录|后记|跋|编后记|再版后记|译后记|修订后记|结语|尾声|"
+    r"^(附录|后记|补记|跋|编后记|再版后记|译后记|修订后记|结语|尾声|"
     r"致谢|鸣谢|参考文献|参考书目|参考资料|索引|出版后记)"
 )
 
@@ -1056,6 +1059,7 @@ _END_MATTER_TITLE_RE = re.compile(
 _NON_CONTENT_CATALOG_TITLE_RE = re.compile(
     r"^(封底|封面|扉页|版权页|版权信息|书名页|出版信息|版本说明|"
     r"空白页|勒口|腰封|插图|彩插|图版|图录|广告页|"
+    r"前折页|后折页|前环衬|后环衬|环衬|衬页|"
     r"文前\d*|文后\d*)"
     r"([：:\s].*)?$"
 )
@@ -3732,6 +3736,29 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 adopt_chapter_blocks([])
                 reached_end = True
                 break
+
+            # 书末纯图页（左右栏皆图、canvas 无字）：进度已高时少次空抓即完成，
+            # 避免双页图在左右/上下键间空转，不必等普通章 STALE_PAGE_LIMIT=8。
+            if (
+                not is_terminal_now
+                and empty_page_streak >= IMAGE_ONLY_NEAR_END_EMPTY_STREAK
+                and stale >= IMAGE_ONLY_NEAR_END_STALE_LIMIT
+                and n_chars_now <= 0
+            ):
+                pct = await read_reader_progress_percent(page)
+                if pct is not None and pct >= NEAR_END_PROGRESS_PERCENT:
+                    print(
+                        f"    … 近书末纯图/无字页（进度 {pct}%，"
+                        f"stale={stale}, empty={empty_page_streak}），"
+                        f"视为全书结束"
+                    )
+                    await commit_chapter(
+                        current_chapter, ch_blocks,
+                        note_suffix=" [近书末纯图页收尾]",
+                        allow_empty=True)
+                    adopt_chapter_blocks([])
+                    reached_end = True
+                    break
 
             # 仅在「足够多次整页重复」后才走空转处理；半页重叠的 stale 继续换翻页方式
             if page_cycle_hits >= MAX_PAGE_CYCLE_HITS and stale >= 4:
