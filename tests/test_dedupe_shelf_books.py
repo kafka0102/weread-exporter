@@ -171,6 +171,29 @@ class TestClassify(unittest.TestCase):
         )
         self.assertEqual((bucket, reason), ("new", "new"))
 
+    def test_shelf_title_dup(self):
+        bucket, reason = classify_book(
+            "sid2",
+            "词品（珍藏本）",
+            forbid_ids=set(),
+            downloaded_ids=set(),
+            ebook_keys={},
+            seen_title_keys={"词品"},
+        )
+        self.assertEqual((bucket, reason), ("dup", "shelf-title-dup"))
+
+    def test_shelf_title_dup_after_higher_priority(self):
+        # forbid 优先于重名
+        bucket, reason = classify_book(
+            "sid",
+            "词品",
+            forbid_ids={"sid"},
+            downloaded_ids=set(),
+            ebook_keys={},
+            seen_title_keys={"词品"},
+        )
+        self.assertEqual((bucket, reason), ("dup", "forbid"))
+
 
 class TestMigrateAndRun(unittest.TestCase):
     def test_migrate_downloaded_from_new(self):
@@ -208,6 +231,7 @@ class TestMigrateAndRun(unittest.TestCase):
                         "idebook,长安诗酒汴京花：全二册,随园散人",
                         "idsame,古今词话,[宋]杨湜",
                         "idnew,续词品,杨夔生",
+                        "iddupname,续词品（注释本）,另一人",
                         "idprocessed,旧书,人",
                     ]
                 )
@@ -241,18 +265,84 @@ class TestMigrateAndRun(unittest.TestCase):
                 books_dir=books,
                 dry_run=False,
             )
-            self.assertEqual(result["todo"], 5)
-            self.assertEqual(result["dup"], 4)  # forbid+dl+ebook+same-title
+            self.assertEqual(result["todo"], 6)
+            # forbid+dl+ebook+ebook-same-title+shelf-title-dup
+            self.assertEqual(result["dup"], 5)
             self.assertEqual(result["new"], 1)
             self.assertEqual(result["reasons"]["downloaded"], 1)
+            self.assertEqual(result["reasons"]["shelf-title-dup"], 1)
             dup_text = dup.read_text(encoding="utf-8")
             new_text = new.read_text(encoding="utf-8")
             self.assertIn("idforbid", dup_text)
             self.assertIn("iddl", dup_text)
             self.assertIn("idebook", dup_text)
             self.assertIn("idsame", dup_text)
+            self.assertIn("iddupname", dup_text)
             self.assertIn("idnew", new_text)
             self.assertNotIn("idnew", dup_text)
+
+
+    def test_migrate_shelf_title_dup_within_new(self):
+        with tempfile.TemporaryDirectory() as td:
+            new_p = Path(td) / "new.txt"
+            dup_p = Path(td) / "dup.txt"
+            new_p.write_text(
+                "a,词品,甲\nb,词品（珍藏本）,乙\n",
+                encoding="utf-8",
+            )
+            dup_p.write_text("", encoding="utf-8")
+            from dedupe_shelf_books import migrate_stale_from_new
+
+            moved = migrate_stale_from_new(
+                new_p,
+                dup_p,
+                forbid_ids=set(),
+                downloaded_ids=set(),
+                ebook_keys={},
+                dry_run=False,
+            )
+            self.assertEqual(len(moved), 1)
+            self.assertEqual(moved[0][1], "shelf-title-dup")
+            self.assertEqual(new_p.read_text(encoding="utf-8").strip(), "a,词品,甲")
+            self.assertIn("b,词品（珍藏本）,乙", dup_p.read_text(encoding="utf-8"))
+
+    def test_run_keeps_first_shelf_title_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            shelf = td_path / "shelf.txt"
+            forbid = td_path / "forbid.txt"
+            ebook = td_path / "ebook.json"
+            dup = td_path / "dup.txt"
+            new = td_path / "new.txt"
+            books = td_path / "books"
+            books.mkdir()
+
+            shelf.write_text(
+                "id1,古今词话,[宋]杨湜\nid2,古今词话,沈雄\nid3,词品,甲\n",
+                encoding="utf-8",
+            )
+            forbid.write_text("", encoding="utf-8")
+            ebook.write_text("[]", encoding="utf-8")
+            dup.write_text("", encoding="utf-8")
+            new.write_text("", encoding="utf-8")
+
+            result = run(
+                shelf_path=shelf,
+                forbid_path=forbid,
+                ebook_path=ebook,
+                dup_path=dup,
+                new_path=new,
+                books_dir=books,
+                dry_run=False,
+            )
+            self.assertEqual(result["new"], 2)
+            self.assertEqual(result["dup"], 1)
+            self.assertEqual(result["reasons"]["shelf-title-dup"], 1)
+            new_text = new.read_text(encoding="utf-8")
+            dup_text = dup.read_text(encoding="utf-8")
+            self.assertIn("id1,古今词话,[宋]杨湜", new_text)
+            self.assertIn("id3,词品,甲", new_text)
+            self.assertIn("id2,古今词话,沈雄", dup_text)
 
 
 if __name__ == "__main__":

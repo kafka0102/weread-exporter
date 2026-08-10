@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""书架书去重：shelf_books vs forbid / 本地已下载 / ebook-info。
+"""书架书去重：shelf_books vs forbid / 本地已下载 / ebook-info / 书架重名。
 
-匹配 ebook-info 时只比「归一化主书名」，不比作者：
+匹配 ebook-info 与书架内部重名时只比「归一化主书名」，不比作者：
 - 去掉括号及括号内内容（半角/全角）
 - 去掉横线/冒号后的副标题
 - 压缩空白后全等 → 视为重复
+- 书架（及 new/dup 已处理列表）中同主书名只保留第一本，其余进 dup
 
 用法：
     python dedupe_shelf_books.py
@@ -98,6 +99,16 @@ def load_id_set_from_lines(path: Path) -> set[str]:
     return ids
 
 
+def load_title_keys_from_lines(path: Path) -> set[str]:
+    """从 shelf 格式文件收集归一化主书名（空标题跳过）。"""
+    keys: set[str] = set()
+    for _book_id, title, _author, _raw in load_shelf_lines(path):
+        key = normalize_title(title)
+        if key:
+            keys.add(key)
+    return keys
+
+
 def load_forbid_ids(path: Path) -> set[str]:
     """每行一个 weread ID；含逗号则取首段；忽略空行与 # 注释。"""
     if not path.is_file():
@@ -175,11 +186,14 @@ def migrate_stale_from_new(
 ) -> list[tuple[str, str]]:
     """把 new 中按当前规则已属 dup 的书迁到 dup。
 
+    含：forbid / 本地已下载 / ebook-info / 与已有 dup 或 new 内先前条目重名。
     返回 [(raw_line, reason), ...]。
     """
     if not new_path.is_file():
         return []
     lines = new_path.read_text(encoding="utf-8").splitlines()
+    # 已在 dup 中的书名视为已占用；new 内按出现顺序只保留第一本
+    seen_title_keys = load_title_keys_from_lines(dup_path)
     keep: list[str] = []
     moved: list[tuple[str, str]] = []
     for line in lines:
@@ -194,11 +208,15 @@ def migrate_stale_from_new(
             forbid_ids=forbid_ids,
             downloaded_ids=downloaded_ids,
             ebook_keys=ebook_keys,
+            seen_title_keys=seen_title_keys,
         )
         if bucket == "dup":
             moved.append((line.rstrip("\n"), reason))
         else:
             keep.append(line.rstrip("\n"))
+        key = normalize_title(title)
+        if key:
+            seen_title_keys.add(key)
     if not moved:
         return []
 
@@ -239,8 +257,13 @@ def classify_book(
     forbid_ids: set[str],
     downloaded_ids: set[str],
     ebook_keys: dict[str, list[dict]],
+    seen_title_keys: set[str] | None = None,
 ) -> tuple[str, str]:
-    """返回 (bucket, reason)。bucket 为 'dup' 或 'new'。"""
+    """返回 (bucket, reason)。bucket 为 'dup' 或 'new'。
+
+    seen_title_keys：已占用的归一化主书名（书架/new/dup 内先前条目）。
+    命中时原因 shelf-title-dup；调用方负责在处理后把当前书名加入该集合。
+    """
     if book_id in forbid_ids:
         return "dup", "forbid"
     if book_id in downloaded_ids:
@@ -248,6 +271,8 @@ def classify_book(
     key = normalize_title(title)
     if key and key in ebook_keys:
         return "dup", "ebook-info"
+    if seen_title_keys is not None and key and key in seen_title_keys:
+        return "dup", "shelf-title-dup"
     return "new", "new"
 
 
@@ -301,12 +326,23 @@ def run(
             if parsed:
                 processed.add(parsed[0])
 
+    # new/dup 已处理条目的归一化书名均已占用（migrate 只在两者间移动，集合不变）
+    seen_title_keys = load_title_keys_from_lines(dup_path) | load_title_keys_from_lines(
+        new_path
+    )
+
     shelf = load_shelf_lines(shelf_path)
     todo = [row for row in shelf if row[0] not in processed]
 
     dup_lines: list[str] = []
     new_lines: list[str] = []
-    reasons = {"forbid": 0, "downloaded": 0, "ebook-info": 0, "new": 0}
+    reasons = {
+        "forbid": 0,
+        "downloaded": 0,
+        "ebook-info": 0,
+        "shelf-title-dup": 0,
+        "new": 0,
+    }
 
     for book_id, title, author, raw in todo:
         bucket, reason = classify_book(
@@ -315,8 +351,12 @@ def run(
             forbid_ids=forbid_ids,
             downloaded_ids=downloaded_ids,
             ebook_keys=ebook_keys,
+            seen_title_keys=seen_title_keys,
         )
         reasons[reason] = reasons.get(reason, 0) + 1
+        key = normalize_title(title)
+        if key:
+            seen_title_keys.add(key)
         # 写出原样行
         line = raw if raw.strip() else format_shelf_line(book_id, title, author)
         if bucket == "dup":
@@ -371,6 +411,7 @@ def _print_report(result: dict) -> None:
         f"forbid={r.get('forbid', 0)}, "
         f"downloaded={r.get('downloaded', 0)}, "
         f"ebook-info={r.get('ebook-info', 0)}, "
+        f"shelf-title-dup={r.get('shelf-title-dup', 0)}, "
         f"new={r.get('new', 0)}"
     )
     if result["dry_run"]:
