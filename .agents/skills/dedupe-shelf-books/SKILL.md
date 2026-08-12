@@ -1,6 +1,6 @@
 ---
 name: dedupe-shelf-books
-description: 把 data/shelf_books.txt 与 data/forbid_books.txt、data/ebook-info.json、本地已导出目录（默认 ~/data/weixin/books）比对，按「归一化主书名」判断重复，分别落到 data/dup_books.txt / data/new_books.txt。优先运行 python dedupe_shelf_books.py。触发：书架去重、找重复书/新书、生成 dup_books/new_books、剔除已下载。
+description: 把 data/shelf_books.txt 与 data/forbid_books.txt、data/ebook-info.json、本地已导出目录（默认 ~/data/weixin/books）比对，按「归一化主书名」判断重复，分别落到 data/dup_books.txt / data/new_books.txt。优先运行 python dedupe_shelf_books.py（导出后也要再跑，才能把已下载 ID 从 new 迁到 dup）。触发：书架去重、找重复书/新书、生成 dup_books/new_books、剔除已下载。
 ---
 
 # Skill: 书架书去重
@@ -75,6 +75,21 @@ python dedupe_shelf_books.py --dry-run
 4. 已占用书名集合 = `dup_books` ∪ `new_books` 中所有归一化主书名
 5. 对剩余 todo 按上面规则分类；每处理一本（无论 dup/new）都把其主书名加入已占用集合，**追加**写入（不覆盖已有内容）
 6. 汇报：forbid 数、本地已下载数、new→dup 迁移数、本轮 dup/new 及原因拆分（含 `shelf-title-dup`）
+
+
+## 重要：导出后必须重跑
+
+`data/new_books.txt` **不会**在 `export_precise.py` 成功写出 JSON 后自动删行。
+
+批量导出运行时会跳过 `BOOKS_DIR` 里已有同 ID 的书，但**清单文件本身保持原样**。
+因此：
+
+1. 生成清单：`python dedupe_shelf_books.py`
+2. 批量导出：`python export_precise.py --list data/new_books.txt ...`
+3. **导出一批后立刻再跑** `python dedupe_shelf_books.py`  
+   → 脚本会把 new 里已下载的 ID **迁移**到 `dup_books.txt`（原因 `downloaded`），并顺带清掉 new 内按当前规则已属 dup 的条目
+
+若只看「上次生成的 new_books」而不重跑，会误以为 skill 没剔除已下载书——那是**清单过期**，不是匹配逻辑失效。可用 `--dry-run` 先看将迁移多少本。
 
 ## 边界
 
