@@ -9,6 +9,7 @@ from dedupe_shelf_books import (
     load_ebook_title_keys,
     load_forbid_ids,
     migrate_downloaded_from_new,
+    migrate_stale_from_dup,
     normalize_title,
     parse_shelf_line,
     run,
@@ -75,6 +76,75 @@ class TestNormalizeTitle(unittest.TestCase):
         self.assertEqual(
             normalize_title("词品（中华经典名著全本全注全译丛书）"),
             normalize_title("词品"),
+        )
+
+    def test_keep_journal_issue_parens(self):
+        a = normalize_title("励耘学刊（2019年第2辑/总第30辑）")
+        b = normalize_title("励耘学刊（2024年第1辑/总第39辑）")
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.startswith("励耘学刊"))
+        self.assertIn("2019", a)
+        self.assertIn("2", a)
+        self.assertIn("2024", b)
+        self.assertEqual(
+            normalize_title("文学评论丛刊（第15卷第2期）"),
+            normalize_title("文学评论丛刊(第15卷第2期)"),
+        )
+        self.assertIn("15", normalize_title("文学评论丛刊（第15卷第2期）"))
+        self.assertIn("2", normalize_title("某学刊（第3本第2期）"))
+
+    def test_keep_yearbook_year_parens(self):
+        self.assertNotEqual(
+            normalize_title("唐代文学研究年鉴（2016）"),
+            normalize_title("唐代文学研究年鉴（2023）"),
+        )
+        self.assertEqual(
+            normalize_title("中国李白研究（2023年）"),
+            normalize_title("中国李白研究(2023)"),
+        )
+
+    def test_issue_punctuation_and_numerals_equivalent(self):
+        self.assertEqual(
+            normalize_title("励耘学刊（2024年第1辑/总第39辑）"),
+            normalize_title("励耘学刊（2024年第1辑 总第39辑）"),
+        )
+        self.assertEqual(
+            normalize_title("励耘学刊（2020年第2辑·总第32辑）"),
+            normalize_title("励耘学刊（2020年第2辑/总第32辑）"),
+        )
+        self.assertEqual(
+            normalize_title("明清文学与文献（第三辑）"),
+            normalize_title("明清文学与文献（第3辑）"),
+        )
+        self.assertEqual(
+            normalize_title("乐府学（第十一辑）"),
+            normalize_title("乐府学（第11辑）"),
+        )
+        self.assertEqual(
+            normalize_title("励耘学刊（2018年第1辑/总第二十七辑）"),
+            normalize_title("励耘学刊（2018年第1辑/总第27辑）"),
+        )
+
+    def test_still_strip_edition_and_set_parens(self):
+        self.assertEqual(normalize_title("文学写作（第2版）"), "文学写作")
+        self.assertEqual(normalize_title("草木缘情（第二版）"), "草木缘情")
+        self.assertEqual(normalize_title("纳兰词(插图注释版 全二册)"), "纳兰词")
+        self.assertEqual(normalize_title("诗吟天下（套装共2册）"), "诗吟天下")
+        self.assertEqual(
+            normalize_title("拾荒小集（聚学文丛三辑）"),
+            "拾荒小集",
+        )
+
+    def test_keep_volume_then_strip_subtitle(self):
+        self.assertEqual(
+            normalize_title("讲给孩子的国学经典（第四册）：文集诗薮"),
+            normalize_title("讲给孩子的国学经典（第4册）"),
+        )
+        self.assertEqual(
+            normalize_title(
+                "唐诗之路研究(第二辑)——中国唐诗之路研究会首届年会暨第二次学术研讨会论文集"
+            ),
+            normalize_title("唐诗之路研究（第2辑）"),
         )
 
 
@@ -305,6 +375,89 @@ class TestMigrateAndRun(unittest.TestCase):
             self.assertEqual(moved[0][1], "shelf-title-dup")
             self.assertEqual(new_p.read_text(encoding="utf-8").strip(), "a,词品,甲")
             self.assertIn("b,词品（珍藏本）,乙", dup_p.read_text(encoding="utf-8"))
+
+    def test_classify_keeps_distinct_journal_issues(self):
+        ebook_keys = {
+            normalize_title("励耘学刊（2025年第1辑 总第41辑）"): [
+                {"bookName": "励耘学刊（2025年第1辑 总第41辑）"}
+            ]
+        }
+        bucket, reason = classify_book(
+            "sid",
+            "励耘学刊（2019年第2辑/总第30辑）",
+            forbid_ids=set(),
+            downloaded_ids=set(),
+            ebook_keys=ebook_keys,
+        )
+        self.assertEqual((bucket, reason), ("new", "new"))
+        bucket, reason = classify_book(
+            "sid2",
+            "励耘学刊（2025年第1辑/总第41辑）",
+            forbid_ids=set(),
+            downloaded_ids=set(),
+            ebook_keys=ebook_keys,
+        )
+        self.assertEqual((bucket, reason), ("dup", "ebook-info"))
+
+    def test_migrate_false_journal_dups_back_to_new(self):
+        with tempfile.TemporaryDirectory() as td:
+            new_p = Path(td) / "new.txt"
+            dup_p = Path(td) / "dup.txt"
+            new_p.write_text("a,词品,甲\n", encoding="utf-8")
+            dup_p.write_text(
+                "\n".join(
+                    [
+                        "b,词品（珍藏本）,乙",
+                        "c,励耘学刊（2019年第2辑/总第30辑）,杜桂萍",
+                        "d,励耘学刊（2024年第1辑/总第39辑）,杜桂萍",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ebook_keys = {
+                normalize_title("励耘学刊（2025年第1辑 总第41辑）"): [
+                    {"bookName": "励耘学刊（2025年第1辑 总第41辑）"}
+                ]
+            }
+            moved = migrate_stale_from_dup(
+                dup_p,
+                new_p,
+                forbid_ids=set(),
+                downloaded_ids=set(),
+                ebook_keys=ebook_keys,
+                dry_run=False,
+            )
+            moved_ids = {parse_shelf_line(line)[0] for line, _reason in moved}
+            self.assertEqual(moved_ids, {"c", "d"})
+            new_text = new_p.read_text(encoding="utf-8")
+            dup_text = dup_p.read_text(encoding="utf-8")
+            self.assertIn("c,励耘学刊（2019年第2辑/总第30辑）,杜桂萍", new_text)
+            self.assertIn("d,励耘学刊（2024年第1辑/总第39辑）,杜桂萍", new_text)
+            self.assertIn("b,词品（珍藏本）,乙", dup_text)
+            self.assertNotIn("励耘学刊", dup_text)
+
+    def test_migrate_dup_skips_non_issue_stale_entries(self):
+        with tempfile.TemporaryDirectory() as td:
+            new_p = Path(td) / "new.txt"
+            dup_p = Path(td) / "dup.txt"
+            new_p.write_text("", encoding="utf-8")
+            dup_p.write_text(
+                "x,文学概论讲义,老舍\ny,励耘学刊（2019年第2辑/总第30辑）,杜桂萍\n",
+                encoding="utf-8",
+            )
+            moved = migrate_stale_from_dup(
+                dup_p,
+                new_p,
+                forbid_ids=set(),
+                downloaded_ids=set(),
+                ebook_keys={},
+                dry_run=False,
+            )
+            moved_ids = {parse_shelf_line(line)[0] for line, _reason in moved}
+            self.assertEqual(moved_ids, {"y"})
+            self.assertIn("x,文学概论讲义,老舍", dup_p.read_text(encoding="utf-8"))
+            self.assertIn("y,励耘学刊（2019年第2辑/总第30辑）,杜桂萍", new_p.read_text(encoding="utf-8"))
 
     def test_run_keeps_first_shelf_title_only(self):
         with tempfile.TemporaryDirectory() as td:

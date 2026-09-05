@@ -2,9 +2,10 @@
 """书架书去重：shelf_books vs forbid / 本地已下载 / ebook-info / 书架重名。
 
 匹配 ebook-info 与书架内部重名时只比「归一化主书名」，不比作者：
-- 去掉括号及括号内内容（半角/全角）
+- 去掉装饰性括号（珍藏本、全二册、丛书名等）
+- 保留期刊/学刊期数括号（第N期、第N辑、第N卷、第N本第N期、年份+期数等）
 - 去掉横线/冒号后的副标题
-- 压缩空白后全等 → 视为重复
+- 压缩空白与期数标点后全等 → 视为重复
 - 书架（及 new/dup 已处理列表）中同主书名只保留第一本，其余进 dup
 
 用法：
@@ -32,29 +33,115 @@ DEFAULT_EBOOK_INFO = DATA_DIR / "ebook-info.json"
 DEFAULT_DUP = DATA_DIR / "dup_books.txt"
 DEFAULT_NEW = DATA_DIR / "new_books.txt"
 
-# 半角/全角括号内容（非嵌套，循环剥除）
-_PAREN_RE = re.compile(r"[（(][^（）()]*[）)]")
+# 半角/全角括号内容（非嵌套，循环处理；期数括号保留内文）
+_PAREN_RE = re.compile(r"[（(]([^（）()]*)[）)]")
 # 副标题分隔：破折号/横线/冒号（取主标题）
 _SUBTITLE_RE = re.compile(r"\s*(?:——|—|－|–|-|：|:)\s*")
 _WS_RE = re.compile(r"\s+")
+_CN_NUM = r"[零〇○一二三四五六七八九十百千两0-9]"
+# 纯年份：年鉴/年刊（2016）（2023年）
+_YEAR_ONLY_RE = re.compile(r"^\d{4}年?$")
+# 期数/卷次标记：2019年、第N期/辑/卷/册/本、总第N辑、第N本第N期
+_ISSUE_MARK_RE = re.compile(
+    rf"(?:"
+    rf"\d{{4}}\s*年"
+    rf"|总\s*第?\s*{_CN_NUM}+\s*(?:卷|期|辑|册|本)"
+    rf"|第{_CN_NUM}+\s*(?:卷|期|辑|册|本)"
+    rf")"
+)
+_ISSUE_NUM_RE = re.compile(
+    rf"(总?第)({_CN_NUM}+)(卷|期|辑|册|本)"
+)
+_YEAR_TAIL_RE = re.compile(r"(\d{4})年")
+_CN_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "○": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CN_UNITS = {"十": 10, "百": 100, "千": 1000}
+_PUNCT_DROP = ("·", "・", ".", "/", "／", "、", ",", "，")
+
+
+def _parse_cn_or_arabic_int(token: str) -> int | None:
+    """把期数里的中文/阿拉伯数字转成 int；无法解析则返回 None。"""
+    if not token:
+        return None
+    if token.isdigit():
+        return int(token)
+    if any(ch not in _CN_DIGITS and ch not in _CN_UNITS for ch in token):
+        return None
+    total = 0
+    current = 0
+    for ch in token:
+        if ch in _CN_DIGITS:
+            current = _CN_DIGITS[ch]
+            continue
+        total += (current or 1) * _CN_UNITS[ch]
+        current = 0
+    return total + current
+
+
+def _arabicize_issue_numbers(s: str) -> str:
+    """第十四辑 / 总第二十七辑 → 第14辑 / 总第27辑。"""
+
+    def repl(match: re.Match[str]) -> str:
+        prefix, num, unit = match.group(1), match.group(2), match.group(3) or ""
+        parsed = _parse_cn_or_arabic_int(num)
+        if parsed is None:
+            return match.group(0)
+        return f"{prefix}{parsed}{unit}"
+
+    return _ISSUE_NUM_RE.sub(repl, s)
+
+
+def _is_issue_paren(inner: str) -> bool:
+    """括号内是否为期刊期数/卷次/年份，而非「珍藏本」「全二册」等装饰。"""
+    text = inner.strip()
+    if not text:
+        return False
+    if _YEAR_ONLY_RE.match(text):
+        return True
+    return _ISSUE_MARK_RE.search(text) is not None
+
+
+def _replace_paren(match: re.Match[str]) -> str:
+    inner = match.group(1)
+    return inner if _is_issue_paren(inner) else ""
+
+
+def _title_keeps_issue_paren(title: str) -> bool:
+    """原书名是否含应保留的期数括号。"""
+    return any(_is_issue_paren(m.group(1)) for m in _PAREN_RE.finditer(str(title or "")))
 
 
 def normalize_title(title: str | None) -> str:
-    """归一化书名：去括号修饰 + 去副标题，只保留主标题。"""
+    """归一化书名：去装饰括号与副标题，保留期刊期数。"""
     s = str(title or "").strip()
     if not s:
         return ""
-    # 反复去掉括号段，直到没有
+    # 反复处理括号段：装饰性删除，期数保留内文
     while True:
-        nxt = _PAREN_RE.sub("", s)
+        nxt = _PAREN_RE.sub(_replace_paren, s)
         if nxt == s:
             break
         s = nxt
     # 横线/冒号后的副标题去掉，只留主标题
     s = _SUBTITLE_RE.split(s, maxsplit=1)[0]
+    s = _arabicize_issue_numbers(s)
+    s = _YEAR_TAIL_RE.sub(r"\1", s)
     s = _WS_RE.sub("", s)  # 去空白，避免「词 品」vs「词品」
-    # 统一常见全角标点残留
-    s = s.replace("·", "").replace("・", "").replace(".", "")
+    for ch in _PUNCT_DROP:
+        s = s.replace(ch, "")
     return s.strip()
 
 
@@ -155,24 +242,38 @@ def load_ebook_title_keys(path: Path) -> dict[str, list[dict]]:
     return index
 
 
-def _append_dup_lines(dup_path: Path, lines: list[str]) -> None:
-    """把行追加到 dup（跳过已有 ID）。"""
+def _append_unique_id_lines(path: Path, lines: list[str]) -> None:
+    """把行追加到 shelf 格式文件（跳过已有 ID）。"""
     if not lines:
         return
-    existing_dup = load_id_set_from_lines(dup_path) if dup_path.is_file() else set()
+    existing = load_id_set_from_lines(path) if path.is_file() else set()
     to_append: list[str] = []
     for line in lines:
         parsed = parse_shelf_line(line)
         if not parsed:
             continue
-        if parsed[0] in existing_dup:
+        if parsed[0] in existing:
             continue
         to_append.append(line.rstrip("\n"))
-        existing_dup.add(parsed[0])
+        existing.add(parsed[0])
     if to_append:
-        with dup_path.open("a", encoding="utf-8") as f:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
             for line in to_append:
                 f.write(line + "\n")
+
+
+def _append_dup_lines(dup_path: Path, lines: list[str]) -> None:
+    """把行追加到 dup（跳过已有 ID）。"""
+    _append_unique_id_lines(dup_path, lines)
+
+
+def _rewrite_shelf_file(path: Path, lines: list[str]) -> None:
+    text = "\n".join(line.rstrip("\n") for line in lines)
+    if lines:
+        text += "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
 def migrate_stale_from_new(
@@ -223,11 +324,60 @@ def migrate_stale_from_new(
     if dry_run:
         return moved
 
-    new_text = "\n".join(keep)
-    if keep:
-        new_text += "\n"
-    new_path.write_text(new_text, encoding="utf-8")
+    _rewrite_shelf_file(new_path, keep)
     _append_dup_lines(dup_path, [line for line, _ in moved])
+    return moved
+
+
+def migrate_stale_from_dup(
+    dup_path: Path,
+    new_path: Path,
+    *,
+    forbid_ids: set[str],
+    downloaded_ids: set[str],
+    ebook_keys: dict[str, list[dict]],
+    dry_run: bool = False,
+) -> list[tuple[str, str]]:
+    """把 dup 中「含期刊期数」且按当前规则不再算重复的书迁回 new。
+
+    只救回括号内带期数/卷次/年份的条目，避免把历史误入 dup 的普通书一并捞出。
+    forbid / 本地已下载 / ebook-info / 同主书名已占用的仍留 dup。
+    返回 [(raw_line, reason), ...]。
+    """
+    if not dup_path.is_file():
+        return []
+    lines = dup_path.read_text(encoding="utf-8").splitlines()
+    seen_title_keys = load_title_keys_from_lines(new_path)
+    keep: list[str] = []
+    moved: list[tuple[str, str]] = []
+    for line in lines:
+        parsed = parse_shelf_line(line)
+        if not parsed:
+            keep.append(line.rstrip("\n"))
+            continue
+        book_id, title, _author = parsed
+        bucket, reason = classify_book(
+            book_id,
+            title,
+            forbid_ids=forbid_ids,
+            downloaded_ids=downloaded_ids,
+            ebook_keys=ebook_keys,
+            seen_title_keys=seen_title_keys,
+        )
+        raw = line.rstrip("\n")
+        if bucket == "new" and _title_keeps_issue_paren(title):
+            moved.append((raw, reason))
+        else:
+            keep.append(raw)
+        key = normalize_title(title)
+        if key:
+            seen_title_keys.add(key)
+    if not moved:
+        return []
+    if dry_run:
+        return moved
+    _rewrite_shelf_file(dup_path, keep)
+    _append_unique_id_lines(new_path, [line for line, _ in moved])
     return moved
 
 
@@ -313,15 +463,32 @@ def run(
         ebook_keys=ebook_keys,
         dry_run=dry_run,
     )
+    rescued_pairs = migrate_stale_from_dup(
+        dup_path,
+        new_path,
+        forbid_ids=forbid_ids,
+        downloaded_ids=downloaded_ids,
+        ebook_keys=ebook_keys,
+        dry_run=dry_run,
+    )
     moved = [line for line, _ in moved_pairs]
     moved_reasons: dict[str, int] = {}
     for _line, reason in moved_pairs:
         moved_reasons[reason] = moved_reasons.get(reason, 0) + 1
+    rescued = [line for line, _ in rescued_pairs]
+    rescued_reasons: dict[str, int] = {}
+    for _line, reason in rescued_pairs:
+        rescued_reasons[reason] = rescued_reasons.get(reason, 0) + 1
 
     processed = load_id_set_from_lines(dup_path) | load_id_set_from_lines(new_path)
     # dry-run 时 migrate 未写盘，processed 需把即将迁出的 new 视作已处理
     if dry_run and moved:
         for line in moved:
+            parsed = parse_shelf_line(line)
+            if parsed:
+                processed.add(parsed[0])
+    if dry_run and rescued:
+        for line in rescued:
             parsed = parse_shelf_line(line)
             if parsed:
                 processed.add(parsed[0])
@@ -375,6 +542,8 @@ def run(
         "downloaded_count": len(downloaded_ids),
         "migrated_new_to_dup": len(moved),
         "migrated_reasons": moved_reasons,
+        "migrated_dup_to_new": len(rescued),
+        "rescued_reasons": rescued_reasons,
         "todo": len(todo),
         "dup": len(dup_lines),
         "new": len(new_lines),
@@ -383,6 +552,7 @@ def run(
         "dup_samples": dup_lines[:5],
         "new_samples": new_lines[:5],
         "migrated_samples": moved[:5],
+        "rescued_samples": rescued[:5],
     }
 
 
@@ -401,6 +571,14 @@ def _print_report(result: dict) -> None:
     if result["migrated_samples"]:
         for s in result["migrated_samples"]:
             print(f"  migrate: {s}")
+    print(f"本轮 dup→new 迁回: {result.get('migrated_dup_to_new', 0)} 本")
+    rr = result.get("rescued_reasons") or {}
+    if rr:
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(rr.items()))
+        print(f"  迁回原因: {detail}")
+    if result.get("rescued_samples"):
+        for s in result["rescued_samples"]:
+            print(f"  rescue: {s}")
     print(
         f"本轮 todo {result['todo']} 本 → "
         f"dup {result['dup']} / new {result['new']}"

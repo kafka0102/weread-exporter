@@ -77,7 +77,7 @@
 
 | 触发场景 | skill 文件 |
 |----------|-----------|
-| 书架书去重：运行 `python dedupe_shelf_books.py`，按 forbid ID / 本地已下载 ID / **归一化主书名**（去括号与副标题，**不比作者**）把 `shelf_books` 分到 `dup_books` / `new_books` | `.agents/skills/dedupe-shelf-books/SKILL.md`（同 `.claude/skills/dedupe-shelf-books/SKILL.md`） |
+| 书架书去重：运行 `python dedupe_shelf_books.py`，按 forbid ID / 本地已下载 ID / **归一化主书名**（去装饰括号与副标题，**保留期刊期数**，**不比作者**）把 `shelf_books` 分到 `dup_books` / `new_books` | `.agents/skills/dedupe-shelf-books/SKILL.md`（同 `.claude/skills/dedupe-shelf-books/SKILL.md`） |
 
 当用户说"书架去重 / 找重复书 / 找新书 / 生成 dup_books、new_books / 剔除已下载"等，读上述 skill 并按其流程执行。
 
