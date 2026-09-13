@@ -131,6 +131,37 @@ class AnalyzeRowsTests(unittest.TestCase):
         body = make_body([("版权信息", 100)] + [(f"第{i}章", 200) for i in range(1, 8)])
         self.assertIsNone(dm.analyze_rows(dm.chapter_rows(body)))
 
+    def test_missing_catalog_chapter_is_flagged(self):
+        """目录里有、导出里没有，且标题混在别章正文里 → 章节缺失。"""
+        catalog = ["版权信息"] + [f"第{i}章" for i in range(1, 8)] + ["李白研究"]
+        body = make_body(
+            [("版权信息", 120)] + [(f"第{i}章", 3000) for i in range(1, 8)]
+        )
+        body.append(
+            {
+                "chapter_name": "第七章",
+                "content": "第七章正文" + "李白研究" + "□雷子帧本文综述李白研究进展" * 40,
+            }
+        )
+        result = dm.analyze_rows(dm.chapter_rows(body), catalog_titles=catalog)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["level"], "章节缺失")
+        self.assertEqual(result["missing_chapters"], ["李白研究"])
+
+    def test_quoted_title_is_not_missing_evidence(self):
+        """《李白研究》这类文献引用不算「标题出现在正文中」。"""
+        catalog = ["版权信息"] + [f"第{i}章" for i in range(1, 8)] + ["李白研究"]
+        body = make_body(
+            [("版权信息", 120)] + [(f"第{i}章", 3000) for i in range(1, 8)]
+        )
+        body.append(
+            {
+                "chapter_name": "第七章",
+                "content": "第七章正文" + "参见《李白研究》一书。" * 60,
+            }
+        )
+        self.assertIsNone(dm.analyze_rows(dm.chapter_rows(body), catalog_titles=catalog))
+
 
 class ScanDirectoryTests(unittest.TestCase):
     def test_run_scans_json_books(self):

@@ -15,6 +15,7 @@ python detect_merged_chapters.py
 python detect_merged_chapters.py --include-suspect --tsv .scratch/merged-chapters-report.tsv
 python detect_merged_chapters.py --books-dir ~/data/weixin/books
 python detect_merged_chapters.py --include-output   # 连 output/<id>/chapters 中间产物一起体检
+python detect_merged_chapters.py --catalog-root output   # 默认值：用导出时的 _catalog.json 核对缺章
 ```
 
 脚本**只读**：只打印结果 / 可选写 TSV，不删除、不移动、不修改任何电子书文件。
@@ -32,6 +33,7 @@ python detect_merged_chapters.py --include-output   # 连 output/<id>/chapters �
 | ≥10 章 | 单章 ≥50% 且其余多为小章 → 中度；≥80% → 严重；仅过半但其余章不小 → 可疑 |
 | 任意章数 | 最大章占比 ≥30%，且其中确实混入 ≥2 章其他章正文（该章 ≥50% 抽样窗口命中）或 ≥10 个其他章名 → 中度（强证据） |
 | 任意章数 | 空章 + 标题占位章占比 ≥50% → 「多章无正文」（≥5 章才判定） |
+| 任意章数 | 目录（`output/<id>/_catalog.json`）里有、导出章节里没有，且标题以**非引用**形式出现在别章正文中 → 「章节缺失」（《标题》算文献引用，不算证据） |
 
 「小章」= 正文字数 < max(200 字, 全书 1%)；「标题占位章」= 正文只有章名本身。
 全书不足 5000 字（样本太小）不判定。
@@ -43,6 +45,7 @@ python detect_merged_chapters.py --include-output   # 连 output/<id>/chapters �
 | 严重 | 单章 ≥80%（或 5—9 章时 ≥90%）且其余章基本是占位章 | 基本可确定是合并，直接重抓 |
 | 中度 | 单章过半且其余多为小章，或有强交叉证据 | 抽看一两章正文后重抓 |
 | 可疑 | 单章过半，但其余章都有实质正文（默认不列出，加 `--include-suspect`） | 可能只是正常长章 |
+| 章节缺失 | 目录里的章在导出结果中缺失，其标题出现在别章正文里 | 该章正文被并进邻章，需重抓 |
 | 多章无正文 | 大量空章/标题占位章 | 属于另一类缺失，单独复核 |
 
 输出里的 `最大章为书前/书末项` 是关键提示：占到全书大头的章若是「后记 / 附录 / 索引 /
@@ -57,7 +60,8 @@ python detect_merged_chapters.py --include-output   # 连 output/<id>/chapters �
 ```
 
 `--tsv <path>` 写出明细表（级别 / book_id / 书名 / 章数 / 总字数 / 最大章序号 / 最大章名 /
-占比 / 其余小章数 / 小章占比 / 空章数 / 占位章数 / 最大章为书末项 / 混入章名 / 正文重复章 / 来源）。
+占比 / 其余小章数 / 小章占比 / 空章数 / 占位章数 / 最大章为书末项 / 混入章名 / 正文重复章 /
+目录缺失章 / 来源）。
 `--json` 输出机器可读结果。
 
 ## 发现后如何处置（需用户确认后再动）

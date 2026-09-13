@@ -78,11 +78,16 @@ _BOOKEND_TITLE_RE = re.compile(
 LEVEL_ORDER = {
     "严重": 0,
     "中度": 1,
-    "可疑": 2,
-    "多章无正文": 3,
+    "章节缺失": 2,
+    "可疑": 3,
+    "多章无正文": 4,
 }
 
 _WS_RE = re.compile(r"[\s\u3000\u200b\u200c\u200d\ufeff\u2060]+")
+# 引用文献里的书名/篇名：《标题》不算「标题出现在正文中」
+_QUOTE_OPEN = "《"
+_QUOTE_CLOSE = "》"
+_CATALOG_TITLE_MIN_LEN = 3
 
 
 def normalize_text(text: str) -> str:
@@ -115,6 +120,7 @@ def chapter_rows(body: Iterable[dict]) -> list[dict]:
 def analyze_rows(
     rows: list[dict],
     *,
+    catalog_titles=None,
     min_chapters: int = MIN_CHAPTERS,
     min_total_chars: int = MIN_TOTAL_CHARS,
     major_share: float = MAJOR_SHARE,
@@ -150,6 +156,7 @@ def analyze_rows(
         tiny_for_major = tiny_for_severe = TINY_RATIO_FEW_CHAPTERS
 
     evidence = content_overlap_evidence(rows, top)
+    missing = missing_catalog_titles(rows, catalog_titles)
     levels: list[str] = []
     if top_share >= severe and tiny_ratio >= tiny_for_severe:
         levels.append("严重")
@@ -166,6 +173,8 @@ def analyze_rows(
         )
     ):
         levels.append("中度")
+    if missing:
+        levels.append("章节缺失")
     if not levels and blank_ratio_value >= blank_ratio:
         levels.append("多章无正文")
     if not levels:
@@ -187,6 +196,8 @@ def analyze_rows(
         "leaked_names": evidence["leaked_names"],
         "duplicated_chapters": evidence["duplicated_chapters"],
         "bookend_top": is_bookend_title(top["name"]),
+        "missing": len(missing),
+        "missing_chapters": missing[:20],
     }
 
 
@@ -221,7 +232,61 @@ def is_bookend_title(title: str) -> bool:
     return bool(_BOOKEND_TITLE_RE.match(normalize_text(title)))
 
 
-def analyze_book_json(path: Path, **kwargs) -> dict | None:
+def appears_unquoted(text: str, key: str) -> bool:
+    """key 是否以「非引用」形式出现在正文里（《key》只算文献引用）。"""
+    if not key or key not in text:
+        return False
+    start = 0
+    while True:
+        pos = text.find(key, start)
+        if pos < 0:
+            return False
+        quoted = (
+            pos > 0
+            and text[pos - 1] == _QUOTE_OPEN
+            and text[pos + len(key):pos + len(key) + 1] == _QUOTE_CLOSE
+        )
+        if not quoted:
+            return True
+        start = pos + len(key)
+
+
+def missing_catalog_titles(rows: list[dict], catalog_titles) -> list[str]:
+    """目录里有、导出章节里没有，且标题以非引用形式出现在某章正文中的条目。
+
+    这类条目说明该章正文被并进了别的章（导出时漏切章），是「章节缺失」的信号。
+    """
+    if not catalog_titles:
+        return []
+    names = {normalize_text(r["name"]) for r in rows}
+    texts = [r["text"] for r in rows]
+    missing: list[str] = []
+    for raw in catalog_titles:
+        title = str(raw or "").strip()
+        key = normalize_text(title)
+        if len(key) < _CATALOG_TITLE_MIN_LEN or key in names:
+            continue
+        if is_bookend_title(title):
+            continue
+        if any(appears_unquoted(text, key) for text in texts):
+            missing.append(title)
+    return missing
+
+
+def load_catalog_titles(catalog_path: Path | None) -> list[str]:
+    """读取导出时抓到的目录 _catalog.json；没有返回 []。"""
+    if not catalog_path or not catalog_path.is_file():
+        return []
+    try:
+        titles = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return [str(t) for t in titles] if isinstance(titles, list) else []
+
+
+def analyze_book_json(
+    path: Path, *, catalog_path: Path | None = None, **kwargs
+) -> dict | None:
     """读取成品 JSON 并体检；格式不符返回 None。"""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -230,7 +295,12 @@ def analyze_book_json(path: Path, **kwargs) -> dict | None:
     body = data.get("body")
     if not isinstance(body, list):
         return None
-    result = analyze_rows(chapter_rows(body), **kwargs)
+    catalog_titles = kwargs.pop("catalog_titles", None)
+    if catalog_titles is None:
+        catalog_titles = load_catalog_titles(catalog_path)
+    result = analyze_rows(
+        chapter_rows(body), catalog_titles=catalog_titles, **kwargs
+    )
     if result is None:
         return None
     result["book_id"] = path.name.split("_", 1)[0]
@@ -279,17 +349,23 @@ def run(
     *,
     books_dir: Path = BOOKS_DIR,
     output_root: Path | None = None,
+    catalog_root: Path | None = Path("output"),
     include_suspect: bool = False,
     **kwargs,
 ) -> dict:
-    """扫描 books_dir（可选叠加 output 中间产物），返回体检结果。"""
+    """扫描 books_dir（可选叠加 output 中间产物与目录），返回体检结果。"""
     findings: list[dict] = []
     scanned = 0
     skipped_small = 0
     seen_ids: set[str] = set()
     for path in iter_json_books(books_dir):
-        result = analyze_book_json(path, **kwargs)
         book_id = path.name.split("_", 1)[0]
+        catalog_path = (
+            Path(catalog_root) / book_id / "_catalog.json"
+            if catalog_root is not None
+            else None
+        )
+        result = analyze_book_json(path, catalog_path=catalog_path, **kwargs)
         seen_ids.add(book_id)
         scanned += 1
         if result is None:
@@ -321,6 +397,8 @@ def format_finding(item: dict) -> str:
     evidence = []
     if item["bookend_top"]:
         evidence.append("最大章为书前/书末项")
+    if item.get("missing"):
+        evidence.append(f"目录缺失{int(item['missing'])}章并入他章")
     if item["leaked_names"]:
         evidence.append(f"混入其他章名{item['leaked_names']}个")
     if item["duplicated_chapters"]:
@@ -368,7 +446,8 @@ def print_report(result: dict, *, limit: int = 0) -> None:
 def write_tsv(path: Path, findings: list[dict]) -> None:
     header = (
         "级别\tbook_id\t书名\t章数\t总字数\t最大章序号\t最大章名\t占比\t"
-        "其余小章数\t小章占比\t空章数\t占位章数\t最大章为书末项\t混入章名\t正文重复章\t来源\n"
+        "其余小章数\t小章占比\t空章数\t占位章数\t最大章为书末项\t混入章名\t正文重复章"
+        "\t目录缺失章\t来源\n"
     )
     lines = [
         "\t".join(
@@ -388,6 +467,7 @@ def write_tsv(path: Path, findings: list[dict]) -> None:
                 "是" if f["bookend_top"] else "否",
                 str(f["leaked_names"]),
                 str(f["duplicated_chapters"]),
+                str(f.get("missing", 0)),
                 f["source"],
             ]
         )
@@ -412,6 +492,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("output"),
         help="中间产物根目录，配 --include-output 使用（默认 output）",
+    )
+    parser.add_argument(
+        "--catalog-root",
+        type=Path,
+        default=Path("output"),
+        help="用 <root>/<book_id>/_catalog.json 交叉核对章节是否缺失（默认 output）",
     )
     parser.add_argument(
         "--include-output",
@@ -456,6 +542,7 @@ def main(argv: list[str] | None = None) -> int:
     result = run(
         books_dir=args.books_dir,
         output_root=args.output_root if args.include_output else None,
+        catalog_root=args.catalog_root,
         include_suspect=args.include_suspect,
         min_chapters=args.min_chapters,
         min_total_chars=args.min_chars,
