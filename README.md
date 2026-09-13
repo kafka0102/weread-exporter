@@ -111,6 +111,33 @@ python fetch_shelf.py --author-interval 8
 
 > 登录过期时 `--headless` 无法弹扫码页，去掉 `--headless` 重新扫一次即可。
 
+### 4. 空叶子章节体检与增量修复
+
+批量导出偶发“目录里有、但抓到的正文为空”的叶子章节（最后一章豁免）。
+这类问题不需要整本重下，用 `repair_empty_chapters.py` 只补抓空章：
+
+```bash
+# 空跑：列出问题书 ID/书名与空章（默认模式，不改任何文件）
+python repair_empty_chapters.py --dry-run
+python repair_empty_chapters.py --dry-run --book <book_id>
+
+# 只补抓空叶子章：不改 chapter_id、不插入/删除章节，仅更新 content/word_count
+python repair_empty_chapters.py --apply --no-prefer-largest-screen --book <book_id> \
+  --catalog-root output
+
+# 先刷新书架缓存再扫描（fetch_shelf.py 需可登录）
+python repair_empty_chapters.py --refresh-shelf --dry-run
+```
+
+- 只处理微信读书来源：ID 在 `data/shelf_books.txt`，或 `--catalog-root` 下有
+  `_catalog.json`；排除带 `source_url` / `kind`（十点古籍/搜韵/ctext）及非法 ID 的书。
+- 口径：内容为空的非末章叶子；书前/书末无正文项默认豁免（`--strict` 可含）；
+  章节数 ≤2 默认豁免（`--min-chapters` 可调）。
+- `--apply` 可加 `--limit N` / `--max-chapters N` 控制规模，逐本失败默认继续，
+  `--fail-fast` 改为失败即停；写 JSON 前自动备份到 `output/<id>/backups/`。
+- 结构性损坏（章节缺失/正文被并进邻章）不适用本脚本，应整本重下，见
+  `docs/reports/merged-chapters-2026-09-13.md`。
+
 ## 输出
 
 ```
