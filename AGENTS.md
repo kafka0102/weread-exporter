@@ -78,8 +78,11 @@
 | 触发场景 | skill 文件 |
 |----------|-----------|
 | 书架书去重：运行 `python dedupe_shelf_books.py`，按 forbid ID / 本地已下载 ID / **归一化主书名**（去装饰括号与副标题，**保留期刊期数**，**不比作者**）把 `shelf_books` 分到 `dup_books` / `new_books` | `.agents/skills/dedupe-shelf-books/SKILL.md`（同 `.claude/skills/dedupe-shelf-books/SKILL.md`） |
+| 已下载电子书体检：运行 `python detect_merged_chapters.py`，找出**单章占比异常偏高 / 正文被合并进单一章节 / 多章无正文**的书并给出分级清单（≤2 章的书豁免） | `.agents/skills/detect-merged-chapters/SKILL.md`（同 `.claude/skills/detect-merged-chapters/SKILL.md`） |
 
 当用户说"书架去重 / 找重复书 / 找新书 / 生成 dup_books、new_books / 剔除已下载"等，读上述 skill 并按其流程执行。
+
+当用户说"章节字数异常 / 单章占比过高 / 内容都合并到一章 / 章节为空 / 体检已下载电子书"等，读 `detect-merged-chapters` skill 并按其流程执行。
 
 ## 修改完成后必须自动提交
 
