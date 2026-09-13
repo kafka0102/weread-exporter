@@ -766,6 +766,10 @@ _TOC_MARKER_RE = re.compile(r"^(目\s*录|目\s*次|总\s*目|总\s*目\s*录|co
 CATALOG_PAGE_MARKER_TITLE_HITS = 2
 # 逻辑章已在目录末项、顶栏却仍停在更早章节：连续这么多页即判定越位灌末章
 LAST_CHAPTER_BEHIND_LIMIT = 3
+# 正文越章允许跳向「书末性质章名」的最大目录距离：超过此值仍出现
+# 附录/参考资料/后记这类标题，通常只是当前章内部同名小节的标题，
+# 不是真正的书末章，禁止越章跳转（避免几十章正文灌进书末章）。
+MAX_OVERRUN_BOOKEND_JUMP = 8
 # 标题前缀后若接这些成分，视为正文提及而非新章起始
 _NOT_CHAPTER_START_REST = re.compile(
     r"^(的|与|和|在|是|了|也|都|就|还|曾|并|便|则|却|又|已|将|会|能|要|"
@@ -880,6 +884,20 @@ def is_chapter_start_text(text: str, chapter_title: str) -> bool:
     # 压缩空白后全等
     tk, titlek = compact_title_key(t), compact_title_key(title)
     if tk and titlek and tk == titlek:
+        return True
+    # canvas 标题可能省略/多带「第N章/第N课」前缀（「雅乐部」vs 目录「第2章 雅乐部」）。
+    # 只做整行剥前缀后全等，且两侧编号一致或一侧无编号。
+    q_pre, q_rest = split_chapter_ordinal_prefix(t)
+    s_pre, s_rest = split_chapter_ordinal_prefix(title)
+    q_rest_key = compact_title_key(q_rest)
+    s_rest_key = compact_title_key(s_rest)
+    if (
+        q_rest_key
+        and s_rest_key
+        and q_rest_key == s_rest_key
+        and (not q_pre or not s_pre or q_pre == s_pre)
+        and q_pre != s_pre
+    ):
         return True
     # 极短标题（云/雪/雁/序/春日 等 ≤2 字）禁止前缀粘连正文
     if not titlek or len(titlek) <= 2:
@@ -1206,6 +1224,25 @@ def compact_title_key(text: str) -> str:
     return re.sub(r"\s+", "", s)
 
 
+# 章序前缀：目录「第2章 雅乐部 / 第一课 概 论」与 canvas/顶栏「雅乐部 / 第一课概论」
+# 互相对不齐时，按前缀剥掉后再比，否则 current 定位失败会让整段断章逻辑失明。
+# 「第2章」的「章」后常带空格，逐字无空格两种情况都要能剥。
+_CHAPTER_ORDINAL_PREFIX_RE = re.compile(
+    r"^第\s*[0-9０-９一二三四五六七八九十百千两]+\s*[章节课回篇部卷辑集]"
+)
+
+
+def split_chapter_ordinal_prefix(text: str) -> tuple[str, str]:
+    """把「第N章/第N课…」前缀与剩余标题拆开；无前缀时剩余即原文。"""
+    s = normalize_catalog_title(text or "")
+    if not s:
+        return "", ""
+    m = _CHAPTER_ORDINAL_PREFIX_RE.match(s)
+    if not m:
+        return "", s
+    return m.group(0), s[m.end():].strip()
+
+
 def clean_catalog_titles(titles) -> list[str]:
     """清洗目录列表：去进度污染、去空、保序去重。"""
     out: list[str] = []
@@ -1247,6 +1284,23 @@ def catalog_index(catalog_titles, title: str):
                 return i
             if nk and compact_title_key(cn) == nk:
                 return i
+        # 「第2章 雅乐部」vs「雅乐部」（或反向）：剥掉章序前缀后整串相等。
+        # 顺序编号必须一致或一侧没有编号，避免「第1节 x」误配「第2节 x」。
+        q_pre, q_rest = split_chapter_ordinal_prefix(norm)
+        if q_rest:
+            q_rest_key = compact_title_key(q_rest)
+            for i, c in enumerate(catalog_titles):
+                c_norm = normalize_catalog_title(c)
+                if not c_norm:
+                    continue
+                c_pre, c_rest = split_chapter_ordinal_prefix(c_norm)
+                c_rest_key = compact_title_key(c_rest)
+                if not c_rest_key or c_rest_key != q_rest_key:
+                    continue
+                if q_pre and c_pre and q_pre != c_pre:
+                    continue
+                if q_pre != c_pre or q_rest != c_norm:
+                    return i
         # 顶栏偶发更短/更长：仅当较短方≥4 且是较长方前缀/包含时放宽
         if nk and len(nk) >= 4:
             for i, c in enumerate(catalog_titles):
@@ -1553,11 +1607,17 @@ def find_future_catalog_hit(
     *,
     min_ahead: int = 1,
     max_ahead: int = 40,
+    header_title: str | None = None,
 ):
     """在正文中查找 current 之后第 min_ahead..max_ahead 个目录章首。
 
     返回 (title, before, after)；找不到则 None。
     多个命中时取正文中最早出现者；同位置取目录更靠前的。
+
+    header_title：阅读器顶栏章名。遥距出现的「书末性质章名」（附录/参考资料/
+    后记等）需要顶栏确认阅读器已到达该位置，才允许当作正文越章；否则只是当前章
+    内部同名小节标题（如「第三课附录」被画布拆成两行），越章会把中间几十章正文
+    全灌进书末章。
     """
     if not blocks or not catalog_titles:
         return None
@@ -1573,7 +1633,23 @@ def find_future_catalog_hit(
         return None
     best = None
     best_pos = None
-    for title in catalog_titles[start:end]:
+    header_idx = (
+        catalog_index(catalog_titles, header_title) if header_title else None
+    )
+    for i in range(start, end):
+        title = catalog_titles[i]
+        # 书末性质标题（附录/参考资料/后记等）离当前逻辑章很远就出现时，
+        # 多半是当前章内部同名的小节标题（如「第三课附录」被画布拆成
+        # 「第三课|附录」两行），不能当成正文越章跳过去，否则会让中间几十章
+        # 的正文全灌进书末章。相邻距离内的同名书末章仍放行（正常线性到达）。
+        if (
+            i != c_idx + 1
+            and (i - c_idx) > MAX_OVERRUN_BOOKEND_JUMP
+            and is_end_matter_title(title)
+        ):
+            # 顶栏未提供时不拦截（兼容无头/证据类调用）；提供且未到目标章才拦截
+            if header_idx is not None and header_idx < i:
+                continue
         # 命中章名后紧邻又是章名 → 目录列举，不是真正的章首
         if chapter_start_lacks_body_evidence(blocks, title, catalog_titles):
             continue
@@ -1639,11 +1715,21 @@ def skipped_next_chapter_evidence(
     return hit[0] or ""
 
 
-def content_overrun_split(blocks, catalog_titles, current_title: str, *, max_ahead: int = 40):
+def content_overrun_split(
+    blocks,
+    catalog_titles,
+    current_title: str,
+    *,
+    max_ahead: int = 40,
+    header_title: str | None = None,
+):
     """线性翻页策略下的正文越章恢复。
 
     当紧邻下一章标题未出现，但更后面的目录章首已出现在正文中时，
     在最早出现的后续章首处切开。返回 (hit_title, before, after)；否则 None。
+
+    header_title：可选的阅读器顶栏章名，用于确认遥距书末章名的越章（防同名
+    小节误跳，详见 find_future_catalog_hit）。
 
     注意：这会跳过中间未出现在正文中的目录项（通常是极短诗被 canvas 粘连/翻页越过）。
     中途绝不为此去点目录；漏章靠重开续传或接受短缺失，避免目录乱跳污染整卷。
@@ -1662,6 +1748,7 @@ def content_overrun_split(blocks, catalog_titles, current_title: str, *, max_ahe
         current_title,
         min_ahead=2 if nxt else 1,
         max_ahead=max_ahead,
+        header_title=header_title,
     )
 
 
@@ -3500,6 +3587,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         catalog_titles,
                         current_chapter,
                         max_ahead=max_ahead,
+                        header_title=header_now,
                     )
                     if not hit:
                         break
@@ -4066,6 +4154,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                                 catalog_titles,
                                 current_chapter,
                                 max_ahead=max_ahead,
+                                header_title=new_chapter,
                             )
                             if not hit:
                                 break

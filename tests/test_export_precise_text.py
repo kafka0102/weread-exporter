@@ -160,6 +160,204 @@ class TestCatalogTitleCleaning(unittest.TestCase):
 
 
 
+class TestChapterOrdinalPrefixAlignment(unittest.TestCase):
+    """目录带「第N章/第N课」前缀、canvas/顶栏不带时仍能定位与切章。"""
+
+    def test_catalog_index_matches_prefixed_and_bare(self):
+        catalog = [
+            "扉页",
+            "第1章 序",
+            "第2章 雅乐部",
+            "第29章 黄骢叠（急曲子）",
+            "第47章 乐府杂录跋",
+        ]
+        # 顶栏 bare 名 → 定位到带前缀的目录项
+        self.assertEqual(export_precise.catalog_index(catalog, "序"), 1)
+        self.assertEqual(export_precise.catalog_index(catalog, "雅乐部"), 2)
+        # 带前缀反向也能定位
+        self.assertEqual(
+            export_precise.catalog_index(catalog, "第2章 雅乐部"), 2
+        )
+        self.assertEqual(
+            export_precise.catalog_index(catalog, "黄骢叠（急曲子）"), 3
+        )
+        self.assertEqual(
+            export_precise.catalog_index(catalog, "乐府杂录跋"), 4
+        )
+
+    def test_catalog_index_ignores_differing_ordinal(self):
+        catalog = ["第1节 概论", "第2节 讨论"]
+        # 两侧都有编号但编号不同：不算命中
+        self.assertIsNone(export_precise.catalog_index(catalog, "第3节 概论"))
+        self.assertIsNone(export_precise.catalog_index(catalog, "第3节 讨论"))
+        # 一侧无编号：按剩余串命中
+        self.assertEqual(export_precise.catalog_index(catalog, "概论"), 0)
+        self.assertEqual(
+            export_precise.catalog_index(["第1节 概论", "讨论"], "第3节 讨论"), 1
+        )
+
+    def test_next_catalog_title_after_bare_current(self):
+        catalog = ["扉页", "第1章 序", "第2章 雅乐部"]
+        self.assertEqual(
+            export_precise.next_catalog_title(catalog, "序"), "第2章 雅乐部"
+        )
+
+    def test_is_chapter_start_text_with_ordinal_prefix(self):
+        self.assertTrue(
+            export_precise.is_chapter_start_text("雅乐部", "第2章 雅乐部")
+        )
+        self.assertTrue(
+            export_precise.is_chapter_start_text("第2章 雅乐部", "雅乐部")
+        )
+        # 正文提及不算章首
+        self.assertFalse(
+            export_precise.is_chapter_start_text(
+                "雅乐部宫悬四面天子乐也", "第2章 雅乐部"
+            )
+        )
+
+    def test_find_split_with_prefixed_catalog(self):
+        catalog = ["第1章 序", "第2章 雅乐部", "第4章 清乐部"]
+        blocks = [
+            {"type": "text", "text": "序言正文。"},
+            {"type": "text", "text": "第2章 雅乐部"},
+            {"type": "text", "text": "宫悬四面，天子乐也。"},
+        ]
+        found = export_precise.find_chapter_split(blocks, catalog, "序")
+        self.assertIsNotNone(found)
+        title, before, after = found
+        self.assertEqual(title, "第2章 雅乐部")
+        self.assertEqual(len(before), 1)
+        self.assertEqual(after[0]["text"], "第2章 雅乐部")
+
+    def test_find_split_with_bare_canvas_title(self):
+        catalog = ["第1章 序", "第2章 雅乐部", "第4章 清乐部"]
+        blocks = [
+            {"type": "text", "text": "序言正文。"},
+            {"type": "text", "text": "雅乐部"},
+            {"type": "text", "text": "宫悬四面，天子乐也。"},
+        ]
+        found = export_precise.find_chapter_split(blocks, catalog, "第1章 序")
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], "第2章 雅乐部")
+
+    def test_bare_short_title_still_guarded(self):
+        # 短名「云」仍然不能前缀命中正文
+        self.assertFalse(
+            export_precise.is_chapter_start_text("云破月来花弄影", "第1章 云")
+        )
+        self.assertTrue(
+            export_precise.is_chapter_start_text("云", "第1章 云")
+        )
+
+
+class TestContentOverrunBookendGuard(unittest.TestCase):
+    """书末性质章名离逻辑章很远出现时，不得当作正文越章跳过去。
+
+    典型事故：讲义第三课自带「附录」小节（画布拆成「第三课|附录」），
+    若被当成全书末章「附录」越章跳转，第四课到书末附录的几十章正文
+    会全部灌进「附录」一章。
+    """
+
+    def test_far_bookend_title_not_used_as_overrun(self):
+        catalog = [
+            "第一课",
+            "第二课",
+            "第三课",
+            "第四课",
+            "第五课",
+            "第六课",
+            "第七课",
+            "第八课",
+            "第九课",
+            "第十课",
+            "第十一课",
+            "第十二课",
+            "附录",
+        ]
+        blocks = [
+            {"type": "text", "text": "第三课正文尾句。"},
+            {"type": "text", "text": "第三课"},
+            {"type": "text", "text": "附录"},
+            {"type": "text", "text": "卫觊传……"},
+        ]
+        hit = export_precise.content_overrun_split(
+            blocks, catalog, "第三课", header_title="第三课"
+        )
+        self.assertIsNone(hit)
+
+    def test_far_bookend_allowed_when_header_confirms(self):
+        catalog = [
+            "第一课",
+            "第二课",
+            "第三课",
+            "第四课",
+            "第五课",
+            "第六课",
+            "第七课",
+            "第八课",
+            "第九课",
+            "第十课",
+            "第十一课",
+            "第十二课",
+            "附录",
+        ]
+        blocks = [
+            {"type": "text", "text": "第三课正文尾句。"},
+            {"type": "text", "text": "附录"},
+            {"type": "text", "text": "卫觊传……"},
+        ]
+        hit = export_precise.content_overrun_split(
+            blocks,
+            catalog,
+            "第三课",
+            header_title="附录",
+        )
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "附录")
+
+    def test_near_bookend_title_still_allowed(self):
+        catalog = ["第一课", "第二课", "第三课", "附录"]
+        blocks = [
+            {"type": "text", "text": "第三课正文尾句。"},
+            {"type": "text", "text": "附录"},
+            {"type": "text", "text": "专家文研究……"},
+        ]
+        hit = export_precise.content_overrun_split(
+            blocks, catalog, "第三课"
+        )
+        # 紧邻下一章已出现在正文：交回常规 find_chapter_split，不走越章
+        self.assertIsNone(hit)
+        found = export_precise.find_chapter_split(blocks, catalog, "第三课")
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], "附录")
+
+    def test_non_endmatter_far_jump_still_allowed(self):
+        # 非书末性质标题仍按原规则允许（诗集作者跨章等场景）
+        catalog = [
+            "来鹄 二首",
+            "云",
+            "蚕妇",
+            "王维 二十七首",
+            "渭川田家",
+            "宿郑州",
+            "西施咏",
+            "桃源行",
+            "陇头吟",
+            "辛夷坞",
+        ]
+        blocks = [
+            {"type": "text", "text": "来鹄正文。"},
+            {"type": "text", "text": "辛夷坞"},
+            {"type": "text", "text": "木末芙蓉花"},
+        ]
+        hit = export_precise.content_overrun_split(
+            blocks, catalog, "来鹄 二首"
+        )
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "辛夷坞")
+
+
 class TestHeaderChapterProgress(unittest.TestCase):
     """顶栏不得把已内容切章前进的目录进度回退。"""
 
