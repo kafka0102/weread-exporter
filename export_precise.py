@@ -741,6 +741,16 @@ HARD_RUNAWAY_CHAPTER_LINES = 12000
 HARD_RUNAWAY_CHAPTER_PAGES = 400
 # 顶栏跨过「下一章」仍持续灌入新正文时，连续确认后按正文切章（不点目录）
 HEADER_MULTI_AHEAD_CONFIRM = 2
+# 印刷目录页：一页里出现这么多「目录章名」且占该页文本行比例达标，视为目录列举页。
+# 目录页里的章名只是目录条目，不能当章首切章（否则会一路推进到目录末章，正文全灌末章）。
+CATALOG_PAGE_TITLE_HITS = 3
+CATALOG_PAGE_TITLE_SHARE = 0.4
+# 目录页不会有成句正文；正文行占比高于此值说明是正文页（诗歌页尤其常见）
+CATALOG_PAGE_PROSE_MAX_SHARE = 0.6
+# 目录项里不会出现的句末标点：带这些标点的行按正文行算
+_PROSE_LINE_MARKS = "。！？；"
+# 逻辑章已在目录末项、顶栏却仍停在更早章节：连续这么多页即判定越位灌末章
+LAST_CHAPTER_BEHIND_LIMIT = 3
 # 标题前缀后若接这些成分，视为正文提及而非新章起始
 _NOT_CHAPTER_START_REST = re.compile(
     r"^(的|与|和|在|是|了|也|都|就|还|曾|并|便|则|却|又|已|将|会|能|要|"
@@ -917,6 +927,123 @@ def split_blocks_at_chapter_start(blocks, chapter_title: str):
     return list(blocks), []
 
 
+def _page_text_lines(blocks) -> list[str]:
+    """当前页的文本行（去空白，保序）。"""
+    out: list[str] = []
+    for block in blocks or []:
+        if block.get("type") != "text":
+            continue
+        line = strip_format_chars((block.get("text") or "").strip())
+        if line:
+            out.append(line)
+    return out
+
+
+def catalog_page_title_hits(blocks, catalog_titles) -> list[str]:
+    """本页以「整行/整行拼接」形式出现的目录章名（保序去重）。
+
+    只认「整行（或 canvas 折行拼接后）恰好等于目录项」的行：
+    目录页的条目正是这个形态，而正文行首顺带带出章名（如「舟中晓望正文注释」
+    或索引条目「《刘禹锡新论》刘青海著」）不会被算成目录条目。
+    """
+    keyed: dict[str, str] = {}
+    for raw in catalog_titles or []:
+        title = normalize_catalog_title(raw)
+        key = compact_title_key(title)
+        if not key or key in keyed:
+            continue
+        keyed[key] = title
+    if not keyed:
+        return []
+    max_key_len = max(len(key) for key in keyed)
+    lines = [compact_title_key(line) for line in _page_text_lines(blocks)]
+    hits: list[str] = []
+    seen: set[str] = set()
+    for i in range(len(lines)):
+        joined = ""
+        for j in range(i, min(len(lines), i + 4)):
+            joined += lines[j]
+            if not joined:
+                break
+            if len(joined) > max_key_len:
+                break
+            if joined in keyed and joined not in seen:
+                seen.add(joined)
+                hits.append(keyed[joined])
+                break
+    return hits
+
+
+def _line_is_catalog_title(line: str, catalog_titles) -> bool:
+    """整行（压缩空白后）是否等于某个目录章名。"""
+    key = compact_title_key(line)
+    if not key:
+        return False
+    for raw in catalog_titles or []:
+        if key == compact_title_key(raw):
+            return True
+    return False
+
+
+def _page_catalog_stats(blocks, catalog_titles) -> tuple[int, int, int]:
+    """(命中的目录章名数, 本页文本行数, 带句末标点的正文行数)。"""
+    lines = _page_text_lines(blocks)
+    hits = catalog_page_title_hits(blocks, catalog_titles)
+    prose = sum(1 for line in lines if any(ch in _PROSE_LINE_MARKS for ch in line))
+    return len(hits), len(lines), prose
+
+
+def looks_like_catalog_page(blocks, catalog_titles) -> bool:
+    """整页基本都是目录章名 → 判定为书内印刷目录页。"""
+    if not blocks or not catalog_titles:
+        return False
+    hits, lines, prose = _page_catalog_stats(blocks, catalog_titles)
+    if lines < CATALOG_PAGE_TITLE_HITS or hits < CATALOG_PAGE_TITLE_HITS:
+        return False
+    if hits / lines < CATALOG_PAGE_TITLE_SHARE:
+        return False
+    return not prose or prose / lines <= CATALOG_PAGE_PROSE_MAX_SHARE
+
+
+def chapter_start_lacks_body_evidence(
+    blocks, chapter_title: str, catalog_titles
+) -> bool:
+    """命中章首后紧邻的下一行又是目录章名 → 目录列举，缺少正文佐证。
+
+    真正的章首后面跟的是正文；目录页里章名是挨着排的。仅在整页章名占比
+    达标时生效，避免正文页里「章名 + 下一章名」的正常起始被误判。
+    """
+    if not blocks or not catalog_titles:
+        return False
+    hits, lines, _prose = _page_catalog_stats(blocks, catalog_titles)
+    if lines < CATALOG_PAGE_TITLE_HITS or hits < CATALOG_PAGE_TITLE_HITS:
+        return False
+    if hits / lines < CATALOG_PAGE_TITLE_SHARE:
+        return False
+    title_key = compact_title_key(chapter_title)
+    if not title_key:
+        return False
+    text_lines = _page_text_lines(blocks)
+    for i, line in enumerate(text_lines):
+        key = compact_title_key(line)
+        if not key:
+            continue
+        if key != title_key and not (
+            len(title_key) > 2 and key.startswith(title_key)
+        ):
+            continue
+        if not is_chapter_start_text(line, chapter_title):
+            continue
+        nxt = text_lines[i + 1].strip() if i + 1 < len(text_lines) else ""
+        return bool(nxt) and _line_is_catalog_title(nxt, catalog_titles)
+    return False
+
+
+def blocks_are_catalog_page(blocks, catalog_titles) -> bool:
+    """当前页是否为「目录列举页」：页内章名不能当作章首切章。"""
+    return looks_like_catalog_page(blocks, catalog_titles)
+
+
 # 目录项 textContent 偶发粘上阅读进度，如「王国维当前读到 99%」
 _CATALOG_PROGRESS_RE = re.compile(
     r"(当前读到|已读到|读到)\s*\d+\s*%?\s*$"
@@ -1046,6 +1173,32 @@ def is_last_catalog_chapter(current_title: str, catalog_titles) -> bool:
         return False
     idx = catalog_index(catalog_titles, current_title)
     return idx is not None and idx == len(catalog_titles) - 1
+
+
+def last_chapter_overrun_evidence(
+    blocks, catalog_titles, current_title: str, header_title: str
+) -> bool:
+    """逻辑章已到目录末项、读者却仍停在更早章节的越位证据。
+
+    此时继续翻页会把整本书的正文灌进「末章」（历史事故：末章 37 万字装全书）。
+    判定要求正文里确实还停着更早的章首，避免把「末章顶栏显示卷/节名」误判成越位。
+    """
+    if not blocks or not catalog_titles or not header_title:
+        return False
+    if not is_last_catalog_chapter(current_title, catalog_titles):
+        return False
+    delta = catalog_index_delta(catalog_titles, current_title, header_title)
+    if delta is None or delta >= 0:
+        return False
+    cur_idx = catalog_index(catalog_titles, current_title)
+    nxt = next_catalog_title(catalog_titles, header_title)
+    if not nxt:
+        return False
+    nxt_idx = catalog_index(catalog_titles, nxt)
+    if cur_idx is None or nxt_idx is None or nxt_idx >= cur_idx:
+        return False
+    _before, after = split_blocks_at_chapter_start(blocks, nxt)
+    return bool(after)
 
 
 # 文末性质标题：书末附录/后记等；卡住时按全书完成收尾，避免无限重开
@@ -1284,6 +1437,9 @@ def find_future_catalog_hit(
     """
     if not blocks or not catalog_titles:
         return None
+    # 书内印刷目录/索引列举页：页内章名只是目录条目，不能据此切章
+    if blocks_are_catalog_page(blocks, catalog_titles):
+        return None
     c_idx = catalog_index(catalog_titles, current_title)
     if c_idx is None:
         return None
@@ -1294,6 +1450,9 @@ def find_future_catalog_hit(
     best = None
     best_pos = None
     for title in catalog_titles[start:end]:
+        # 命中章名后紧邻又是章名 → 目录列举，不是真正的章首
+        if chapter_start_lacks_body_evidence(blocks, title, catalog_titles):
+            continue
         before, after = split_blocks_at_chapter_start(blocks, title)
         if not after:
             continue
@@ -1391,10 +1550,15 @@ def find_chapter_split(blocks, catalog_titles, current_title: str):
     """
     if not blocks or not catalog_titles:
         return None
+    # 印刷目录页：页内章名是目录列举，不能当章首切章
+    if blocks_are_catalog_page(blocks, catalog_titles):
+        return None
     cur = normalize_catalog_title(current_title)
     if cur:
         nxt = next_catalog_title(catalog_titles, cur)
         if not nxt:
+            return None
+        if chapter_start_lacks_body_evidence(blocks, nxt, catalog_titles):
             return None
         before, after = split_blocks_at_chapter_start(blocks, nxt)
         if not after:
@@ -2904,6 +3068,11 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         MAX_EMPTY_HEADER_RESYNC = 1
         # 顶栏跨过多章却仍持续抓到「新正文」时的确认计数（防止双页顶栏闪烁误跳）
         header_multi_ahead_hits = 0
+        # 逻辑章已在目录末项、顶栏却仍在更早章节的确认计数（越位灌末章防护）
+        last_chapter_behind_hits = 0
+        # 上一页是否为被丢弃的印刷目录页（属正常翻页前进，不能算空转 stale）
+        catalog_page_skipped = False
+        catalog_pages_skipped = 0
         # 顶栏长期停在上一章时，允许一次目录重定位到逻辑章
         header_lag_resync_used = 0
         # 中途默认不点目录；仅翻页空转/顶栏错位时有限次目录跳转
@@ -2942,15 +3111,22 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             - 整页指纹在本章已出现过 → 翻页空转，丢弃并记 cycle
             - 文本行若出现在「上一页」→ 跳过（双页重叠半页）
             - 本章已出现的长行 → 跳过（折行抖动下的循环重灌）
+            - 书内印刷目录页 → 整页丢弃（页内章名是目录列举，不能当章首切章）
             """
             nonlocal ch_blocks, last_page_fp, last_page_lines
             nonlocal seen_page_fps, chapter_seen_lines, page_cycle_hits
+            nonlocal catalog_page_skipped
             await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
             chars = await page.evaluate("() => window.__wr_chars")
             rects = await page.evaluate(CANVAS_RECTS_JS)
             imgs = await page.evaluate(VIEWPORT_IMGS_JS)
             new_blocks = build_page_blocks(chars, imgs, rects, seen_imgs)
             if not new_blocks:
+                return False
+            if blocks_are_catalog_page(new_blocks, catalog_titles):
+                catalog_page_skipped = True
+                last_page_fp = page_blocks_fingerprint(new_blocks)
+                last_page_lines = set()
                 return False
             page_fp = page_blocks_fingerprint(new_blocks)
             if page_fp and page_fp == last_page_fp:
@@ -3450,6 +3626,23 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     print(
                         f"    … 顶栏「{new_chapter[:20]}」/逻辑「{(current_chapter or '')[:20]}」"
                     )
+            # 越位灌末章防护：逻辑章已到目录末项，正文/顶栏却仍在更早章节时，
+            # 丢弃脏缓冲并重开会话续传，绝不把整本书写进末章
+            if last_chapter_overrun_evidence(
+                    ch_blocks, catalog_titles, current_chapter, new_chapter):
+                last_chapter_behind_hits += 1
+            else:
+                last_chapter_behind_hits = 0
+            if last_chapter_behind_hits >= LAST_CHAPTER_BEHIND_LIMIT:
+                print(
+                    f"    … 逻辑章已在目录末项「{(current_chapter or '')[:20]}」，"
+                    f"正文仍停在「{(new_chapter or '')[:20]}」："
+                    f"判定章节失同步，丢弃脏缓冲并重开会话续传"
+                    f"（避免整本书灌进末章）"
+                )
+                adopt_chapter_blocks([])
+                request_reopen = True
+                break
             if new_chapter and should_follow_header_title(
                     catalog_titles, current_chapter, new_chapter):
                 # 标题栏前进：先把已窜入上一章末尾的新章内容剥回
@@ -3534,7 +3727,23 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     break
                 continue
 
+            catalog_page_skipped = False
             got_new = await capture_current_page()
+            if catalog_page_skipped and not got_new:
+                # 书内印刷目录页：整页章名只是目录列举，已按规则丢弃，属正常翻页前进
+                catalog_pages_skipped += 1
+                if catalog_pages_skipped <= 1 or catalog_pages_skipped % 5 == 0:
+                    print(
+                        f"    … 印刷目录页（第 {catalog_pages_skipped} 页）："
+                        f"页内章名属目录列举，整页跳过（当前「"
+                        f"{(current_chapter or '')[:20]}」）"
+                    )
+                stale = 0
+                empty_page_streak = 0
+                near_end_fail_streak = 0
+                turn_method_idx = 0
+                page_num += 1
+                continue
             # 偶发：页已翻但 fillText 迟到 → 短重绘再抓（禁止 repaint 后再 reset）
             # 注意：完整 recover（含左右键）绝不能每轮空翻都跑，否则单次 10s+ 像卡死。
             if not got_new:

@@ -1036,3 +1036,176 @@ class TestFarAheadOverrunAndStaleAdvance(unittest.TestCase):
         )
         self.assertTrue(export_precise.is_end_matter_title("附录歌曲"))
 
+
+class TestPrintedCatalogPageDetection(unittest.TestCase):
+    """书内印刷目录页：页内章名属目录列举，不能当章首切章。
+
+    真实事故：唐代文学研究年鉴（2021）正文前有印刷目录，切章规则把目录里
+    的章名当成连续章首，一路推进到目录末章，整本书正文都灌进最后一章。
+    """
+
+    CATALOG = [
+        "扉页",
+        "版权信息",
+        "一年记事",
+        "第十四届唐代文化国际学术研讨会在台湾召开",
+        "中国唐诗之路研究会首届年会暨第二次学术研讨会、浙江诗路文化带高峰论坛在浙江台州召开",
+        "四川省杜甫学会理事会暨四川省杜甫学会成立四十周年纪念会在成都召开",
+        "会议综述",
+        "初唐文学",
+        "盛唐文学",
+        "中唐文学",
+        "晚唐五代文学",
+        "王维研究",
+        "李白研究",
+        "杜甫研究",
+        "韩愈研究",
+        "柳宗元研究",
+        "2020年唐代文学研究论文索引",
+    ]
+
+    # 印刷目录页真实样本（阅读器第 13 页）
+    TOC_PAGE = [
+        {"type": "text", "text": "盛唐文学"},
+        {"type": "text", "text": "中唐文学"},
+        {"type": "text", "text": "晚唐五代文学"},
+        {"type": "text", "text": "王维研究"},
+        {"type": "text", "text": "李白研究"},
+        {"type": "text", "text": "杜甫研究"},
+        {"type": "text", "text": "韩愈研究"},
+    ]
+
+    # 正文里的「章名 + 下一章名」起始页（阅读器第 18 页）：必须仍能切章
+    SECTION_PAGE = [
+        {"type": "text", "text": "一年记事"},
+        {"type": "text", "text": "第十四届唐代文化国际学术研讨会在台湾召开"},
+        {
+            "type": "text",
+            "text": "2020年11月27日至28日，“第十四届唐代文化国际学术研讨会”在台湾召开。会议首日于淡江大学举行开幕式。",
+        },
+    ]
+
+    def test_toc_page_detected(self):
+        self.assertTrue(
+            export_precise.looks_like_catalog_page(self.TOC_PAGE, self.CATALOG)
+        )
+        self.assertTrue(
+            export_precise.blocks_are_catalog_page(self.TOC_PAGE, self.CATALOG)
+        )
+
+    def test_body_and_section_pages_not_detected(self):
+        self.assertFalse(
+            export_precise.looks_like_catalog_page(self.SECTION_PAGE, self.CATALOG)
+        )
+        body_page = [
+            {"type": "text", "text": "2020年11月27日至28日，第十四届唐代文化国际学术研讨会在台湾召开。"},
+            {"type": "text", "text": "本次会议发表人次足有58人，参加学者包含现场及在线，更达百人。"},
+            {"type": "text", "text": "在文学方面，则多在唐诗研究，尤以对白居易发微甚多。"},
+        ]
+        self.assertFalse(
+            export_precise.looks_like_catalog_page(body_page, self.CATALOG)
+        )
+
+    def test_poetry_page_with_short_titles_not_detected(self):
+        """诗歌页常一页多首：章名占比不高，不能误判成目录页。"""
+        catalog = ["鹿柴", "相思", "杂诗"]
+        page = [
+            {"type": "text", "text": "鹿柴"},
+            {"type": "text", "text": "空山不见人，但闻人语响。"},
+            {"type": "text", "text": "返景入深林，复照青苔上。"},
+            {"type": "text", "text": "相思"},
+            {"type": "text", "text": "红豆生南国，春来发几枝。"},
+            {"type": "text", "text": "愿君多采撷，此物最相思。"},
+            {"type": "text", "text": "杂诗"},
+            {"type": "text", "text": "君自故乡来，应知故乡事。"},
+        ]
+        self.assertFalse(export_precise.looks_like_catalog_page(page, catalog))
+        self.assertIsNotNone(
+            export_precise.find_chapter_split(page, catalog, "鹿柴")
+        )
+
+    def test_no_split_inside_printed_catalog_page(self):
+        """目录页不能切章，否则会连推多章、把正文全灌末章。"""
+        self.assertIsNone(
+            export_precise.find_chapter_split(
+                self.TOC_PAGE, self.CATALOG, "版权信息"
+            )
+        )
+        self.assertIsNone(
+            export_precise.find_future_catalog_hit(
+                self.TOC_PAGE, self.CATALOG, "版权信息", min_ahead=1
+            )
+        )
+        self.assertIsNone(
+            export_precise.content_overrun_split(
+                self.TOC_PAGE, self.CATALOG, "版权信息"
+            )
+        )
+
+    def test_section_page_still_splits(self):
+        """正文起始页的「节名 + 首个条目名」不是目录列举，仍要正常切章。"""
+        self.assertFalse(
+            export_precise.chapter_start_lacks_body_evidence(
+                self.SECTION_PAGE, "一年记事", self.CATALOG
+            )
+        )
+        split = export_precise.find_chapter_split(
+            self.SECTION_PAGE, self.CATALOG, "版权信息"
+        )
+        self.assertIsNotNone(split)
+        self.assertEqual(split[0], "一年记事")
+
+    def test_catalog_listing_lacks_body_evidence(self):
+        self.assertTrue(
+            export_precise.chapter_start_lacks_body_evidence(
+                self.TOC_PAGE, "盛唐文学", self.CATALOG
+            )
+        )
+
+
+class TestLastChapterOverrunGuard(unittest.TestCase):
+    """末章越位防护：逻辑章已在目录末项而正文仍停在前面时，必须停下重开会话。"""
+
+    CATALOG = [
+        "版权信息",
+        "一年记事",
+        "第十四届唐代文化国际学术研讨会在台湾召开",
+        "2020年唐代文学研究专著索引",
+        "2020年唐代文学研究论文索引",
+    ]
+
+    def test_evidence_when_reader_still_in_front_matter(self):
+        blocks = [
+            {"type": "text", "text": "一年记事"},
+            {"type": "text", "text": "第十四届唐代文化国际学术研讨会在台湾召开"},
+            {"type": "text", "text": "2020年11月27日至28日，第十四届唐代文化国际学术研讨会在台湾召开。"},
+        ]
+        self.assertTrue(
+            export_precise.last_chapter_overrun_evidence(
+                blocks, self.CATALOG, "2020年唐代文学研究论文索引", "一年记事"
+            )
+        )
+
+    def test_no_evidence_for_normal_last_chapter(self):
+        """正常末章：正文是索引条目，顶栏就是末章。"""
+        blocks = [
+            {"type": "text", "text": "2020年唐代文学研究论文索引"},
+            {"type": "text", "text": "唐诗选本经典性及相关问题的几点思考　查洪德、袁梅　中州学刊2020.1"},
+        ]
+        self.assertFalse(
+            export_precise.last_chapter_overrun_evidence(
+                blocks,
+                self.CATALOG,
+                "2020年唐代文学研究论文索引",
+                "2020年唐代文学研究论文索引",
+            )
+        )
+        # 顶栏显示小节名、正文只有索引条目：不算越位
+        self.assertFalse(
+            export_precise.last_chapter_overrun_evidence(
+                blocks,
+                self.CATALOG,
+                "2020年唐代文学研究论文索引",
+                "2020年唐代文学研究专著索引",
+            )
+        )
