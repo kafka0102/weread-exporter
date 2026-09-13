@@ -58,11 +58,14 @@ EVIDENCE_NAME_MIN_LEN = 4
 # 交叉印证时其他章正文的抽样窗口（足够长才算重复，避免套话/固定句式误命中）
 EVIDENCE_WINDOW = 24
 EVIDENCE_STEP = 15
-# 同一章至少这么多个窗口出现在最大章内，才认定该章正文被合并
-EVIDENCE_MIN_WINDOW_HITS = 2
+# 同一章 ≥ 此比例的抽样窗口出现在最大章内，才认定该章正文被合并
+# （真实合并≈100%，偶然撞句多在 2% 以下）
+EVIDENCE_DUP_RATIO = 0.5
+# 太短的章窗口太少，不参与正文重复判定
+EVIDENCE_DUP_MIN_CHARS = 200
 # 强证据：最大章占比 ≥ 此比例，且混入其他章正文 ≥3 章或章名 ≥10 个 → 直接判合并
 EVIDENCE_SHARE_FLOOR = 0.3
-EVIDENCE_DUP_CHAPTERS = 3
+EVIDENCE_DUP_CHAPTERS = 2
 EVIDENCE_LEAKED_NAMES = 10
 
 # 书前/书末性质章名：这类章吞掉全书基本可确定是合并，正文性章名需人工复核
@@ -199,12 +202,16 @@ def content_overlap_evidence(rows: list[dict], top: dict) -> dict:
             leaked_names += 1
         if row["chars"] < EVIDENCE_WINDOW * 3:
             continue
+        if row["chars"] < EVIDENCE_DUP_MIN_CHARS:
+            continue
         windows = [
             row["text"][pos:pos + EVIDENCE_WINDOW]
             for pos in range(0, row["chars"] - EVIDENCE_WINDOW, EVIDENCE_STEP)
         ]
+        if not windows:
+            continue
         hits = sum(1 for w in windows if w in top["text"])
-        if hits >= min(EVIDENCE_MIN_WINDOW_HITS, len(windows)):
+        if hits / len(windows) >= EVIDENCE_DUP_RATIO:
             duplicated += 1
     return {"leaked_names": leaked_names, "duplicated_chapters": duplicated}
 
