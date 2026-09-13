@@ -1163,6 +1163,95 @@ class TestPrintedCatalogPageDetection(unittest.TestCase):
         )
 
 
+class TestCatalogPageRunaway(unittest.TestCase):
+    """书末印刷目录页空转：反复回读同一页时必须收尾，不能无限跳过。
+
+    真实事故：本书（「今文学」与晚清诗学的演变）正文末章「后记」读完后，
+    读者翻到电子书自带的印刷目录页（封面/书名页/…/后记 列举），翻页键在末两页
+    之间来回横跳；旧逻辑每页都判为目录页并清零 stale，连跳 295 页仍不结束。
+    """
+
+    CATALOG = [
+        "封面",
+        "书名页",
+        "版权信息",
+        "内容简介",
+        "作者简介",
+        "绪论",
+        "第一章 晚清诗学演变的历史因缘",
+        "结语",
+        "参考文献",
+        "后记",
+    ]
+
+    # 书末印刷目录页真实样本（阅读器第 13 页，目录末尾三项）
+    TAIL_TOC_PAGE = [
+        {"type": "text", "text": "结语"},
+        {"type": "text", "text": "参考文献"},
+        {"type": "text", "text": "后记"},
+    ]
+
+    def test_tail_toc_page_is_catalog_page(self):
+        self.assertTrue(
+            export_precise.blocks_are_catalog_page(
+                self.TAIL_TOC_PAGE, self.CATALOG
+            )
+        )
+
+    def test_single_skip_is_not_runaway(self):
+        """印刷目录页只跳过一两次属正常翻页前进，不能误判为空转。"""
+        self.assertFalse(
+            export_precise.is_catalog_page_runaway(repeat_hits=1, skip_streak=1)
+        )
+        self.assertFalse(
+            export_precise.is_catalog_page_runaway(repeat_hits=2, skip_streak=3)
+        )
+
+    def test_repeated_catalog_page_is_runaway(self):
+        """同一目录页指纹反复出现（末两页横跳）→ 判定空转。"""
+        seen: dict = {}
+        repeat_hits = 0
+        # 页 A ↔ 页 B 来回翻：两页指纹各自累计
+        for fingerprint in ("fpA", "fpB", "fpA", "fpB", "fpA"):
+            repeat_hits = max(
+                repeat_hits,
+                export_precise.note_catalog_page_seen(seen, fingerprint),
+            )
+        self.assertEqual(repeat_hits, 3)
+        self.assertTrue(
+            export_precise.is_catalog_page_runaway(
+                repeat_hits=repeat_hits, skip_streak=5
+            )
+        )
+
+    def test_long_skip_streak_is_runaway(self):
+        """连续跳过大量目录页且毫无进度 → 兜底判定空转。"""
+        limit = export_precise.CATALOG_PAGE_SKIP_LIMIT
+        self.assertFalse(
+            export_precise.is_catalog_page_runaway(
+                repeat_hits=0, skip_streak=limit - 1
+            )
+        )
+        self.assertTrue(
+            export_precise.is_catalog_page_runaway(
+                repeat_hits=0, skip_streak=limit
+            )
+        )
+
+    def test_note_catalog_page_seen_ignores_empty_fingerprint(self):
+        seen: dict = {}
+        self.assertEqual(
+            export_precise.note_catalog_page_seen(seen, ""), 0
+        )
+        self.assertEqual(seen, {})
+        self.assertEqual(
+            export_precise.note_catalog_page_seen(seen, "fp"), 1
+        )
+        self.assertEqual(
+            export_precise.note_catalog_page_seen(seen, "fp"), 2
+        )
+
+
 class TestLastChapterOverrunGuard(unittest.TestCase):
     """末章越位防护：逻辑章已在目录末项而正文仍停在前面时，必须停下重开会话。"""
 

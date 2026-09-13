@@ -747,6 +747,12 @@ CATALOG_PAGE_TITLE_HITS = 3
 CATALOG_PAGE_TITLE_SHARE = 0.4
 # 目录页不会有成句正文；正文行占比高于此值说明是正文页（诗歌页尤其常见）
 CATALOG_PAGE_PROSE_MAX_SHARE = 0.6
+# 同一目录页反复出现 / 连续跳过过多目录页却毫无进度：判定书末目录页空转。
+# 书末常带一册「印刷目录」（封面/书名页/…/后记 的列举页）；读完后翻页键既可能
+# 停在原地反复回读同一页，也会在末两页之间来回横跳。此时若继续「整页丢弃」并
+# 清零 stale，就会无限空转（历史事故：同一本书连跳 295 页仍不结束）。
+CATALOG_PAGE_REPEAT_LIMIT = 3
+CATALOG_PAGE_SKIP_LIMIT = 40
 # 目录项里不会出现的句末标点：带这些标点的行按正文行算
 _PROSE_LINE_MARKS = "。！？；"
 # 逻辑章已在目录末项、顶栏却仍停在更早章节：连续这么多页即判定越位灌末章
@@ -1042,6 +1048,26 @@ def chapter_start_lacks_body_evidence(
 def blocks_are_catalog_page(blocks, catalog_titles) -> bool:
     """当前页是否为「目录列举页」：页内章名不能当作章首切章。"""
     return looks_like_catalog_page(blocks, catalog_titles)
+
+
+def note_catalog_page_seen(seen_counts: dict, fingerprint: str) -> int:
+    """记录一次「整页被判为目录页」，返回该页指纹累计出现次数。"""
+    if not fingerprint:
+        return 0
+    seen_counts[fingerprint] = int(seen_counts.get(fingerprint, 0)) + 1
+    return seen_counts[fingerprint]
+
+
+def is_catalog_page_runaway(*, repeat_hits: int, skip_streak: int) -> bool:
+    """目录页反复出现 / 连续跳过过多且毫无进度 → 书末印刷目录页空转。
+
+    命中后必须停止「整页丢弃 + 清零 stale」，改按本页无新内容处理，
+    交给停滞/文末收尾逻辑结束全书，否则会在书末无限空转。
+    """
+    return (
+        int(repeat_hits or 0) >= CATALOG_PAGE_REPEAT_LIMIT
+        or int(skip_streak or 0) >= CATALOG_PAGE_SKIP_LIMIT
+    )
 
 
 # 目录项 textContent 偶发粘上阅读进度，如「王国维当前读到 99%」
@@ -3073,6 +3099,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         # 上一页是否为被丢弃的印刷目录页（属正常翻页前进，不能算空转 stale）
         catalog_page_skipped = False
         catalog_pages_skipped = 0
+        # 目录页空转检测：同一目录页指纹累计次数、连续跳过目录页数
+        catalog_page_fps: dict[str, int] = {}
+        catalog_page_repeat_hits = 0
+        catalog_page_skip_streak = 0
         # 顶栏长期停在上一章时，允许一次目录重定位到逻辑章
         header_lag_resync_used = 0
         # 中途默认不点目录；仅翻页空转/顶栏错位时有限次目录跳转
@@ -3086,9 +3116,14 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             keep_chapter_progress=True：保留本章已抓行/页指纹（仅清「上一页」重叠态）。
             """
             nonlocal last_page_fp, last_page_lines, seen_page_fps, chapter_seen_lines, page_cycle_hits
+            nonlocal catalog_page_fps, catalog_page_repeat_hits
+            nonlocal catalog_page_skip_streak
             last_page_fp = ""
             last_page_lines = set()
             page_cycle_hits = 0
+            catalog_page_fps = {}
+            catalog_page_repeat_hits = 0
+            catalog_page_skip_streak = 0
             if keep_chapter_progress:
                 return
             seen_page_fps = set()
@@ -3116,6 +3151,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             nonlocal ch_blocks, last_page_fp, last_page_lines
             nonlocal seen_page_fps, chapter_seen_lines, page_cycle_hits
             nonlocal catalog_page_skipped
+            nonlocal catalog_page_fps, catalog_page_repeat_hits
             await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
             chars = await page.evaluate("() => window.__wr_chars")
             rects = await page.evaluate(CANVAS_RECTS_JS)
@@ -3126,6 +3162,11 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if blocks_are_catalog_page(new_blocks, catalog_titles):
                 catalog_page_skipped = True
                 last_page_fp = page_blocks_fingerprint(new_blocks)
+                # 记指纹出现次数：同一目录页反复出现 = 翻页没前进（书末横跳）
+                catalog_page_repeat_hits = max(
+                    catalog_page_repeat_hits,
+                    note_catalog_page_seen(catalog_page_fps, last_page_fp),
+                )
                 last_page_lines = set()
                 return False
             page_fp = page_blocks_fingerprint(new_blocks)
@@ -3515,7 +3556,36 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             )
             await force_reader_repaint(page)
             await recover_reader_text_after_nav(page, allow_nudge=True)
-            await capture_current_page()
+            bootstrap_got = await capture_current_page()
+            # 续传时阅读器常停在上次中断的位置：书末电子书自带印刷目录页，
+            # 顶栏已是待抓章，正文却还在更前面。此时目录重定位回本章章首再抓，
+            # 否则整章会被空写（历史事故：「后记」0 字落盘后直接收尾）。
+            if (
+                not bootstrap_got
+                and catalog_page_skipped
+                and current_chapter
+                and catalog_titles
+                and catalog_index(catalog_titles, current_chapter) is not None
+            ):
+                print(
+                    f"    … 首页是印刷目录页（当前「"
+                    f"{(current_chapter or '')[:20]}」）："
+                    f"目录重定位到本章章首后重抓"
+                )
+                landed = await jump_catalog_and_reanchor(
+                    current_chapter,
+                    reason="首页落在印刷目录页",
+                    clear_buffer=False,
+                )
+                if landed:
+                    current_chapter = landed
+                bootstrap_got = await capture_current_page()
+                if bootstrap_got:
+                    print(
+                        f"    … 重定位后抓到正文「"
+                        f"{(current_chapter or '')[:24]}」"
+                        f"（{chapter_text_line_count(ch_blocks)} 行）"
+                    )
         while await split_if_next_chapter_started():
             if reached_end:
                 break
@@ -3732,18 +3802,33 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if catalog_page_skipped and not got_new:
                 # 书内印刷目录页：整页章名只是目录列举，已按规则丢弃，属正常翻页前进
                 catalog_pages_skipped += 1
+                catalog_page_skip_streak += 1
                 if catalog_pages_skipped <= 1 or catalog_pages_skipped % 5 == 0:
                     print(
                         f"    … 印刷目录页（第 {catalog_pages_skipped} 页）："
                         f"页内章名属目录列举，整页跳过（当前「"
                         f"{(current_chapter or '')[:20]}」）"
                     )
-                stale = 0
-                empty_page_streak = 0
-                near_end_fail_streak = 0
-                turn_method_idx = 0
-                page_num += 1
-                continue
+                if is_catalog_page_runaway(
+                    repeat_hits=catalog_page_repeat_hits,
+                    skip_streak=catalog_page_skip_streak,
+                ):
+                    # 书末印刷目录页空转：翻页键已停在同一（或末两）页反复回读，
+                    # 再继续「丢页 + 清零 stale」就是死循环。改按「本页无新内容」
+                    # 处理，让 stale/文末收尾逻辑结束全书。
+                    print(
+                        f"    … 书末印刷目录页空转：累计跳过 {catalog_pages_skipped} 页，"
+                        f"同一目录页重复 {catalog_page_repeat_hits} 次，"
+                        f"不再清零 stale，改按本页无新内容收尾"
+                        f"（当前「{(current_chapter or '')[:20]}」）"
+                    )
+                else:
+                    stale = 0
+                    empty_page_streak = 0
+                    near_end_fail_streak = 0
+                    turn_method_idx = 0
+                    page_num += 1
+                    continue
             # 偶发：页已翻但 fillText 迟到 → 短重绘再抓（禁止 repaint 后再 reset）
             # 注意：完整 recover（含左右键）绝不能每轮空翻都跑，否则单次 10s+ 像卡死。
             if not got_new:
@@ -3784,6 +3869,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 near_end_fail_streak = 0
                 turn_method_idx = 0
                 empty_header_resync = 0
+                # 抓到正文 = 翻页确实前进了：目录页空转计数清零重算
+                catalog_page_fps.clear()
+                catalog_page_repeat_hits = 0
+                catalog_page_skip_streak = 0
                 if page_num == 1 or page_num % 2 == 0:
                     print(
                         f"    … 翻页中 p={page_num} 本章约 {n_lines} 行 "
