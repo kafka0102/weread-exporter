@@ -75,6 +75,20 @@ class TestSplitBlocksAtChapterStart(unittest.TestCase):
         self.assertEqual(len(before), 1)
         self.assertEqual(after[0]["text"], "张志和渔父西塞山前白鹭飞，桃花流水鳜鱼肥。")
 
+    def test_prose_line_starting_with_chapter_name_is_not_start(self):
+        """「柳宗元研究本年度论文数量最多…」是正文提及，不能当章首。"""
+        self.assertFalse(
+            export_precise.is_chapter_start_text(
+                "柳宗元研究本年度论文数量最多，涉及面广泛，角度亦较多样，"
+                "而以柳宗元的思想、作品、后世接受研究的论文较出色。",
+                "柳宗元研究",
+            )
+        )
+        # 目录里正常的短粘连仍要认（词牌/首句）
+        self.assertTrue(
+            export_precise.is_chapter_start_text("张志和渔父西塞山前白鹭飞", "张志和")
+        )
+
     def test_no_split_on_inline_mention(self):
         """正文中提及下一作者名不应误切。"""
         blocks = [

@@ -741,6 +741,9 @@ HARD_RUNAWAY_CHAPTER_LINES = 12000
 HARD_RUNAWAY_CHAPTER_PAGES = 400
 # 顶栏跨过「下一章」仍持续灌入新正文时，连续确认后按正文切章（不点目录）
 HEADER_MULTI_AHEAD_CONFIRM = 2
+# 章名后允许粘连的最长尾巴：词牌/首句（「张志和渔父西塞山前白鹭飞…」）可以，
+# 「柳宗元研究本年度论文数量最多…」这类正文提及不行（会被误当成章首而越章）
+CHAPTER_START_PREFIX_MAX_TAIL = 24
 # 印刷目录页：一页里出现这么多「目录章名」且占该页文本行比例达标，视为目录列举页。
 # 目录页里的章名只是目录条目，不能当章首切章（否则会一路推进到目录末章，正文全灌末章）。
 CATALOG_PAGE_TITLE_HITS = 3
@@ -895,10 +898,26 @@ def is_chapter_start_text(text: str, chapter_title: str) -> bool:
         return False
     if _NOT_CHAPTER_START_REST.match(rest):
         return False
+    # 章名后只允许词牌/首句这类短粘连；「柳宗元研究本年度论文数量最多…」
+    # 这种「章名 + 长正文」是正文提及，不是章首（否则会越章跳过真正的下一章）
+    if len(rest) > CHAPTER_START_PREFIX_MAX_TAIL:
+        return False
     return True
 
 
-def split_blocks_at_chapter_start(blocks, chapter_title: str):
+def is_exact_chapter_title(text: str, chapter_title: str) -> bool:
+    """整行是否就是章名本身（忽略空白/零宽字符），不允许任何粘连尾巴。"""
+    t = strip_format_chars((text or "").strip())
+    title = normalize_catalog_title(chapter_title)
+    if not t or not title:
+        return False
+    if t == title:
+        return True
+    tk, titlek = compact_title_key(t), compact_title_key(title)
+    return bool(tk and titlek and tk == titlek)
+
+
+def split_blocks_at_chapter_start(blocks, chapter_title: str, *, exact: bool = False):
     """在 blocks 中按 chapter_title 章首切分为 (before, after)。
 
     after 为空表示未找到章首；before 可能为空（整页已属新章）。
@@ -927,7 +946,12 @@ def split_blocks_at_chapter_start(blocks, chapter_title: str):
             if not piece:
                 continue
             joined = piece if not joined else (joined + piece)
-            if is_chapter_start_text(joined, title):
+            matched = (
+                is_exact_chapter_title(joined, title)
+                if exact
+                else is_chapter_start_text(joined, title)
+            )
+            if matched:
                 return blocks[:i], blocks[i:]
             jk = compact_title_key(joined)
             # 已比标题长仍不是章首前缀，停止向后拼
@@ -1489,7 +1513,9 @@ def find_future_catalog_hit(
         # 命中章名后紧邻又是章名 → 目录列举，不是真正的章首
         if chapter_start_lacks_body_evidence(blocks, title, catalog_titles):
             continue
-        before, after = split_blocks_at_chapter_start(blocks, title)
+        # 越章只认「整行就是章名」的章首：正文里「柳宗元研究本年度论文数量最多…」
+        # 这类粘连行会把逻辑章提前推到后面的章，跳掉真正的下一章
+        before, after = split_blocks_at_chapter_start(blocks, title, exact=True)
         if not after:
             continue
         pos = len(blocks) - len(after)
