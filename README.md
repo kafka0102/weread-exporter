@@ -53,7 +53,7 @@ python export_precise.py d31323b0813abaf26g0137c2 --download-images --prefer-lar
 python export_precise.py d31323b0813abaf26g0137c2 --out-dir ~/data/weixin/books --prefer-largest-screen
 
 # 批量：不传 book_id，读取 data/new_books.txt 中尚未导出的书
-# 书与书默认间隔 60s（SLEEP_BOOK_INTERVAL）；任一本失败则停止
+# 书与书默认间隔 6s（SLEEP_BOOK_INTERVAL）；任一本失败则停止
 # data/forbid_books.txt 中的 weread ID 会被跳过（不算失败）
 python export_precise.py --prefer-largest-screen
 python export_precise.py --list data/new_books.txt --prefer-largest-screen
@@ -68,7 +68,7 @@ python export_precise.py d31323b0813abaf26g0137c2 --headless --prefer-largest-sc
 - 自动跳到全书开头（原生点击目录首项），逐页翻到全书末尾自动停止
 - **自动续传**：中途卡住会重开浏览器，从上次章节继续；中间产物在 `output/<book_id>/`
 - **全书成功后**才写入 `~/data/weixin/books/<book_id>_<书名>.json`（字段对齐 dedao/json：纯文本 content、`has_content`、空元数据键；可用 `BOOKS_DIR` / `--out-dir` 覆盖）
-- 章切换后按该章字数动态等待：`ceil(字数/2000)*SLEEP_CHAPTER_PER_2K_CHARS`，夹在 `SLEEP_CHAPTER_MIN`–`SLEEP_CHAPTER_MAX`（默认 0.3–2 秒）
+- 章切换后按该章字数动态等待：`ceil(字数/2000)*SLEEP_CHAPTER_PER_2K_CHARS`，夹在 `SLEEP_CHAPTER_MIN`–`SLEEP_CHAPTER_MAX`（默认 0.3–1 秒）
 - 默认不下载图片；需要时加 `--download-images`。正文 md 中间产物仍可含 `images/` 相对路径引用
 
 ### 2. 下载图片
