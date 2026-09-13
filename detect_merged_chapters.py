@@ -67,6 +67,8 @@ EVIDENCE_DUP_MIN_CHARS = 200
 EVIDENCE_SHARE_FLOOR = 0.3
 EVIDENCE_DUP_CHAPTERS = 2
 EVIDENCE_LEAKED_NAMES = 10
+# 缺章信号：目录缺失项要少于已导出章数的这个比例（否则更像「篇/节嵌套被拍平」，属正常）
+MISSING_RATIO_LIMIT = 0.3
 
 # 书前/书末性质章名：这类章吞掉全书基本可确定是合并，正文性章名需人工复核
 _BOOKEND_TITLE_RE = re.compile(
@@ -87,7 +89,10 @@ _WS_RE = re.compile(r"[\s\u3000\u200b\u200c\u200d\ufeff\u2060]+")
 # 引用文献里的书名/篇名：《标题》不算「标题出现在正文中」
 _QUOTE_OPEN = "《"
 _QUOTE_CLOSE = "》"
-_CATALOG_TITLE_MIN_LEN = 3
+_CATALOG_TITLE_MIN_LEN = 4
+# 标题行后允许跟的短尾巴（作者署名、序号），超过则视为普通正文提及
+# 目录项与导出章名允许的前后缀差（如目录「第1章 序言」 vs 导出「序言」）
+_TITLE_PREFIX_MAX = 6
 
 
 def normalize_text(text: str) -> str:
@@ -102,7 +107,8 @@ def chapter_rows(body: Iterable[dict]) -> list[dict]:
         if not isinstance(chapter, dict):
             continue
         name = str(chapter.get("chapter_name") or "")
-        text = normalize_text(str(chapter.get("content") or ""))
+        raw = str(chapter.get("content") or "")
+        text = normalize_text(raw)
         rows.append(
             {
                 "index": i,
@@ -173,7 +179,8 @@ def analyze_rows(
         )
     ):
         levels.append("中度")
-    if missing:
+    # 目录缺失项远多于已导出章时，多半是「篇/节嵌套被拍平」的正常情况，不报
+    if missing and len(missing) <= max(2.0, chapters * MISSING_RATIO_LIMIT):
         levels.append("章节缺失")
     if not levels and blank_ratio_value >= blank_ratio:
         levels.append("多章无正文")
@@ -232,23 +239,37 @@ def is_bookend_title(title: str) -> bool:
     return bool(_BOOKEND_TITLE_RE.match(normalize_text(title)))
 
 
-def appears_unquoted(text: str, key: str) -> bool:
-    """key 是否以「非引用」形式出现在正文里（《key》只算文献引用）。"""
-    if not key or key not in text:
+def title_appears_unquoted(texts: Iterable[str], key: str) -> bool:
+    """key 是否以非引用形式出现在正文里（《key》/«key» 只算文献引用）。"""
+    if not key:
         return False
-    start = 0
-    while True:
-        pos = text.find(key, start)
-        if pos < 0:
-            return False
-        quoted = (
-            pos > 0
-            and text[pos - 1] == _QUOTE_OPEN
-            and text[pos + len(key):pos + len(key) + 1] == _QUOTE_CLOSE
-        )
-        if not quoted:
+    for text in texts:
+        start = 0
+        while True:
+            pos = text.find(key, start)
+            if pos < 0:
+                break
+            left = text[pos - 1] if pos > 0 else ""
+            right = text[pos + len(key):pos + len(key) + 1]
+            if not (left in {_QUOTE_OPEN, "«"} and right in {_QUOTE_CLOSE, "»"}):
+                return True
+            start = pos + len(key)
+    return False
+
+
+def title_matches_chapter_name(key: str, names: Iterable[str]) -> bool:
+    """目录项是否已作为某一章导出（容忍「第N章」等短前后缀差异）。"""
+    for name in names:
+        if not name:
+            continue
+        if name == key:
             return True
-        start = pos + len(key)
+        short, long = (name, key) if len(name) <= len(key) else (key, name)
+        if len(long) - len(short) > _TITLE_PREFIX_MAX:
+            continue
+        if long.startswith(short) or long.endswith(short):
+            return True
+    return False
 
 
 def missing_catalog_titles(rows: list[dict], catalog_titles) -> list[str]:
@@ -264,11 +285,13 @@ def missing_catalog_titles(rows: list[dict], catalog_titles) -> list[str]:
     for raw in catalog_titles:
         title = str(raw or "").strip()
         key = normalize_text(title)
-        if len(key) < _CATALOG_TITLE_MIN_LEN or key in names:
+        if len(key) < _CATALOG_TITLE_MIN_LEN:
+            continue
+        if title_matches_chapter_name(key, names):
             continue
         if is_bookend_title(title):
             continue
-        if any(appears_unquoted(text, key) for text in texts):
+        if title_appears_unquoted(texts, key):
             missing.append(title)
     return missing
 

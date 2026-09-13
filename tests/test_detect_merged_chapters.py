@@ -140,7 +140,13 @@ class AnalyzeRowsTests(unittest.TestCase):
         body.append(
             {
                 "chapter_name": "第七章",
-                "content": "第七章正文" + "李白研究" + "□雷子帧本文综述李白研究进展" * 40,
+                "content": (
+                    "第七章正文\n\n"
+                    "本章讨论唐代文学研究的进展。\n\n"
+                    "李白研究\n\n"
+                    "□雷子帧本文综述李白研究进展。\n\n"
+                    + "学界对李白的研究持续推进。\n\n" * 40
+                ),
             }
         )
         result = dm.analyze_rows(dm.chapter_rows(body), catalog_titles=catalog)
@@ -157,7 +163,7 @@ class AnalyzeRowsTests(unittest.TestCase):
         body.append(
             {
                 "chapter_name": "第七章",
-                "content": "第七章正文" + "参见《李白研究》一书。" * 60,
+                "content": "第七章正文\n\n参见《李白研究》一书。\n\n" * 40,
             }
         )
         self.assertIsNone(dm.analyze_rows(dm.chapter_rows(body), catalog_titles=catalog))
