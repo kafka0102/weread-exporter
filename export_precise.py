@@ -755,6 +755,10 @@ CATALOG_PAGE_REPEAT_LIMIT = 3
 CATALOG_PAGE_SKIP_LIMIT = 40
 # 目录项里不会出现的句末标点：带这些标点的行按正文行算
 _PROSE_LINE_MARKS = "。！？；"
+# 书内印刷目录页常见标记行（「目录 / 目次 / 总目」独占一行）
+_TOC_MARKER_RE = re.compile(r"^(目\s*录|目\s*次|总\s*目|总\s*目\s*录|contents)$", re.I)
+# 出现「目录」标记行时，页内只需这么多个目录章名即可判定为目录页
+CATALOG_PAGE_MARKER_TITLE_HITS = 2
 # 逻辑章已在目录末项、顶栏却仍停在更早章节：连续这么多页即判定越位灌末章
 LAST_CHAPTER_BEHIND_LIMIT = 3
 # 标题前缀后若接这些成分，视为正文提及而非新章起始
@@ -1004,6 +1008,12 @@ def looks_like_catalog_page(blocks, catalog_titles) -> bool:
     if not blocks or not catalog_titles:
         return False
     hits, lines, prose = _page_catalog_stats(blocks, catalog_titles)
+    # 页面上出现「目录」标记行，且页内已有多个目录章名：印刷目录页
+    # （这类页面常把每卷的品目拼成长行，章名占比不高，光看占比会漏判）
+    if hits >= CATALOG_PAGE_MARKER_TITLE_HITS and any(
+        _TOC_MARKER_RE.match(line) for line in _page_text_lines(blocks)
+    ):
+        return True
     if lines < CATALOG_PAGE_TITLE_HITS or hits < CATALOG_PAGE_TITLE_HITS:
         return False
     if hits / lines < CATALOG_PAGE_TITLE_SHARE:
@@ -2145,6 +2155,30 @@ async def dismiss_reader_overlays(page) -> bool:
     return bool(removed)
 
 
+async def has_visible_catalog_items(page) -> bool:
+    """目录面板里是否已有可见目录项。
+
+    宽屏布局下微信读书把目录做成常驻侧栏，`is_reader_catalog_open()` 会判为
+    「未遮挡正文」；但目录项其实已经可见，无需再点目录按钮（点了反而收起）。
+    """
+    try:
+        return bool(
+            await page.evaluate(
+                """() => Array.from(document.querySelectorAll('.readerCatalog_list_item'))
+                    .some(el => {
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden') return false;
+                        if (parseFloat(st.opacity || '1') < 0.05) return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width >= 40 && r.height >= 16
+                            && r.bottom > 0 && r.top < window.innerHeight;
+                    })"""
+            )
+        )
+    except Exception:
+        return False
+
+
 async def is_reader_catalog_open(page) -> bool:
     """目录/目录搜索层是否真正展开并遮挡阅读区。
 
@@ -2176,6 +2210,33 @@ async def is_reader_catalog_open(page) -> bool:
                         document.querySelectorAll('.readerCatalog_list_item')
                     ).filter(el => visibleBox(el, 40, 16));
 
+                    // 宽屏下微信读书把目录做成右侧常驻侧栏：它不遮挡正文画布，
+                    // 翻页键仍然有效。只有目录面板盖住正文时才算「阻塞翻页」。
+                    const blocksReader = () => {
+                        const canvases = Array.from(document.querySelectorAll('canvas'))
+                            .map(c => c.getBoundingClientRect())
+                            .filter(r => r.width > 100 && r.height > 200
+                                && r.bottom > 0 && r.top < window.innerHeight);
+                        if (!canvases.length) return true;
+                        const isCatalog = (el) => !!(el && el.closest
+                            && el.closest('[class*="readerCatalog"],[class*="Catalog"]'));
+                        let total = 0, covered = 0;
+                        for (const r of canvases) {
+                            for (let i = 1; i <= 5; i++) {
+                                for (let j = 1; j <= 5; j++) {
+                                    const x = r.left + r.width * i / 6;
+                                    const y = r.top + r.height * j / 6;
+                                    if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) continue;
+                                    total += 1;
+                                    if (isCatalog(document.elementFromPoint(x, y))) covered += 1;
+                                }
+                            }
+                        }
+                        if (!total) return true;
+                        // 侧栏只压住半个跨页（宽屏常驻目录）时不算阻塞
+                        return covered / total >= 0.6;
+                    };
+
                     // A) 真搜索态：可见「取消」+ 可见可点的搜索输入
                     const cancelBtns = Array.from(document.querySelectorAll('button, a, span, div'))
                         .filter(el => {
@@ -2186,12 +2247,12 @@ async def is_reader_catalog_open(page) -> bool:
                         'input[placeholder*="搜索"], input[type="search"]'
                     )).filter(el => visibleBox(el, 40, 12));
                     if (cancelBtns.length && searchInputs.length) {
-                        return true;
+                        return blocksReader();
                     }
 
                     // B) 有可见目录项 = 目录真正展开（最可靠）
                     if (visibleCatalogItems().length > 0) {
-                        return true;
+                        return blocksReader();
                     }
 
                     // C) 蒙层 + 可见目录列表（不要用「DOM 里有搜索 input」当证据）
@@ -2207,7 +2268,7 @@ async def is_reader_catalog_open(page) -> bool:
                             && r.left > -100) {
                             if (document.querySelector('.readerCatalog_list, .readerCatalog_list_scroll_area')
                                 && visibleCatalogItems().length > 0) {
-                                return true;
+                                return blocksReader();
                             }
                         }
                     }
@@ -2225,7 +2286,7 @@ async def is_reader_catalog_open(page) -> bool:
                         ).some(it => visibleBox(it, 40, 16));
                         if (!hasVisItem) continue;
                         if (r.width >= 200 && r.height >= 200) {
-                            return true;
+                            return blocksReader();
                         }
                     }
                     return false;
@@ -2413,9 +2474,10 @@ async def open_reader_catalog(page) -> bool:
     """打开目录；若已打开则直接成功。处理 wr_mask 拦截。
 
     成功标准：出现可见的 `.readerCatalog_list_item`（关闭态 DOM 里虽有节点但宽高为 0）。
+    宽屏下微信读书把目录做成常驻侧栏：此时目录项已可见，无需（也不能）再点目录按钮。
     """
     await restore_reader_catalog_styles(page)
-    if await is_reader_catalog_open(page):
+    if await is_reader_catalog_open(page) or await has_visible_catalog_items(page):
         await blur_reader_inputs(page)
         return True
     await dismiss_reader_overlays(page)

@@ -1162,6 +1162,26 @@ class TestPrintedCatalogPageDetection(unittest.TestCase):
             )
         )
 
+    def test_toc_marker_page_with_glued_entries(self):
+        """目录标记行 + 品目长行的印刷目录页（诗式首页）也要识别出来。"""
+        catalog = ["扉页", "序", "卷一", "卷二", "卷三", "卷四", "卷五"]
+        page = [
+            {"type": "text", "text": "序"},
+            {"type": "text", "text": "诗式［唐］皎然"},
+            {"type": "text", "text": "目录"},
+            {"type": "text", "text": "卷一"},
+            {
+                "type": "text",
+                "text": "序明势明作用明四声诗有四不诗有四深诗有二要诗有二废诗有四离诗有六迷",
+            },
+            {"type": "text", "text": "卷二"},
+            {"type": "text", "text": "作用事第二格三良诗‘西北有浮云'"},
+        ]
+        self.assertTrue(export_precise.looks_like_catalog_page(page, catalog))
+        self.assertIsNone(
+            export_precise.find_chapter_split(page, catalog, "序")
+        )
+
 
 class TestCatalogPageRunaway(unittest.TestCase):
     """书末印刷目录页空转：反复回读同一页时必须收尾，不能无限跳过。
