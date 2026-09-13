@@ -744,6 +744,8 @@ HEADER_MULTI_AHEAD_CONFIRM = 2
 # 章名后允许粘连的最长尾巴：词牌/首句（「张志和渔父西塞山前白鹭飞…」）可以，
 # 「柳宗元研究本年度论文数量最多…」这类正文提及不行（会被误当成章首而越章）
 CHAPTER_START_PREFIX_MAX_TAIL = 24
+# 年鉴类正文小节常与前段同行：章名后紧跟署名标记（「…成果量的发展变化□王兆鹏陈小青」）
+_BYLINE_MARKERS = "□▢■○●◆◇"
 # 印刷目录页：一页里出现这么多「目录章名」且占该页文本行比例达标，视为目录列举页。
 # 目录页里的章名只是目录条目，不能当章首切章（否则会一路推进到目录末章，正文全灌末章）。
 CATALOG_PAGE_TITLE_HITS = 3
@@ -958,7 +960,69 @@ def split_blocks_at_chapter_start(blocks, chapter_title: str, *, exact: bool = F
             if jk and titlek and len(jk) > len(titlek) + 24:
                 if not jk.startswith(titlek):
                     break
+    if not exact:
+        inline = split_block_at_inline_byline_title(blocks, title)
+        if inline is not None:
+            return inline
     return list(blocks), []
+
+
+def split_block_at_inline_byline_title(blocks, chapter_title: str):
+    """章名夹在段落中间、且其后紧跟署名标记时，从该处切开。
+
+    年鉴/文集里的小节标题常与前一段落在同一 canvas 行（还可能夹着插图），例如
+    「…所呈现的形象。20世纪下半叶台湾唐代文学研究成果量[图]的发展变化□王兆鹏陈小青…」。
+    这类小节靠行首匹配永远切不开，只能按「章名 + 署名标记」就地下刀。
+    """
+    title = normalize_catalog_title(chapter_title)
+    if not title:
+        return None
+    needles = [title]
+    titlek = compact_title_key(title)
+    if titlek and titlek != title:
+        needles.append(titlek)
+    items = list(blocks or [])
+    for i, block in enumerate(items):
+        if block.get("type") != "text":
+            continue
+        # 章名可能被插图切成两块，因此拼接时跳过非文本块（图片等）
+        joined = ""
+        spans: list[tuple[int, int, int]] = []
+        for j in range(i, min(len(items), i + 8)):
+            piece = (
+                strip_format_chars((items[j].get("text") or "").strip())
+                if items[j].get("type") == "text"
+                else ""
+            )
+            if not piece:
+                continue
+            spans.append((j, len(joined), len(piece)))
+            joined += piece
+            if len(joined) > 200:
+                break
+        if not joined:
+            continue
+        for needle in needles:
+            for marker in _BYLINE_MARKERS:
+                pos = joined.find(needle + marker)
+                if pos <= 0:
+                    continue
+                for block_index, start, length in spans:
+                    if not (start <= pos < start + length):
+                        continue
+                    head = joined[start:pos].strip()
+                    tail = joined[pos:start + length].strip()
+                    if not tail:
+                        break
+                    before = list(items[:block_index])
+                    if head:
+                        before.append({**items[block_index], "text": head})
+                    after = [
+                        {**items[block_index], "text": tail},
+                        *list(items[block_index + 1:]),
+                    ]
+                    return before, after
+    return None
 
 
 def _page_text_lines(blocks) -> list[str]:

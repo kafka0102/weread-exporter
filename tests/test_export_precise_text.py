@@ -89,6 +89,33 @@ class TestSplitBlocksAtChapterStart(unittest.TestCase):
             export_precise.is_chapter_start_text("张志和渔父西塞山前白鹭飞", "张志和")
         )
 
+    def test_inline_byline_subsection_is_split(self):
+        """年鉴小节标题与前段同行、中间还夹着插图时，仍要切开。"""
+        title = "20世纪下半叶台湾唐代文学研究成果量的发展变化"
+        blocks = [
+            {"type": "text", "text": "…分析了文学与事功在书写中所呈现的形象。"},
+            {"type": "text", "text": "20世纪下半叶台湾唐代文学研究成果量"},
+            {"type": "image", "src": "ch0059_img02.jpg"},
+            {
+                "type": "text",
+                "text": "的发展变化□王兆鹏陈小青本文从计量学术史的角度统计分析…",
+            },
+        ]
+        before, after = export_precise.split_blocks_at_chapter_start(blocks, title)
+        self.assertTrue(after)
+        # 章名被插图切成两块：新章从「20世纪下半叶…成果量」开始，图片与后半个章名归入新章
+        self.assertEqual(after[0]["text"], "20世纪下半叶台湾唐代文学研究成果量")
+        self.assertEqual(after[1]["type"], "image")
+        self.assertEqual(
+            after[2]["text"], "的发展变化□王兆鹏陈小青本文从计量学术史的角度统计分析…"
+        )
+        self.assertEqual(before[0]["text"], "…分析了文学与事功在书写中所呈现的形象。")
+        # 行首本就是章名时不走行中匹配
+        line_start = [{"type": "text", "text": title}, {"type": "text", "text": "正文"}]
+        before2, after2 = export_precise.split_blocks_at_chapter_start(line_start, title)
+        self.assertEqual(before2, [])
+        self.assertEqual(len(after2), 2)
+
     def test_no_split_on_inline_mention(self):
         """正文中提及下一作者名不应误切。"""
         blocks = [
