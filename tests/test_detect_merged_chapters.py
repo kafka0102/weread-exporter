@@ -168,6 +168,94 @@ class AnalyzeRowsTests(unittest.TestCase):
         )
         self.assertIsNone(dm.analyze_rows(dm.chapter_rows(body), catalog_titles=catalog))
 
+    def _book_with(self, tail_name: str, tail_content: str) -> list[dict]:
+        """8 章正常书 + 一个承载目录条目正文的章节，用于缺章规则测试。"""
+        body = make_body(
+            [("版权信息", 120)] + [(f"第{i}章", 3000) for i in range(1, 8)]
+        )
+        body.append({"chapter_name": tail_name, "content": tail_content})
+        return body
+
+    def test_wrapped_title_is_not_missing_evidence(self):
+        """长标题在正文里折行断开 → 章界错位，但正文完整，不算缺失。"""
+        catalog = ["版权信息", "清明与孙都督伯泉出郊游迎恩隆禧二寺观郑尚书园池"]
+        body = self._book_with(
+            "第七章",
+            "第七章正文\n\n"
+            "清明与孙都督伯泉出郊游迎恩隆禧二寺观郑尚\n\n"
+            "书园池\n\n"
+            "将军宿卫未央下，岁改不知春草长。\n\n" + "正文继续。\n\n" * 40,
+        )
+        self.assertIsNone(dm.analyze_rows(dm.chapter_rows(body), catalog_titles=catalog))
+
+    def test_volume_heading_is_not_missing_evidence(self):
+        """卷标题（卷一 乐府）是结构性标题，正文不单独成章属正常。"""
+        catalog = ["版权信息", "卷一 乐府"]
+        body = self._book_with(
+            "版权信息",
+            "版权信息\n\n书名：明诗评选\n\n卷一 乐府\n\n" + "版权说明。\n\n" * 40,
+        )
+        self.assertIsNone(dm.analyze_rows(dm.chapter_rows(body), catalog_titles=catalog))
+
+    def test_author_group_heading_is_not_missing_evidence(self):
+        """作者分组行（柳永 八首）只是分组抬头，正文本来就不单独成章。"""
+        catalog = ["版权信息", "柳永 八首"]
+        body = self._book_with(
+            "第七章",
+            "第七章正文\n\n柳永 八首\n\n雨霖铃\n\n寒蝉凄切，对长亭晚。\n\n"
+            + "词作赏析。\n\n" * 40,
+        )
+        self.assertIsNone(dm.analyze_rows(dm.chapter_rows(body), catalog_titles=catalog))
+
+    def test_inline_mention_is_not_missing_evidence(self):
+        """标题只夹在句子中间（学会/机构名）→ 不是被并进邻章的信号。"""
+        catalog = ["版权信息", "王维研究"]
+        body = self._book_with(
+            "第七章",
+            "第七章正文\n\n中国王维研究会会长吴相洲教授指出，唐代文学研究持续推进。\n\n"
+            + "正文继续。\n\n" * 40,
+        )
+        self.assertIsNone(dm.analyze_rows(dm.chapter_rows(body), catalog_titles=catalog))
+
+    def test_catalog_chapter_is_not_missing_evidence(self):
+        """目录/索引类章节里逐行罗列篇名，不作为「章节缺失」证据。"""
+        catalog = ["版权信息", "庚子书愤二首"]
+        body = self._book_with(
+            "篇目笔画索引",
+            "庚子书愤二首\n\n贫居\n\n贫病有感\n\n" + "篇名\n\n" * 100,
+        )
+        self.assertIsNone(dm.analyze_rows(dm.chapter_rows(body), catalog_titles=catalog))
+
+    def test_swallowed_short_piece_is_still_flagged(self):
+        """真正被并进邻章的短篇目（独立成行）仍要报出来。"""
+        catalog = ["版权信息", "秋蕊香引", "王维研究"]
+        body = self._book_with(
+            "第七章",
+            "第七章正文\n\n秋蕊香引\n\n留不得。光阴催促，奈芳兰歇。\n\n"
+            "中国王维研究会会长吴相洲教授指出研究进展。\n\n" + "正文继续。\n\n" * 40,
+        )
+        result = dm.analyze_rows(dm.chapter_rows(body), catalog_titles=catalog)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["level"], "章节缺失")
+        self.assertEqual(result["missing_chapters"], ["秋蕊香引"])
+
+    def test_title_body_form_classification(self):
+        """标题在正文里的三种形态：独立整行 / 折行 / 句中。"""
+        body = self._book_with(
+            "第七章",
+            "第七章正文\n\n代意二首\n\n梦兰前事悔成占。\n\n"
+            "少游已矣，万人何赎——山抹微云君\n\n秦观\n\n"
+            "中国王维研究会会长吴相洲教授指出。\n\n",
+        )
+        rows = dm.chapter_rows(body)
+        self.assertEqual(dm.title_body_form(rows, dm.normalize_text("代意二首")), "line")
+        self.assertEqual(
+            dm.title_body_form(rows, dm.normalize_text("少游已矣，万人何赎——山抹微云君秦观")),
+            "wrapped",
+        )
+        self.assertEqual(dm.title_body_form(rows, dm.normalize_text("王维研究")), "inline")
+        self.assertEqual(dm.title_body_form(rows, "查无此标题"), "")
+
 
 class ScanDirectoryTests(unittest.TestCase):
     def test_run_scans_json_books(self):

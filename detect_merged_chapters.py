@@ -12,6 +12,8 @@
 - 5—9 章：单章 ≥70% 且其余多为小章才报，≥90% 为严重（上下卷各半属正常）
 - ≥10 章：单章过半即不合理，≥80% 且其余多为小章为严重
 - 另有「多章无正文」一档：空章 + 标题占位章占比过高
+- 「章节缺失」只认「短篇目被并进邻章」的强信号：目录条目在别章正文里**独立成行**；
+  折行断开的标题、夹在句子中间的提及、卷标题与作者分组行（本来就不单独成章）都豁免
 
 用法：
     python detect_merged_chapters.py
@@ -76,6 +78,19 @@ _BOOKEND_TITLE_RE = re.compile(
     r"目录|总目|索引|索引目录|附录|后记|编后记|跋|出版后记|参考文献|参考资料|"
     r"年谱|大事记|作者简介|内容提要|文前|文后)"
 )
+# 卷标题（「卷一 乐府」「卷十三 李之仪：…」）：结构性标题，正文里不单独成章属正常
+_VOLUME_TITLE_RE = re.compile(r"^卷[一二三四五六七八九十百千零〇\d]+")
+# 作者分组行（「柳永 八首」「李齐贤 五十三首」）：目录用空白分隔姓名与首数，
+# 这类条目只是分组抬头，正文本来就不单独成章
+_AUTHOR_GROUP_RE = re.compile(
+    r"^[^\s，。、：；！？·《》（）]{1,8}"
+    r"\s+[一二三四五六七八九十百千两\d]+首$"
+)
+# 目录/索引类章节：逐行罗列书名或篇名，不能当作「标题被并进别章」的证据
+_CATALOG_CHAPTER_RE = re.compile(r"(目录|总目|索引|篇目|书目)")
+
+# 标题在正文里的出现形态（由强到弱）
+TITLE_FORM_RANK = {"line": 3, "wrapped": 2, "inline": 1, "": 0}
 
 LEVEL_ORDER = {
     "严重": 0,
@@ -114,6 +129,7 @@ def chapter_rows(body: Iterable[dict]) -> list[dict]:
                 "index": i,
                 "name": name,
                 "text": text,
+                "raw": raw,
                 "chars": len(text),
                 "blank": len(text) == 0,
                 # 标题占位：正文只有章名本身（或更短）
@@ -272,15 +288,112 @@ def title_matches_chapter_name(key: str, names: Iterable[str]) -> bool:
     return False
 
 
+def is_volume_heading(key: str) -> bool:
+    """目录项是否为卷标题（卷一 乐府、卷十三 李之仪：…）。"""
+    return bool(_VOLUME_TITLE_RE.match(normalize_text(key)))
+
+
+def is_author_group_heading(title: str) -> bool:
+    """目录项是否为作者分组行（柳永 八首、李齐贤 五十三首）。"""
+    return bool(_AUTHOR_GROUP_RE.match(str(title).strip()))
+
+
+def is_catalog_chapter_name(name: str) -> bool:
+    """章名是否为目录/索引类章节（逐行罗列篇名，不当作缺章证据）。"""
+    return bool(_CATALOG_CHAPTER_RE.search(normalize_text(name)))
+
+
+def _indexed_text(raw: str) -> tuple[str, list[int]]:
+    """原始正文 → (去空白文本, 每个字符在原文中的下标)，用于把命中位置映射回原文。"""
+    chars: list[str] = []
+    indexes: list[int] = []
+    for position, char in enumerate(raw or ""):
+        if _WS_RE.match(char):
+            continue
+        chars.append(char)
+        indexes.append(position)
+    return "".join(chars), indexes
+
+
+def _is_line_edge(char: str) -> bool:
+    """字符是否为行首/行尾边界（换行或空白）。"""
+    return not char or bool(_WS_RE.fullmatch(char))
+
+
+def evidence_texts(rows: Iterable[dict]) -> list[tuple[str, str, list[int]]]:
+    """把可作证据的章节（跳过目录/索引类章）预处理成 (原始文本, 去空白文本, 下标表)。
+
+    一本书只处理一次，避免逐条目录项重复归一化。
+    """
+    prepared: list[tuple[str, str, list[int]]] = []
+    for row in rows:
+        if is_catalog_chapter_name(row.get("name") or ""):
+            continue
+        raw = row.get("raw")
+        if raw is None:
+            raw = row.get("text") or ""
+        text, indexes = _indexed_text(raw)
+        if text:
+            prepared.append((raw, text, indexes))
+    return prepared
+
+
+def title_form_in(prepared: Iterable[tuple[str, str, list[int]]], key: str) -> str:
+    """在预处理过的正文里判断标题的出现形态。
+
+    - `line`：至少一处独立成行（两侧是行首/行尾/空白，且标题内部无空白）
+      → 篇目被并进邻章，是「章节缺失」的真信号
+    - `wrapped`：只以折行形式出现（标题在正文里被断成两行）→ 排版折行，豁免
+    - `inline`：只夹在句子中间 → 提及/引用，豁免
+    - `""`：正文里找不到
+    """
+    best = ""
+    for raw, text, indexes in prepared:
+        if key not in text:
+            continue
+        start = 0
+        while True:
+            position = text.find(key, start)
+            if position < 0:
+                break
+            start = position + 1
+            first = indexes[position]
+            last = indexes[position + len(key) - 1]
+            span = raw[first : last + 1]
+            left = raw[first - 1] if first > 0 else ""
+            right = raw[last + 1] if last + 1 < len(raw) else ""
+            if any(_is_line_edge(char) for char in span):
+                # 标题在正文里被空白断开（长标题折行）→ 排版折行
+                form = "wrapped"
+            elif _is_line_edge(left) and _is_line_edge(right):
+                return "line"
+            else:
+                form = "inline"
+            if TITLE_FORM_RANK[form] > TITLE_FORM_RANK[best]:
+                best = form
+    return best
+
+
+def title_body_form(rows: Iterable[dict], key: str) -> str:
+    """标题在正文里的出现形态（一次性用法，扫描时用 evidence_texts + title_form_in）。"""
+    return title_form_in(evidence_texts(rows), key)
+
+
 def missing_catalog_titles(rows: list[dict], catalog_titles) -> list[str]:
-    """目录里有、导出章节里没有，且标题以非引用形式出现在某章正文中的条目。
+    """目录里有、导出章节里没有，且在别章正文里独立成行的条目。
 
     这类条目说明该章正文被并进了别的章（导出时漏切章），是「章节缺失」的信号。
+    只保留「短篇目被并进邻章」的强信号，以下情况豁免：
+
+    - 卷标题、作者分组行：结构性标题，正文本来就不单独成章
+    - 标题在正文里只是折行断开（长标题换行导致章界错位），或夹在句子中间
+    - 出现位置在目录/索引类章节里（逐行罗列篇名）
     """
     if not catalog_titles:
         return []
     names = {normalize_text(r["name"]) for r in rows}
     texts = [r["text"] for r in rows]
+    prepared = evidence_texts(rows)
     missing: list[str] = []
     for raw in catalog_titles:
         title = str(raw or "").strip()
@@ -291,8 +404,13 @@ def missing_catalog_titles(rows: list[dict], catalog_titles) -> list[str]:
             continue
         if is_bookend_title(title):
             continue
-        if title_appears_unquoted(texts, key):
-            missing.append(title)
+        if is_volume_heading(key) or is_author_group_heading(title):
+            continue
+        if not title_appears_unquoted(texts, key):
+            continue
+        if title_form_in(prepared, key) != "line":
+            continue
+        missing.append(title)
     return missing
 
 
