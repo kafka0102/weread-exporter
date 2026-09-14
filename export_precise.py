@@ -1854,6 +1854,72 @@ def trim_blocks_before_future_catalog(
     return list(before), title
 
 
+# 指针超前防护：逻辑章被「正文越章」推到前面、阅读器却仍在更早章节时，
+# 后面整段正文会一段段灌进当前章（历史事故：15 万字全并进「诗心与史胆的融合」）。
+# 凭「缓冲里出现更早的目录章首」+「顶栏确实落后」判定，连续确认后回退重抓。
+LAG_BACK_SYNC_CONFIRM = 2
+MAX_LAG_BACK_SYNC = 3
+# 回退只找当前章往前这么多位之内的章首（更靠前的多半是引文/目录残留）
+LAG_BACK_SCAN_DEPTH = 30
+
+
+def earlier_catalog_chapter_in_blocks(
+    blocks,
+    catalog_titles,
+    current_title: str,
+    header_title: str | None = None,
+) -> str:
+    """缓冲里是否出现「比当前逻辑章更靠前」的目录章首 → 返回该章名。
+
+    只在前两项都成立时才认（宁可漏判，也不要无故回退重抓）：
+    - 当前章能在目录定位，且阅读器顶栏确实落后于它（顶栏无法定位时不信）；
+    - 缓冲里出现比当前章早 ≥2 位的目录章首行（整行章名，或章名 + 短尾巴）
+      —— 说明正在抓的正文属于更早的章，当前章是「指针超前」。
+    返回最靠后的那个更早章（最接近当前章）。
+    """
+    if not blocks or not catalog_titles:
+        return ""
+    cur = catalog_index(catalog_titles, current_title)
+    if cur is None:
+        return ""
+    header_idx = catalog_index(catalog_titles, header_title) if header_title else None
+    if header_idx is None or header_idx >= cur:
+        return ""
+    start = max(0, cur - LAG_BACK_SCAN_DEPTH)
+    candidates: dict[str, tuple[int, str]] = {}
+    for idx in range(start, cur - 1):
+        key = compact_title_key(catalog_titles[idx])
+        # 太短的章名在正文里天然会重复出现，不能当证据
+        if len(key) < 4:
+            continue
+        candidates.setdefault(key, (idx, catalog_titles[idx]))
+    if not candidates:
+        return ""
+    best_idx = None
+    best_title = ""
+    for line in _page_text_lines(blocks):
+        line = (line or "").strip()
+        if not line or len(line) > _TITLE_LINE_MAX_LEN:
+            continue
+        line_key = compact_title_key(line)
+        if not line_key:
+            continue
+        hit = candidates.get(line_key)
+        if hit is None:
+            for key, value in candidates.items():
+                if not line_key.startswith(key):
+                    continue
+                if len(line_key) - len(key) > CHAPTER_START_PREFIX_MAX_TAIL:
+                    continue
+                hit = value
+                break
+        if hit is None:
+            continue
+        if best_idx is None or hit[0] > best_idx:
+            best_idx, best_title = hit
+    return best_title
+
+
 def skipped_next_chapter_evidence(
     blocks, catalog_titles, current_title: str, *, max_ahead: int = 40
 ) -> str:
@@ -3489,6 +3555,9 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         header_multi_ahead_hits = 0
         # 逻辑章已在目录末项、顶栏却仍在更早章节的确认计数（越位灌末章防护）
         last_chapter_behind_hits = 0
+        # 逻辑章被正文越章推到前面（指针超前）时的回退重抓计数
+        lag_back_sync_hits = 0
+        lag_back_sync_used = 0
         # 上一页是否为被丢弃的印刷目录页（属正常翻页前进，不能算空转 stale）
         catalog_page_skipped = False
         catalog_pages_skipped = 0
@@ -4090,6 +4159,35 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     print(
                         f"    … 顶栏「{new_chapter[:20]}」/逻辑「{(current_chapter or '')[:20]}」"
                     )
+            # 指针超前防护：逻辑章被「正文越章」推到前面、阅读器却仍在更早章节时，
+            # 继续抓只会把中间整段灌进当前章（历史事故：整本书并进单章）。
+            # 凭「缓冲里出现更早的目录章首」+「顶栏确实落后」判定，回退重抓。
+            back_title = ""
+            if lag_back_sync_used < MAX_LAG_BACK_SYNC:
+                back_title = earlier_catalog_chapter_in_blocks(
+                    ch_blocks, catalog_titles, current_chapter, new_chapter
+                )
+            if back_title:
+                lag_back_sync_hits += 1
+            else:
+                lag_back_sync_hits = 0
+            if back_title and lag_back_sync_hits >= LAG_BACK_SYNC_CONFIRM:
+                lag_back_sync_used += 1
+                lag_back_sync_hits = 0
+                print(
+                    f"    … 逻辑章「{(current_chapter or '')[:20]}」已超前、"
+                    f"正文回到更早的「{back_title[:20]}」：清掉超前缓冲回退重抓"
+                )
+                adopt_chapter_blocks([])
+                current_chapter = (
+                    resolve_chapter_title(back_title, catalog_titles) or back_title
+                )
+                page_num = 0
+                stale = 0
+                turn_method_idx = 0
+                # 当前屏还没抓进新（更早）章，先原地抓这一屏，别立刻翻走
+                skip_first_turn = True
+                continue
             # 越位灌末章防护：逻辑章已到目录末项，正文/顶栏却仍在更早章节时，
             # 丢弃脏缓冲并重开会话续传，绝不把整本书写进末章
             if last_chapter_overrun_evidence(
