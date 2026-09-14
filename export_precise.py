@@ -1469,6 +1469,173 @@ def is_export_complete_after(last_title: str, catalog_titles) -> bool:
     return all(is_non_content_catalog_title(t) for t in rest)
 
 
+# 续传保护：output/<id> 里的章产物可能来自出错的历史运行（正文被并进单一章）。
+# 这类产物一旦被当成「已完成」，重跑会直接把它拼成 JSON——不打开阅读器、也不报错。
+# 判定前先核对磁盘产物与目录是否对得上，对不上就中止，别静默写坏数据。
+RESUME_MISSING_TITLE_MIN = 3
+RESUME_MISSING_TITLE_RATIO = 0.3
+RESUME_MERGED_TITLE_MIN = 2
+# 最大章占全书字节达到此比例才拿它的正文当「章被合并」的证据
+RESUME_DOMINANT_CHAPTER_SHARE = 0.3
+# 目录/索引类章节逐行罗列篇名，它正文里的标题不能当合并证据
+_INDEX_LIKE_CHAPTER_RE = re.compile(r"目录|总目|目次|索引|篇目|书目|参考文献")
+# 结构性标题（卷/部/辑/编）：正文里常挂在相邻章首尾，本就不单独成章，不算缺章
+_SECTION_LIKE_CATALOG_TITLE_RE = re.compile(
+    r"^(?:第?\s*[一二三四五六七八九十百千零〇0-9]+\s*[卷部辑编]"
+    r"|[上下中]\s*[卷编部]"
+    r"|卷\s*[一二三四五六七八九十百千0-9]*)"
+)
+# 标题行都很短，超长的行不可能是章标题
+_TITLE_LINE_MAX_LEN = 60
+
+
+def _md_chapter_title(md_path: str, raw_dir: str) -> str:
+    """读单个章文件标题：优先 raw meta，其次 md 首行。"""
+    base = os.path.basename(md_path)
+    raw_path = os.path.join(raw_dir, base[:-3] + ".json" if base.endswith(".md") else base)
+    if os.path.isfile(raw_path):
+        try:
+            with open(raw_path, encoding="utf-8") as rf:
+                title = normalize_catalog_title(str(json.load(rf).get("title") or ""))
+        except Exception:
+            title = ""
+        if title:
+            return title
+    try:
+        with open(md_path, encoding="utf-8") as f:
+            line = f.readline().strip()
+    except OSError:
+        return ""
+    return normalize_catalog_title(line.lstrip("#").strip())
+
+
+def disk_chapter_titles(md_dir) -> list[str]:
+    """按编号顺序读回已落盘章标题。"""
+    if not md_dir or not os.path.isdir(md_dir):
+        return []
+    raw_dir = os.path.join(os.path.dirname(md_dir), "raw")
+    titles: list[str] = []
+    for fn in sorted(f for f in os.listdir(md_dir) if f.endswith(".md")):
+        title = _md_chapter_title(os.path.join(md_dir, fn), raw_dir)
+        if title:
+            titles.append(title)
+    return titles
+
+
+def missing_catalog_chapters_on_disk(md_dir, catalog_titles) -> list[str]:
+    """目录里有、但已落盘章标题里找不到的正文项（忽略封面/版权页等无正文项）。"""
+    disk_titles = disk_chapter_titles(md_dir)
+    if not disk_titles or not catalog_titles:
+        return []
+    missing: list[str] = []
+    for title in catalog_titles:
+        if is_non_content_catalog_title(title):
+            continue
+        if _SECTION_LIKE_CATALOG_TITLE_RE.match(normalize_catalog_title(title)):
+            continue
+        if catalog_index(disk_titles, title) is None:
+            missing.append(title)
+    return missing
+
+
+def merged_titles_in_dominant_chapter(md_dir, catalog_titles) -> list[str]:
+    """最大章正文里独立成行的其他目录标题（正文被并进单章的强证据）。
+
+    只扫最大那个章文件，且它在全书占比够大时才认——正常书的单章不会吞掉全书。
+    """
+    if not md_dir or not os.path.isdir(md_dir) or not catalog_titles:
+        return []
+    paths = [
+        os.path.join(md_dir, f)
+        for f in sorted(os.listdir(md_dir))
+        if f.endswith(".md")
+    ]
+    sizes = {}
+    for path in paths:
+        try:
+            sizes[path] = os.path.getsize(path)
+        except OSError:
+            continue
+    if not sizes:
+        return []
+    total = sum(sizes.values())
+    biggest, biggest_size = max(sizes.items(), key=lambda kv: kv[1])
+    if total <= 0 or biggest_size < RESUME_DOMINANT_CHAPTER_SHARE * total:
+        return []
+
+    raw_dir = os.path.join(os.path.dirname(md_dir), "raw")
+    own_key = compact_title_key(_md_chapter_title(biggest, raw_dir))
+    if own_key and _INDEX_LIKE_CHAPTER_RE.search(own_key):
+        return []
+
+    keys: dict[str, str] = {}
+    for title in catalog_titles:
+        norm = normalize_catalog_title(title)
+        if not norm or is_non_content_catalog_title(norm):
+            continue
+        if _SECTION_LIKE_CATALOG_TITLE_RE.match(norm):
+            continue
+        key = compact_title_key(norm)
+        # 太短的标题在正文里天然会重复出现，不能当证据
+        if len(key) < 4:
+            continue
+        keys.setdefault(key, norm)
+    if not keys:
+        return []
+
+    hits: list[str] = []
+    seen: set[str] = set()
+    try:
+        with open(biggest, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip().lstrip("#").strip()
+                if not line or len(line) > _TITLE_LINE_MAX_LEN:
+                    continue
+                key = re.sub(r"\s+", "", line)
+                if key == own_key or key not in keys or key in seen:
+                    continue
+                seen.add(key)
+                hits.append(keys[key])
+    except OSError:
+        return []
+    return hits
+
+
+def stale_chapter_artifacts_evidence(md_dir, catalog_titles) -> str | None:
+    """磁盘章产物是否已损坏（不宜当作「已完成」续传）→ 返回原因；正常时 None。"""
+    if not md_dir or not catalog_titles or not os.path.isdir(md_dir):
+        return None
+    content_titles = [t for t in catalog_titles if not is_non_content_catalog_title(t)]
+    reasons: list[str] = []
+    missing = missing_catalog_chapters_on_disk(md_dir, catalog_titles)
+    if missing and len(missing) >= RESUME_MISSING_TITLE_MIN and len(missing) > (
+        RESUME_MISSING_TITLE_RATIO * max(len(content_titles), 1)
+    ):
+        reasons.append(
+            f"目录 {len(content_titles)} 个正文项里有 {len(missing)} 个没有对应章文件"
+            f"（如「{missing[0][:24]}」）"
+        )
+    merged = merged_titles_in_dominant_chapter(md_dir, catalog_titles)
+    if len(merged) >= RESUME_MERGED_TITLE_MIN:
+        reasons.append(
+            f"最大章正文里独立成行地出现了 {len(merged)} 个其他目录标题"
+            f"（如「{merged[0][:24]}」）"
+        )
+    return "；".join(reasons) or None
+
+
+def assert_resume_artifacts_trustworthy(book_id, md_dir, catalog_titles) -> None:
+    """续传前确认磁盘产物没被污染；可疑就中止，避免把坏数据静默拼成 JSON。"""
+    evidence = stale_chapter_artifacts_evidence(md_dir, catalog_titles)
+    if not evidence:
+        return
+    raise RuntimeError(
+        f"续传中止：output/{book_id}/ 的章产物与目录不符（{evidence}），"
+        f"正文疑似已被合并进单一章。请删除 output/{book_id}/ 后重抓；"
+        "不要让这份中间产物继续参与续传。"
+    )
+
+
 def is_export_terminal_chapter(current_title: str, catalog_titles) -> bool:
     """卡住时应按书末收尾的章：目录末项，或仅剩文末附录/后记链/无正文装饰项。
 
@@ -2081,22 +2248,9 @@ def get_last_chapter_title(md_dir):
         return None, 0
     idx = int(files[-1].replace(".md", ""))
     # 优先 raw json 的 title（避免空标题 md 首行变成「#」）
-    raw_path = os.path.join(os.path.dirname(md_dir), "raw", files[-1].replace(".md", ".json"))
-    title = ""
-    if os.path.isfile(raw_path):
-        try:
-            with open(raw_path, encoding="utf-8") as rf:
-                meta = json.load(rf)
-            title = normalize_catalog_title(str(meta.get("title") or ""))
-        except Exception:
-            title = ""
-    if not title:
-        with open(os.path.join(md_dir, files[-1]), encoding="utf-8") as f:
-            line = f.readline().strip()
-        if line.startswith("#"):
-            title = normalize_catalog_title(line.lstrip("#").strip())
-        else:
-            title = normalize_catalog_title(line)
+    title = _md_chapter_title(
+        os.path.join(md_dir, files[-1]), os.path.join(os.path.dirname(md_dir), "raw")
+    )
     return title or None, idx
 
 
@@ -4528,6 +4682,7 @@ async def export_one_book(
         # 已落盘目录最后一章，或其后仅剩封底等无正文项：视为全书完成
         pre_catalog = load_catalog_titles(catalog_path) if os.path.isfile(catalog_path) else []
         if last_title and pre_catalog and is_export_complete_after(last_title, pre_catalog):
+            assert_resume_artifacts_trustworthy(book_id, md_dir, pre_catalog)
             print(f"\n--- 会话 {session} ---")
             if is_last_catalog_chapter(last_title, pre_catalog):
                 print(
@@ -4564,6 +4719,7 @@ async def export_one_book(
             check_title, _check_idx = get_last_chapter_title(md_dir)
             check_cat = load_catalog_titles(catalog_path) if os.path.isfile(catalog_path) else []
             if check_title and check_cat and is_export_complete_after(check_title, check_cat):
+                assert_resume_artifacts_trustworthy(book_id, md_dir, check_cat)
                 print(
                     f"\n  ✅ 已导出「{check_title[:32]}」且无更多正文目录项，"
                     f"停止重开，全书完成。"
@@ -4585,6 +4741,8 @@ async def export_one_book(
         if added == 0:
             # 若已有章节产物则视为完成（续传场景）
             if any(fn.endswith(".md") for fn in os.listdir(md_dir)):
+                if pre_catalog:
+                    assert_resume_artifacts_trustworthy(book_id, md_dir, pre_catalog)
                 print("\n  无新章节，按已有产物收尾。")
                 break
             raise RuntimeError(f"未能导出任何章节：{book_id}")
