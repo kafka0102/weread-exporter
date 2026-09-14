@@ -92,7 +92,9 @@ python detect_merged_chapters.py --refresh-cache    # 忽略干净书缓存，�
      实测：只删成品、留着 `output/<id>/` 重跑，新成品与旧成品逐字节相同。
    删除属于破坏性操作：先确认清单，优先 `mv` 到 `~/.Trash/<批次>/` 而不是直接 `rm`；
    中间产物也建议 `mv`（例如 `~/.Trash/<批次>/output/<id>/`）而不是 `rm -rf`，必要时还能对照。
-3. 用修好的逻辑重抓：`python export_precise.py --no-prefer-largest-screen`（`--force` 可跳过「已有 JSON」检查）。
+3. 用修好的逻辑重抓：`python export_precise.py --prefer-largest-screen`（`--force` 可跳过「已有 JSON」检查）。
+   **默认用大屏**：大屏单屏字数多、翻页次数少，既快又不容易把相邻章的正文并进同一屏；
+   只有在明确要用笔记本内建屏时才传 `--no-prefer-largest-screen`。
    若 `output/<id>/` 没清干净，脚本会由 `assert_resume_artifacts_trustworthy()` 直接报错中止，不再静默复用。
 4. 重抓后再跑一次 `python dedupe_shelf_books.py`，让清单与本地成品保持一致。
 

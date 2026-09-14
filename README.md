@@ -8,7 +8,7 @@
 
 1. **Playwright 自动化** — 启动 Chromium，持久化登录会话（扫码一次，后续自动复用）
 2. **Canvas fillText Hook** — 注入钩子拦截所有 `CanvasRenderingContext2D.fillText()` 调用，捕获每个字符的 (x, y) 坐标
-3. **全宽桌面排版优先** — 阅读器默认自动匹配目标单屏宽度（`READER_VIEWPORT_WIDTH=0`，再受 `READER_VIEWPORT_MAX_*=1600x1000` 限制）打开；多显示器时**必须**用 CLI 指定目标屏：`--prefer-largest-screen`（外接大屏）或 `--no-prefer-largest-screen`（笔记本内建屏）；如需旧版单页策略，可开启 `READER_FORCE_SINGLE_PAGE=1` 或使用 `--force-single-page`（失败会自动恢复宽视口）
+3. **全宽桌面排版优先** — 阅读器默认自动匹配目标单屏宽度（`READER_VIEWPORT_WIDTH=0`，再受 `READER_VIEWPORT_MAX_*=1600x1000` 限制）打开；多显示器时**必须**用 CLI 指定目标屏：**默认用 `--prefer-largest-screen`（外接大屏）**，需要笔记本内建屏才用 `--no-prefer-largest-screen`（大屏单屏字数多、翻页次数少，章界更不容易被并章）；如需旧版单页策略，可开启 `READER_FORCE_SINGLE_PAGE=1` 或使用 `--force-single-page`（失败会自动恢复宽视口）
 4. **Canvas 按页归组** — `fillText` 坐标是 canvas 局部坐标；若仍出现多 canvas，按屏幕 left 拆页后再分行，防止左右页同 y 交错乱码
 5. **视口图片捕获** — 每页只取当前视口内可见的 `img[class*="wr_readerImage"]`（用 `getBoundingClientRect` 过滤掉预加载的下一页/下一章图片），解决图片归属偏移
 6. **图文交错** — 把文字行和图片按屏幕 y 坐标排序，图片精确落在对应段落之间、正确章节里
@@ -31,7 +31,7 @@ playwright install chromium
 
 ```bash
 # 单本：传入 reader URL（推荐）或 book_id
-# 多显示器目标屏必须显式指定：--prefer-largest-screen 或 --no-prefer-largest-screen
+# 多显示器目标屏必须显式指定；默认优先大屏 --prefer-largest-screen（单屏字数多、翻页少、章界更稳）
 python export_precise.py https://weread.qq.com/web/reader/d31323b0813abaf26g0137c2 --prefer-largest-screen
 python export_precise.py d31323b0813abaf26g0137c2 --prefer-largest-screen
 
@@ -39,7 +39,7 @@ python export_precise.py d31323b0813abaf26g0137c2 --prefer-largest-screen
 python export_precise.py d31323b0813abaf26g0137c2 --force --prefer-largest-screen
 
 # 临时调整阅读器视口；默认 0=自动匹配目标单屏（.env READER_VIEWPORT_WIDTH/HEIGHT，受 MAX 上限）
-# 目标屏用 --prefer-largest-screen（外接大屏）/ --no-prefer-largest-screen（笔记本内建屏）
+# 目标屏默认用 --prefer-largest-screen（外接大屏）；仅在明确要笔记本内建屏时才用 --no-prefer-largest-screen
 python export_precise.py d31323b0813abaf26g0137c2 --reader-width 0 --reader-height 0 --prefer-largest-screen
 python export_precise.py d31323b0813abaf26g0137c2 --reader-width 1470 --reader-height 900 --no-prefer-largest-screen
 
