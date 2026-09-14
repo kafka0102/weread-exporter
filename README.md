@@ -66,7 +66,10 @@ python export_precise.py d31323b0813abaf26g0137c2 --headless --prefer-largest-sc
 - `--headless`：cache 有登录痕迹才启用无头；无头下若出现登录页会报错并立即终止（需去掉 `--headless` 重新扫码）
 - 阅读器默认自动匹配目标单屏宽度（可 `READER_VIEWPORT_MAX_*` 限制）；多显示器时必须用 `--prefer-largest-screen` / `--no-prefer-largest-screen` 指定目标屏（不传会报错提示），检测到双页时按 canvas 拆页抓取；`--force-single-page` / `--no-force-single-page` 可临时覆盖 `.env` 的 `READER_FORCE_SINGLE_PAGE`（强制失败会恢复宽视口）
 - 自动跳到全书开头（原生点击目录首项），逐页翻到全书末尾自动停止
-- **自动续传**：中途卡住会重开浏览器，从上次章节继续；中间产物在 `output/<book_id>/`
+- **自动续传**：中途卡住会重开浏览器，从上次章节继续；中间产物在 `output/<book_id>/`。
+  续传前会核对中间产物与 `_catalog.json`（缺章过多、或最大章正文里独立成行混进其他目录标题），
+  产物被污染时直接报错中止——**重抓前请把成品和 `output/<book_id>/` 一起删掉**，
+  只删成品会让重跑直接复用旧 md（`--force` 也绕不过）
 - **全书成功后**才写入 `~/data/weixin/books/<book_id>_<书名>.json`（字段对齐 dedao/json：纯文本 content、`has_content`、空元数据键；可用 `BOOKS_DIR` / `--out-dir` 覆盖）
 - 章切换后按该章字数动态等待：`ceil(字数/2000)*SLEEP_CHAPTER_PER_2K_CHARS`，夹在 `SLEEP_CHAPTER_MIN`–`SLEEP_CHAPTER_MAX`（默认 0.3–1 秒）
 - 默认不下载图片；需要时加 `--download-images`。正文 md 中间产物仍可含 `images/` 相对路径引用

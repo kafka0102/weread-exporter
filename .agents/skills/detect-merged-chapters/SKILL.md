@@ -83,11 +83,17 @@ python detect_merged_chapters.py --refresh-cache    # 忽略干净书缓存，�
 ## 发现后如何处置（需用户确认后再动）
 
 1. 把命中的 `book_id` 追加到 `data/new_books.txt`（格式 `ID,书名,作者`），可置顶优先抓。
-2. 删掉已抓取的产物，否则批量导出会按「已存在 JSON」跳过：
-   - `~/data/weixin/books/<id>_书名.json`（成品）
-   - `output/<id>/`（中间产物，可保留用于对照）
-   删除属于破坏性操作：先确认清单，优先 `mv` 到 `~/.Trash/<批次>/` 而不是直接 `rm`。
+2. 删掉已抓取的产物。**两个位置都要清掉**，缺一个都会让「不加 `--force` 的重跑」直接复用旧结果：
+   - `~/data/weixin/books/<id>_书名.json`（成品）——留着会被「已存在 JSON」跳过。
+   - `output/<id>/`（中间产物）——留着会被续传逻辑当成「已到目录末章」：
+     `export_precise.py` 读 `output/<id>/chapters` 里最后一个 md 的标题，只要它等于目录末项，
+     就打印「全书导出完成」，**不打开阅读器**，直接用这些旧 md 拼出成品 JSON；
+     `--force` 只跳过「已存在 JSON」检查，绕不过这个判定。
+     实测：只删成品、留着 `output/<id>/` 重跑，新成品与旧成品逐字节相同。
+   删除属于破坏性操作：先确认清单，优先 `mv` 到 `~/.Trash/<批次>/` 而不是直接 `rm`；
+   中间产物也建议 `mv`（例如 `~/.Trash/<批次>/output/<id>/`）而不是 `rm -rf`，必要时还能对照。
 3. 用修好的逻辑重抓：`python export_precise.py --no-prefer-largest-screen`（`--force` 可跳过「已有 JSON」检查）。
+   若 `output/<id>/` 没清干净，脚本会由 `assert_resume_artifacts_trustworthy()` 直接报错中止，不再静默复用。
 4. 重抓后再跑一次 `python dedupe_shelf_books.py`，让清单与本地成品保持一致。
 
 ## 边界
@@ -105,3 +111,7 @@ python detect_merged_chapters.py --refresh-cache    # 忽略干净书缓存，�
 - 脚本：`detect_merged_chapters.py`
 - 单测：`tests/test_detect_merged_chapters.py`
 - 合并成因与修复：`export_precise.py` 的 `looks_like_catalog_page()` / `last_chapter_overrun_evidence()`
+- 续传保护：`export_precise.py` 的 `stale_chapter_artifacts_evidence()` /
+  `assert_resume_artifacts_trustworthy()`（单测 `tests/test_export_precise_resume.py`）。
+  续传判定前先核对 `output/<id>/chapters` 与 `_catalog.json`：缺章过多、或最大章正文里
+  独立成行混进 ≥2 个其他目录标题，就判为「产物已污染」并报错中止。
