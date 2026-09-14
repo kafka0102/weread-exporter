@@ -346,5 +346,217 @@ class ScanDirectoryTests(unittest.TestCase):
             self.assertIn("严重\tx1\t书", text)
 
 
+
+class CacheTests(unittest.TestCase):
+    def _write_book(self, books: Path, book_id: str, title: str, body: list[dict]) -> Path:
+        path = books / f"{book_id}_{title}.json"
+        path.write_text(
+            json.dumps({"title": title, "body": body}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return path
+
+    def _sample_books(self, books: Path) -> tuple[Path, Path]:
+        broken = self._write_book(
+            books,
+            "aaaa1111",
+            "合并书",
+            make_body(
+                [("版权信息", 100)]
+                + [(f"第{i}章", 200) for i in range(1, 11)]
+                + [("后记", 200000)]
+            ),
+        )
+        clean = self._write_book(
+            books,
+            "bbbb2222",
+            "正常书",
+            make_body([(f"第{i}章", 20000) for i in range(1, 13)]),
+        )
+        return broken, clean
+
+    def test_second_run_skips_unchanged_clean_json(self):
+        """没问题且 JSON 没变的书第二次不重扫；命中档每次都扫。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            books = root / "books"
+            books.mkdir()
+            cache = root / "cache.json"
+            self._sample_books(books)
+            calls: list[str] = []
+            original = dm.analyze_book_json
+
+            def wrapped(path, **kwargs):
+                calls.append(path.name)
+                return original(path, **kwargs)
+
+            dm.analyze_book_json = wrapped
+            try:
+                first = dm.run(books_dir=books, cache_path=cache)
+                self.assertEqual(first["scanned"], 2)
+                self.assertEqual(first["cached"], 0)
+                self.assertEqual(len(first["findings"]), 1)
+                self.assertEqual(len(calls), 2)
+                calls.clear()
+                second = dm.run(books_dir=books, cache_path=cache)
+                self.assertEqual(second["scanned"], 2)
+                self.assertEqual(second["cached"], 1)
+                self.assertEqual(len(second["findings"]), 1)
+                self.assertEqual(second["findings"][0]["book_id"], "aaaa1111")
+                self.assertEqual(calls, ["aaaa1111_合并书.json"])
+            finally:
+                dm.analyze_book_json = original
+
+    def test_changed_clean_json_is_rescanned(self):
+        """干净书 JSON 变了就必须重扫。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            books = root / "books"
+            books.mkdir()
+            cache = root / "cache.json"
+            _broken, clean = self._sample_books(books)
+            dm.run(books_dir=books, cache_path=cache)
+            clean.write_text(
+                json.dumps(
+                    {
+                        "title": "正常书",
+                        "body": make_body([(f"第{i}章", 21000) for i in range(1, 13)]),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            calls: list[str] = []
+            original = dm.analyze_book_json
+
+            def wrapped(path, **kwargs):
+                calls.append(path.name)
+                return original(path, **kwargs)
+
+            dm.analyze_book_json = wrapped
+            try:
+                result = dm.run(books_dir=books, cache_path=cache)
+                self.assertEqual(result["cached"], 0)
+                self.assertIn("bbbb2222_正常书.json", calls)
+            finally:
+                dm.analyze_book_json = original
+
+    def test_refresh_cache_rescans_clean_books(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            books = root / "books"
+            books.mkdir()
+            cache = root / "cache.json"
+            self._sample_books(books)
+            dm.run(books_dir=books, cache_path=cache)
+            calls: list[str] = []
+            original = dm.analyze_book_json
+
+            def wrapped(path, **kwargs):
+                calls.append(path.name)
+                return original(path, **kwargs)
+
+            dm.analyze_book_json = wrapped
+            try:
+                result = dm.run(
+                    books_dir=books, cache_path=cache, refresh_cache=True
+                )
+                self.assertEqual(result["cached"], 0)
+                self.assertEqual(len(calls), 2)
+            finally:
+                dm.analyze_book_json = original
+
+    def test_rule_change_invalidates_clean_cache(self):
+        """阈值变了，旧的干净书缓存不能沿用。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            books = root / "books"
+            books.mkdir()
+            cache = root / "cache.json"
+            self._sample_books(books)
+            dm.run(books_dir=books, cache_path=cache)
+            calls: list[str] = []
+            original = dm.analyze_book_json
+
+            def wrapped(path, **kwargs):
+                calls.append(path.name)
+                return original(path, **kwargs)
+
+            dm.analyze_book_json = wrapped
+            try:
+                result = dm.run(
+                    books_dir=books, cache_path=cache, min_chapters=3
+                )
+                self.assertEqual(result["cached"], 0)
+                self.assertEqual(len(calls), 2)
+            finally:
+                dm.analyze_book_json = original
+
+    def test_catalog_change_rescans_clean_json(self):
+        """成品 JSON 没变但 _catalog.json 变了，也要重扫。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            books = root / "books"
+            catalog_root = root / "output"
+            books.mkdir()
+            cache = root / "cache.json"
+            self._write_book(
+                books,
+                "bbbb2222",
+                "正常书",
+                make_body([(f"第{i}章", 20000) for i in range(1, 13)]),
+            )
+            dm.run(books_dir=books, catalog_root=catalog_root, cache_path=cache)
+            catalog_dir = catalog_root / "bbbb2222"
+            catalog_dir.mkdir(parents=True)
+            (catalog_dir / "_catalog.json").write_text(
+                json.dumps(["第1章", "第2章"], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            calls: list[str] = []
+            original = dm.analyze_book_json
+
+            def wrapped(path, **kwargs):
+                calls.append(path.name)
+                return original(path, **kwargs)
+
+            dm.analyze_book_json = wrapped
+            try:
+                result = dm.run(
+                    books_dir=books, catalog_root=catalog_root, cache_path=cache
+                )
+                self.assertEqual(result["cached"], 0)
+                self.assertEqual(calls, ["bbbb2222_正常书.json"])
+            finally:
+                dm.analyze_book_json = original
+
+    def test_no_cache_does_not_read_or_write(self):
+        """cache_path=None 时全量扫描，也不写缓存文件。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            books = root / "books"
+            books.mkdir()
+            cache = root / "cache.json"
+            self._sample_books(books)
+            dm.run(books_dir=books, cache_path=cache)
+            self.assertTrue(cache.is_file())
+            cache.unlink()
+            calls: list[str] = []
+            original = dm.analyze_book_json
+
+            def wrapped(path, **kwargs):
+                calls.append(path.name)
+                return original(path, **kwargs)
+
+            dm.analyze_book_json = wrapped
+            try:
+                result = dm.run(books_dir=books, cache_path=None)
+                self.assertEqual(result["cached"], 0)
+                self.assertEqual(len(calls), 2)
+                self.assertFalse(cache.exists())
+            finally:
+                dm.analyze_book_json = original
+
+
 if __name__ == "__main__":
     unittest.main()

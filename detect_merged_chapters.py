@@ -18,11 +18,13 @@
 用法：
     python detect_merged_chapters.py
     python detect_merged_chapters.py --include-suspect --tsv .scratch/merged.tsv
+    python detect_merged_chapters.py --refresh-cache   # 忽略缓存，全量重扫
     BOOKS_DIR=~/data/weixin/books python detect_merged_chapters.py
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -33,6 +35,9 @@ import env_config  # noqa: F401  # 导入即加载 .env
 from env_config import BOOKS_DIR
 
 ROOT_DIR = Path(__file__).resolve().parent
+# 干净书缓存：JSON（及对应目录）没变就不重扫。命中档每次重扫。
+CACHE_VERSION = 1
+DEFAULT_CACHE_PATH = ROOT_DIR / ".scratch" / "merged-chapters-cache.json"
 
 # 章节数下限：≤4 章的书（诗词画册/单篇/「正文+附录」）不做单章占比判定
 MIN_CHAPTERS = 5
@@ -486,19 +491,110 @@ def iter_json_books(books_dir: Path) -> Iterator[Path]:
             yield path
 
 
+def source_fingerprint(path: Path, catalog_path: Path | None = None) -> dict:
+    """用 mtime + size 标识成品 JSON（及可选 _catalog.json）是否变化，避免读全文。"""
+    stat = path.stat()
+    fingerprint = {
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+        "catalog_mtime_ns": 0,
+        "catalog_size": 0,
+    }
+    if catalog_path is not None and catalog_path.is_file():
+        catalog_stat = catalog_path.stat()
+        fingerprint["catalog_mtime_ns"] = catalog_stat.st_mtime_ns
+        fingerprint["catalog_size"] = catalog_stat.st_size
+    return fingerprint
+
+
+def fingerprints_match(cached: dict, current: dict) -> bool:
+    """缓存指纹与当前文件是否一致。"""
+    for field in ("mtime_ns", "size", "catalog_mtime_ns", "catalog_size"):
+        if cached.get(field) != current.get(field):
+            return False
+    return True
+
+
+def build_rule_key(catalog_root: Path | None, analyze_kwargs: dict) -> str:
+    """判定规则指纹：脚本或阈值变了，旧的干净书缓存全部失效。"""
+    script = Path(__file__).resolve()
+    script_stat = script.stat()
+    payload = {
+        "version": CACHE_VERSION,
+        "script_mtime_ns": script_stat.st_mtime_ns,
+        "script_size": script_stat.st_size,
+        "catalog_root": str(Path(catalog_root).resolve()) if catalog_root else "",
+        "kwargs": {key: analyze_kwargs[key] for key in sorted(analyze_kwargs)},
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def load_ok_cache(path: Path | None, rule_key: str) -> dict[str, dict]:
+    """读干净书缓存；版本/规则对不上或文件坏了则当作没有。"""
+    if path is None or not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict) or data.get("version") != CACHE_VERSION:
+        return {}
+    if data.get("rule") != rule_key:
+        return {}
+    ok = data.get("ok")
+    if not isinstance(ok, dict):
+        return {}
+    cleaned: dict[str, dict] = {}
+    for key, fingerprint in ok.items():
+        if not isinstance(key, str) or not isinstance(fingerprint, dict):
+            continue
+        if Path(key).is_file():
+            cleaned[key] = fingerprint
+    return cleaned
+
+
+def save_ok_cache(path: Path, rule_key: str, ok: dict[str, dict]) -> None:
+    """原子写回干净书缓存。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": CACHE_VERSION, "rule": rule_key, "ok": ok}
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
 def run(
     *,
     books_dir: Path = BOOKS_DIR,
     output_root: Path | None = None,
     catalog_root: Path | None = Path("output"),
     include_suspect: bool = False,
+    cache_path: Path | None = None,
+    refresh_cache: bool = False,
     **kwargs,
 ) -> dict:
-    """扫描 books_dir（可选叠加 output 中间产物与目录），返回体检结果。"""
+    """扫描 books_dir（可选叠加 output 中间产物与目录），返回体检结果。
+
+    cache_path 非空时：上次判定没问题、且 JSON/_catalog.json 没变的书跳过重扫。
+    命中档（含「可疑」）每次都重扫。refresh_cache=True 时忽略已有缓存并写回。
+    """
     findings: list[dict] = []
     scanned = 0
     skipped_small = 0
+    cached = 0
     seen_ids: set[str] = set()
+    visited: set[str] = set()
+    ok_entries: dict[str, dict] = {}
+    rule_key = build_rule_key(catalog_root, kwargs)
+    previous = (
+        {}
+        if cache_path is None or refresh_cache
+        else load_ok_cache(cache_path, rule_key)
+    )
     for path in iter_json_books(books_dir):
         book_id = path.name.split("_", 1)[0]
         catalog_path = (
@@ -506,10 +602,19 @@ def run(
             if catalog_root is not None
             else None
         )
-        result = analyze_book_json(path, catalog_path=catalog_path, **kwargs)
+        cache_key = str(path.resolve())
+        visited.add(cache_key)
+        fingerprint = source_fingerprint(path, catalog_path)
         seen_ids.add(book_id)
         scanned += 1
+        cached_fp = previous.get(cache_key)
+        if cached_fp and fingerprints_match(cached_fp, fingerprint):
+            ok_entries[cache_key] = fingerprint
+            cached += 1
+            continue
+        result = analyze_book_json(path, catalog_path=catalog_path, **kwargs)
         if result is None:
+            ok_entries[cache_key] = fingerprint
             skipped_small += 1
             continue
         findings.append(result)
@@ -524,12 +629,18 @@ def run(
                 skipped_small += 1
                 continue
             findings.append(result)
+    if cache_path is not None:
+        for key, fingerprint in previous.items():
+            if key not in visited:
+                ok_entries[key] = fingerprint
+        save_ok_cache(cache_path, rule_key, ok_entries)
     if not include_suspect:
         findings = [f for f in findings if f["level"] != "可疑"]
     findings.sort(key=lambda f: (LEVEL_ORDER[f["level"]], -f["top_share"]))
     return {
         "scanned": scanned,
         "skipped": skipped_small,
+        "cached": cached,
         "findings": findings,
     }
 
@@ -560,8 +671,11 @@ def format_finding(item: dict) -> str:
 
 def print_report(result: dict, *, limit: int = 0) -> None:
     findings = result["findings"]
+    cached = int(result.get("cached") or 0)
+    cache_note = f"缓存跳过 {cached} 本，" if cached else ""
     print(
-        f"扫描 {result['scanned']} 本（章节数不足/字数过少跳过 {result['skipped']} 本），"
+        f"扫描 {result['scanned']} 本（{cache_note}"
+        f"章节数不足/字数过少跳过 {result['skipped']} 本），"
         f"命中 {len(findings)} 本"
     )
     if not findings:
@@ -671,6 +785,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=0, help="每档最多列出多少本（0=不限）")
     parser.add_argument("--tsv", type=Path, default=None, help="把结果写成 TSV")
     parser.add_argument(
+        "--cache",
+        type=Path,
+        default=DEFAULT_CACHE_PATH,
+        help=f"干净书缓存路径（默认 {DEFAULT_CACHE_PATH}）",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="不读写缓存，全量扫描",
+    )
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="忽略已有缓存并全量重扫，写回新缓存",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="以 JSON 输出结果（便于其它脚本消费）",
@@ -685,6 +815,8 @@ def main(argv: list[str] | None = None) -> int:
         output_root=args.output_root if args.include_output else None,
         catalog_root=args.catalog_root,
         include_suspect=args.include_suspect,
+        cache_path=None if args.no_cache else args.cache,
+        refresh_cache=bool(args.refresh_cache) and not args.no_cache,
         min_chapters=args.min_chapters,
         min_total_chars=args.min_chars,
         major_share=args.major_share,

@@ -1,6 +1,6 @@
 ---
 name: detect-merged-chapters
-description: 体检已下载的微信读书电子书（默认 ~/data/weixin/books/*.json），找出「单章字数占比异常偏高 / 正文被合并进单一章节 / 多章无正文」的书并给出分级清单。优先运行 python detect_merged_chapters.py（只读，不改任何文件）。触发：章节字数异常、单章占比过高、内容都合并到一章、章节为空/字数为零、体检已下载电子书、抽查导出结果。
+description: 体检已下载的微信读书电子书（默认 ~/data/weixin/books/*.json），找出「单章字数占比异常偏高 / 正文被合并进单一章节 / 多章无正文」的书并给出分级清单。优先运行 python detect_merged_chapters.py（不改电子书；干净书有缓存）。触发：章节字数异常、单章占比过高、内容都合并到一章、章节为空/字数为零、体检已下载电子书、抽查导出结果。
 ---
 
 # Skill: 已下载电子书章节合并体检
@@ -16,9 +16,12 @@ python detect_merged_chapters.py --include-suspect --tsv .scratch/merged-chapter
 python detect_merged_chapters.py --books-dir ~/data/weixin/books
 python detect_merged_chapters.py --include-output   # 连 output/<id>/chapters 中间产物一起体检
 python detect_merged_chapters.py --catalog-root output   # 默认值：用导出时的 _catalog.json 核对缺章
+python detect_merged_chapters.py --refresh-cache    # 忽略干净书缓存，全量重扫
 ```
 
-脚本**只读**：只打印结果 / 可选写 TSV，不删除、不移动、不修改任何电子书文件。
+直接跑脚本即可：没问题且 JSON（及对应 `_catalog.json`）没变的书走 `.scratch/merged-chapters-cache.json`，下次跳过；命中档每次重扫。`--refresh-cache` 全量重扫并写回缓存，`--no-cache` 不读写缓存。判定参数或脚本变化会使缓存失效。
+
+脚本不删除、不移动、不修改任何电子书文件；除可选 TSV 外，只额外写上述缓存。
 
 ## 判定规则（脚本已实现）
 
@@ -90,6 +93,7 @@ python detect_merged_chapters.py --catalog-root output   # 默认值：用导出
 ## 边界
 
 - 只体检 `~/data/weixin/books/*.json`（可用 `--books-dir` / `BOOKS_DIR` 覆盖）；`--include-output` 才会看中间产物。
+- 默认缓存干净书；要核对缓存是否误跳，用 `--refresh-cache`。
 - 判定是启发式：短书豁免、5—9 章收紧门槛，但「单章占比高」本身不等于故障，务必人工复核 `可疑` 档。
 - 交叉证据（章名混入 / 正文重复）是抽样比对：24 字窗口、命中率 ≥50% 才算「该章正文被合并」，避免套话/引文造成的偶然撞句。
 - 「章节缺失」是保守规则：只在标题**独立成行**时成立，宁可漏报折行/句中/结构性标题，也不把它们当故障。
