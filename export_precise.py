@@ -2360,18 +2360,24 @@ def find_chapter_split(blocks, catalog_titles, current_title: str):
 
     - 当前章能在目录定位时：只匹配「下一章」标题（避免跳章吞掉中间目录项）。
       章名比对已忽略空格差异（canvas「沈佺期三首」vs 目录「沈佺期 三首」）。
-    - 当前章未知（顶栏为空）时：按目录顺序找第一个作为章首出现的标题。
+    - 当前章无法在目录定位时（顶栏为空，或顶栏显示的是书名/卷名这类目录外
+      文本）：按目录顺序找第一个作为章首出现的标题。
+
+    「能否定位」必须用 catalog_index 判断，不能只看清洗后是否为空：阅读器顶栏
+    常整本停在书名（如「词林正韵」），清洗后非空却在目录里找不到任何对应项；
+    旧逻辑把它当成「当前章已知」，next_catalog_title 返回 None 后直接 return，
+    于是正文一路堆进同一章（历史事故：19 章 8307 字全并成一章，成品只剩 13 章）。
     """
     if not blocks or not catalog_titles:
         return None
     # 印刷目录页：页内章名是目录列举，不能当章首切章
     if blocks_are_catalog_page(blocks, catalog_titles):
         return None
-    cur = normalize_catalog_title(current_title)
-    if cur:
-        nxt = next_catalog_title(catalog_titles, cur)
-        if not nxt:
+    cur_idx = catalog_index(catalog_titles, current_title)
+    if cur_idx is not None:
+        if cur_idx + 1 >= len(catalog_titles):
             return None
+        nxt = catalog_titles[cur_idx + 1]
         if chapter_start_lacks_body_evidence(blocks, nxt, catalog_titles):
             return None
         before, after = split_blocks_at_chapter_start(blocks, nxt)
@@ -2379,7 +2385,7 @@ def find_chapter_split(blocks, catalog_titles, current_title: str):
             return None
         return nxt, before, after
 
-    # 顶栏空：按目录顺序找第一个章首
+    # 顶栏空或顶栏不在目录：按目录顺序找第一个章首
     for title in catalog_titles:
         before, after = split_blocks_at_chapter_start(blocks, title)
         if after:

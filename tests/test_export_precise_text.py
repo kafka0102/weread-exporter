@@ -508,6 +508,40 @@ class TestFindChapterSplit(unittest.TestCase):
         self.assertEqual(found[0], "李白")
         self.assertEqual(found[1][0]["text"], "导言正文")
 
+    def test_header_showing_book_title_still_splits_in_catalog_order(self):
+        """顶栏整本停在书名（不在目录里）时，仍要按目录切章。
+
+        历史事故（词林正韵）：顶栏一直显示书名「词林正韵」，旧逻辑只看
+        「清洗后非空」就认定当前章已知，next_catalog_title 取不到便直接
+        return None，正文再也不会切章——全书 19 章 8307 字灌进一章，
+        成品只剩 13 章、缺第1—7章。
+        """
+        blocks = [
+            {"type": "text", "text": "第1章"},
+            {"type": "text", "text": "平声：一东二冬通用"},
+            {"type": "text", "text": "【一东】东同童僮铜桐峒筒瞳中"},
+            {"type": "text", "text": "第3章"},
+            {"type": "text", "text": "平声：四支五微八齐十灰通用"},
+        ]
+        catalog = ["扉页", "第1章", "第2章", "第3章"]
+        found = export_precise.find_chapter_split(blocks, catalog, "词林正韵")
+        self.assertIsNotNone(found)
+        nxt, before, after = found
+        self.assertEqual(nxt, "第1章")
+        self.assertEqual(before, [])
+        self.assertEqual(after[0]["text"], "第1章")
+
+    def test_header_off_catalog_without_catalog_title_in_blocks_no_split(self):
+        """顶栏不在目录、正文里也没有任何目录章首时，不能凭空切章。"""
+        blocks = [
+            {"type": "text", "text": "某段没有章名的正文"},
+            {"type": "text", "text": "还是正文"},
+        ]
+        catalog = ["扉页", "第1章", "第2章"]
+        self.assertIsNone(
+            export_precise.find_chapter_split(blocks, catalog, "某本书名")
+        )
+
     def test_infer_title_for_before_when_current_empty(self):
         catalog = ["版权信息", "作者简介", "导言"]
         self.assertEqual(
