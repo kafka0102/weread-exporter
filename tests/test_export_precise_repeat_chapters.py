@@ -118,13 +118,36 @@ class TestRepeatExportedChapterEvidence(unittest.TestCase):
         )
 
     def test_short_titles_are_ignored(self):
-        """太短的章名在正文里天然重复，不能当重抓证据。"""
-        texts = {"早行": ("早行马上续残梦", {"马上续残梦"})}
+        """短章名只看整章一致：只有行重合（正文不同）时不能当重抓证据。"""
+        texts = {
+            "早行": {
+                "norm": "早行马上续残梦",
+                "lines": {"马上续残梦"},
+                "path": "",
+                "idx": 3,
+            }
+        }
         self.assertEqual(
             export_precise.repeat_exported_chapter_evidence(
                 "早行", blocks("马上续残梦，不知朝日升。"), texts
             ),
             "",
+        )
+
+    def test_short_title_identical_body_is_repeat(self):
+        """短章名但整章一字不差（李杜/楮树那种）仍算回退重抓。"""
+        texts = {
+            "李杜": {
+                "norm": "李杜刘克庄李杜文章宗，继者宜重黎。",
+                "lines": {"李杜", "刘克庄", "李杜文章宗，继者宜重黎。"},
+                "path": "",
+                "idx": 5,
+            }
+        }
+        self.assertTrue(
+            export_precise.repeat_exported_chapter_evidence(
+                "李杜", blocks("李杜", "刘克庄", "李杜文章宗，继者宜重黎。"), texts
+            )
         )
 
     def test_unknown_title_is_not_repeat(self):

@@ -1529,8 +1529,12 @@ def disk_chapter_titles(md_dir) -> list[str]:
 _REPEAT_IGNORE_CHARS_RE = re.compile(
     r"[\s\u3000\u200b\u200c\u200d\ufeff\u2060□■◆◇＿_]+"
 )
-# 已导出章的正文行被新章覆盖到此比例，即认定「同一章被重抓」
-REPEAT_EXPORTED_COVER_RATIO = 0.6
+# 已导出章的长正文行被新章覆盖到此比例，即认定「同一章被重抓」
+REPEAT_EXPORTED_COVER_RATIO = 0.8
+# 参与重合比对的正文行最短长度（「刘克庄」这类短行是噪声，容易拉高重合度）
+REPEAT_EXPORTED_MIN_LINE_LEN = 6
+# 长行不足这么多行时不做重合比对（行太少时比例没有意义）
+REPEAT_EXPORTED_MIN_LINE_COUNT = 2
 # 太短的章名在正文里天然会重复出现，不能当重抓证据
 REPEAT_EXPORTED_MIN_TITLE_KEY = 4
 
@@ -1559,6 +1563,7 @@ def exported_chapter_texts(md_dir) -> dict[str, dict]:
         if not key:
             continue
         lines: set[str] = set()
+        ordered: list[str] = []
         try:
             with open(path, encoding="utf-8") as f:
                 body = f.read()
@@ -1569,7 +1574,9 @@ def exported_chapter_texts(md_dir) -> dict[str, dict]:
             if not line or line.startswith("#") or line.startswith("!["):
                 continue
             lines.add(line)
-        norm = repeat_compare_text("".join(lines))
+            ordered.append(line)
+        # norm 必须按正文顺序拼接（set 顺序随机，会让整章包含判定失效）
+        norm = repeat_compare_text("".join(ordered))
         try:
             idx = int(fn[:-3])
         except ValueError:
@@ -1590,9 +1597,12 @@ def repeat_exported_chapter_evidence(title, blocks, exported_texts) -> str:
     - 同名章已在磁盘导出，且本章没抓到正文（空占位章重复）；
     - 同名章的压缩全文已完整出现在本章正文里（含 □ 之类渲染差异）；
     - 同名章正文行有 ≥REPEAT_EXPORTED_COVER_RATIO 的比例在本章正文里重现。
+
+    全文一致这条对短章名（「李杜」「楮树」）也适用——整章一字不差就是同一章；
+    行重合那条才要求章名够长，避免短章名在正文里天然重复造成误判。
     """
     key = compact_title_key(title)
-    if not key or len(key) < REPEAT_EXPORTED_MIN_TITLE_KEY:
+    if not key:
         return ""
     entry = (exported_texts or {}).get(key)
     if not entry:
@@ -1607,8 +1617,11 @@ def repeat_exported_chapter_evidence(title, blocks, exported_texts) -> str:
         return "同名空章"
     if disk_norm and disk_norm in new_norm:
         return "正文与已导出章一致"
-    disk_lines = {line for line in disk_lines if len(repeat_compare_text(line)) >= 4}
-    if not disk_lines:
+    disk_lines = {
+        line for line in disk_lines
+        if len(repeat_compare_text(line)) >= REPEAT_EXPORTED_MIN_LINE_LEN
+    }
+    if len(disk_lines) < REPEAT_EXPORTED_MIN_LINE_COUNT:
         return ""
     hit = sum(1 for line in disk_lines if repeat_compare_text(line) in new_norm)
     ratio = hit / len(disk_lines)
