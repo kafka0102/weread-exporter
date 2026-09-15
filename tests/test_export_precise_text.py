@@ -1557,3 +1557,27 @@ class TestLastChapterOverrunGuard(unittest.TestCase):
                 "2020年唐代文学研究专著索引",
             )
         )
+
+
+class TestChapterProgressLabel(unittest.TestCase):
+    """日志里的章进度标签：`17/99`（总章数取目录正文项）。"""
+
+    def test_progress_with_known_total(self):
+        self.assertEqual(export_precise.chapter_progress_label(17, 99), "17/99")
+        self.assertEqual(export_precise.chapter_progress_label(1, 1), "1/1")
+
+    def test_progress_without_catalog_falls_back_to_index(self):
+        """无目录（总章数未知）时只显示章号，不显示误导性的 /0。"""
+        self.assertEqual(export_precise.chapter_progress_label(17, 0), "17")
+        self.assertEqual(export_precise.chapter_progress_label(17, None), "17")
+
+    def test_progress_with_bad_index(self):
+        self.assertEqual(export_precise.chapter_progress_label(None, 99), "?")
+
+    def test_content_catalog_titles_drops_non_content_items(self):
+        catalog = ["封面", "第一章 起", "封底", "版权页", "第二章 承", "文前1"]
+        self.assertEqual(
+            export_precise.content_catalog_titles(catalog),
+            ["第一章 起", "第二章 承"],
+        )
+        self.assertEqual(export_precise.content_catalog_titles(None), [])

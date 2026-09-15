@@ -1418,6 +1418,26 @@ def is_non_content_catalog_title(title: str) -> bool:
     return bool(_NON_CONTENT_CATALOG_TITLE_RE.match(t))
 
 
+def content_catalog_titles(catalog_titles) -> list[str]:
+    """目录里的正文项（去掉封面/版权页等无正文项），顺序不变。"""
+    return [t for t in (catalog_titles or []) if not is_non_content_catalog_title(t)]
+
+
+def chapter_progress_label(idx, total_chapters) -> str:
+    """日志用章进度标签 `17/99`；总章数未知（无目录）时退化为 `17`。"""
+    try:
+        idx = int(idx)
+    except (TypeError, ValueError):
+        return "?"
+    try:
+        total_chapters = int(total_chapters or 0)
+    except (TypeError, ValueError):
+        total_chapters = 0
+    if total_chapters <= 0:
+        return f"{idx}"
+    return f"{idx}/{total_chapters}"
+
+
 # 近书末：阅读进度很高且连续失败时按完成收尾，避免目录/空章死循环
 NEAR_END_PROGRESS_PERCENT = 99
 NEAR_END_FAIL_LIMIT = 3
@@ -1948,7 +1968,7 @@ def stale_chapter_artifacts_evidence(md_dir, catalog_titles) -> str | None:
     """磁盘章产物是否已损坏（不宜当作「已完成」续传）→ 返回原因；正常时 None。"""
     if not md_dir or not catalog_titles or not os.path.isdir(md_dir):
         return None
-    content_titles = [t for t in catalog_titles if not is_non_content_catalog_title(t)]
+    content_titles = content_catalog_titles(catalog_titles)
     reasons: list[str] = []
     missing = missing_catalog_chapters_on_disk(md_dir, catalog_titles)
     if missing and len(missing) >= RESUME_MISSING_TITLE_MIN and len(missing) > (
@@ -3946,9 +3966,18 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                             current_chapter = nxt
                 else:
                     current_chapter = nxt
-        print(f"  📖 {book_title} — {book_author}")
-        print(f"  会话开始:「{current_chapter}」")
         ch_idx = start_idx
+        # 章进度：目录正文项总数（去掉封面/版权页等无正文项），日志里输出「17/99」
+        total_chapters = len(content_catalog_titles(catalog_titles))
+
+        def chapter_progress(idx) -> str:
+            return chapter_progress_label(idx, total_chapters)
+
+        print(f"  📖 {book_title} — {book_author}")
+        if total_chapters > 0:
+            print(f"  会话开始:「{current_chapter}」(第 {chapter_progress(ch_idx)} 章)")
+        else:
+            print(f"  会话开始:「{current_chapter}」")
         ch_blocks = []
         total_chars = total_imgs = 0
         chapters_this_session = 0
@@ -3964,6 +3993,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         dup_chapter_state: dict = {}
         # 已导出章正文摘要（磁盘 + 本会话）：识别回退重抓，见 commit_chapter
         exported_texts = exported_chapter_texts(md_dir)
+        # 最近一次实际落盘的章号：章间等待日志里显示「刚完成第 N/总 章」
+        last_saved_idx = ch_idx
 
         def remember_exported_text(title, blocks, idx=None):
             """把刚落盘的章正文登记进摘要，供后续回退重抓判定。"""
@@ -4358,6 +4389,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             allow_empty=True 时写入仅标题占位章，保证续传能越过空章。
             """
             nonlocal total_chars, total_imgs, chapters_this_session, reached_end
+            nonlocal last_saved_idx
             # 回退重抓防护：同名章已在磁盘导出且正文高度重合（或本章没抓到正文）
             # → 阅读器退回了已导出章节，不能占新章号，否则成品出现重复章、
             # 章号与目录错位，最后还会被去重计数误判成死循环。
@@ -4383,6 +4415,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     total_chars += n
                     total_imgs += len(imgs)
                     chapters_this_session += 1
+                    last_saved_idx = placeholder.get("idx") or ch_idx
                     remember_exported_text(
                         title, blocks, placeholder.get("idx") or ch_idx)
                     print(
@@ -4421,9 +4454,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             remember_exported_text(title, blocks)
             total_chars += n
             total_imgs += len(imgs)
+            last_saved_idx = ch_idx
             note = f" +{len(imgs)}图" if imgs else ""
             note += note_suffix
-            print(f"  [{ch_idx:4d}] {title[:32]:32s} {n:6d}字 ({page_num}页){note}")
+            print(
+                f"  [{chapter_progress(ch_idx):>7}] "
+                f"{title[:32]:32s} {n:6d}字 ({page_num}页){note}"
+            )
             chapters_this_session += 1
             return n, imgs, True
 
@@ -4437,7 +4474,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 min_seconds=SLEEP_CHAPTER_MIN,
                 max_seconds=SLEEP_CHAPTER_MAX,
             )
-            print(f"    … 章间等待 {wait_s:.1f}s（按 {n_chars} 字）")
+            print(
+                f"    … 章间等待 {wait_s:.1f}s"
+                f"（按 {n_chars} 字，已过第 {chapter_progress(last_saved_idx)} 章）"
+            )
             await asyncio.sleep(wait_s)
 
         async def sync_reader_after_content_split(target_title: str) -> bool:
@@ -5193,7 +5233,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             n, imgs, saved = await commit_chapter(
                 current_chapter, ch_blocks, note_suffix=" [末章]", allow_empty=False)
             if saved:
-                print(f"  [{ch_idx:4d}] {(current_chapter or '')[:32]:32s} {n:6d}字 [末章]")
+                print(
+                    f"  [{chapter_progress(ch_idx):>7}] "
+                    f"{(current_chapter or '')[:32]:32s} {n:6d}字 [末章]"
+                )
 
         await page.close(); await ctx.close()
         return book_title, book_author, chapters_this_session, total_chars, ch_idx, reached_end, request_reopen
