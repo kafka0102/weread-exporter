@@ -1456,6 +1456,118 @@ class TestPrintedCatalogPageDetection(unittest.TestCase):
         )
 
 
+class TestTwoPageSpreadCatalogSide(unittest.TestCase):
+    """双页布局：目录页只占一屏的一侧时也要判出来。
+
+    真实事故（迦陵说词讲稿）：每「章」开头有一张该章目录页（右页），左页是
+    上一章的收尾正文。按整屏合并统计只有 3 个章名 / 16 行 = 19% < 40% 阈值，
+    目录页被漏判；目录条目逐个被当成章首切章，该章每讲都只剩标题，整章正文
+    全灌进最后一讲（第六讲 85,120 字、第五讲同名两章）。
+    """
+
+    # 目录只取到第一章（该屏目录页列的就是这三项）
+    CATALOG = [
+        "扉页",
+        "总　序",
+        "第一章　词与文化",
+        "第一讲　从西方文论看花间词的美感特质",
+        "第二讲　谈中国诗词文本中的多义与潜能——一九九四年冬在南开大学七十五周年校庆学术报告会上的讲演",
+    ]
+
+    # 阅读器真实一屏：左页（cid=4）总序收尾，右页（cid=5）第一章目录
+    SPREAD = [
+        {"type": "text", "page": 4,
+         "text": "局即将推出的六册《说诗讲录》两者加起来，我的诗词讲录乃将"},
+        {"type": "text", "page": 4,
+         "text": "有十三册之多。作为一个83岁的老人，面对着自己已有62年讲"},
+        {"type": "text", "page": 4,
+         "text": "课之久的这些积累，真是令人不禁感慨系之。我平常很喜欢引用"},
+        {"type": "text", "page": 4,
+         "text": "的两句话是：\u200b“以无生之觉悟做有生之事业，以悲观之心境过乐"},
+        {"type": "text", "page": 4,
+         "text": "观之生活。\u200b”朋友们也许认为这只是老生常谈，殊不知这实在是"},
+        {"type": "text", "page": 4,
+         "text": "我的真实叙述。我是在极端痛苦中曾经亲自把自己的感情杀死过"},
+        {"type": "text", "page": 4,
+         "text": "的人，我现在的余生之精神情感之所系，就只剩下了诗词讲授之"},
+        {"type": "text", "page": 4,
+         "text": "传承的一个支撑点。大家可能还记得我曾经写过“书生报国成何"},
+        {"type": "text", "page": 4,
+         "text": "计，难忘诗骚屈杜魂”的话，其实那不仅是为了“报国”\u200b，原来也"},
+        {"type": "text", "page": 4,
+         "text": "是为了给自己的生命寻找一个意义。但自己自恨无能，如今面对"},
+        {"type": "text", "page": 4,
+         "text": "着这些杂乱荒疏的讲学之成果，不禁深怀惭怍，最后只好引前人"},
+        {"type": "text", "page": 4,
+         "text": "的两句话聊以自慰，那就是：\u200b“余虽不敏，然余诚矣。\u200b”"},
+        {"type": "text", "page": 5, "text": "第一章词与文化"},
+        {"type": "text", "page": 5, "text": "第一讲从西方文论看花间词的美感特质"},
+        {"type": "text", "page": 5, "text": "第二讲谈中国诗词文本中的多义与潜能——一九九四"},
+        {"type": "text", "page": 5, "text": "年冬在南开大学七十五周年校庆学术报告会上的讲演"},
+    ]
+
+    def test_toc_side_of_spread_is_detected(self):
+        self.assertTrue(
+            export_precise.looks_like_catalog_page(self.SPREAD, self.CATALOG)
+        )
+
+    def test_only_toc_side_is_dropped(self):
+        """只丢目录那一侧，同屏的另一侧正文要留下，不能整屏扔掉。"""
+        kept = export_precise.catalog_page_content_blocks(
+            self.SPREAD, self.CATALOG
+        )
+        self.assertEqual({b["page"] for b in kept}, {4})
+        self.assertEqual(len(kept), 12)
+        self.assertTrue(kept[0]["text"].startswith("局即将推出的六册"))
+
+    def test_toc_entries_are_not_treated_as_chapter_starts(self):
+        self.assertIsNone(
+            export_precise.find_chapter_split(
+                self.SPREAD, self.CATALOG, "第一讲　从西方文论看花间词的美感特质"
+            )
+        )
+        self.assertIsNone(
+            export_precise.find_future_catalog_hit(
+                self.SPREAD, self.CATALOG, "总　序", min_ahead=1
+            )
+        )
+
+    def test_spread_without_page_tags_keeps_old_behaviour(self):
+        """无 canvas 标记（单页/老调用）时不能凭空多判目录页，也不能丢块。"""
+        untagged = [
+            {"type": "text", "text": b["text"]} for b in self.SPREAD
+        ]
+        self.assertFalse(
+            export_precise.looks_like_catalog_page(untagged, self.CATALOG)
+        )
+        self.assertEqual(
+            export_precise.catalog_page_content_blocks(untagged, self.CATALOG), []
+        )
+
+    def test_build_page_blocks_tags_canvas_id(self):
+        """build_page_blocks 要给块打 canvas 标记——判目录页靠它分左右侧。"""
+        chars = []
+        for i, ch in enumerate("正文"):
+            chars.append({"t": ch, "x": 10 + i * 18, "y": 100,
+                          "cl": 230, "cid": 4})
+        for j, line in enumerate([
+            "第一章词与文化",
+            "第一讲从西方文论看花间词的美感特质",
+            "第二讲谈中国诗词文本中的多义与潜能——一九九四年冬在南开大学七十五周年校庆学术报告会上的讲演",
+        ]):
+            for i, ch in enumerate(line):
+                chars.append({"t": ch, "x": 10 + i * 18, "y": 100 + j * 24,
+                              "cl": 849, "cid": 5})
+        rects = [{"left": 230, "top": 0}, {"left": 849, "top": 0}]
+        blocks = export_precise.build_page_blocks(chars, [], rects, set())
+        self.assertEqual(
+            {b["page"] for b in blocks if b["type"] == "text"}, {4, 5}
+        )
+        self.assertTrue(
+            export_precise.looks_like_catalog_page(blocks, self.CATALOG)
+        )
+
+
 class TestCatalogPageRunaway(unittest.TestCase):
     """书末印刷目录页空转：反复回读同一页时必须收尾，不能无限跳过。
 

@@ -1112,8 +1112,30 @@ def _page_catalog_stats(blocks, catalog_titles) -> tuple[int, int, int]:
     return len(hits), len(lines), prose
 
 
-def looks_like_catalog_page(blocks, catalog_titles) -> bool:
-    """整页基本都是目录章名 → 判定为书内印刷目录页。"""
+def _split_blocks_by_canvas(blocks) -> list[list[dict]]:
+    """按 canvas 把块分组（无 page 标记时整组回退）。"""
+    groups: dict[int, list[dict]] = {}
+    untagged: list[dict] = []
+    for b in blocks or []:
+        tag = b.get("page")
+        try:
+            tag_v = int(tag) if tag is not None else None
+        except (TypeError, ValueError):
+            tag_v = None
+        if tag_v is None:
+            untagged.append(b)
+        else:
+            groups.setdefault(tag_v, []).append(b)
+    if not groups:
+        return [list(blocks or [])] if blocks else []
+    out = [groups[k] for k in sorted(groups)]
+    if untagged:
+        out.append(untagged)
+    return out
+
+
+def _looks_like_catalog_page_group(blocks, catalog_titles) -> bool:
+    """单个 canvas 的文本是否基本都是目录章名。"""
     if not blocks or not catalog_titles:
         return False
     hits, lines, prose = _page_catalog_stats(blocks, catalog_titles)
@@ -1128,6 +1150,42 @@ def looks_like_catalog_page(blocks, catalog_titles) -> bool:
     if hits / lines < CATALOG_PAGE_TITLE_SHARE:
         return False
     return not prose or prose / lines <= CATALOG_PAGE_PROSE_MAX_SHARE
+
+
+def looks_like_catalog_page(blocks, catalog_titles) -> bool:
+    """整页基本都是目录章名 → 判定为书内印刷目录页。
+
+    双页布局下一屏含左右两页：只要**其中一页**是目录列举（如右页是本章目录，
+    左页是上一章收尾正文），该页的章名就不能当章首切章。按整屏合并统计会
+    被另一页的正文摊薄（3 个章名 / 16 行 = 19% < 40% 阈值）而漏判——
+    历史事故：迦陵说词讲稿每个「章」开头的本章目录页没被识别，目录条目
+    逐个被当成章首，前一讲全变成只有标题的空壳，整章正文灌进最后一讲。
+    """
+    if not blocks or not catalog_titles:
+        return False
+    for group in _split_blocks_by_canvas(blocks):
+        if _looks_like_catalog_page_group(group, catalog_titles):
+            return True
+    return False
+
+
+def catalog_page_content_blocks(blocks, catalog_titles) -> list[dict]:
+    """去掉「目录列举」那一页的块，保留同屏其它页的正文块。
+
+    双页布局里常见「左页上一章收尾 + 右页本章目录」，整页丢弃会把同屏的
+    正文一起扔掉。单页/无 canvas 标记时返回空列表，调用方按整页丢弃处理。
+    """
+    if not blocks or not catalog_titles:
+        return []
+    groups = _split_blocks_by_canvas(blocks)
+    if len(groups) <= 1:
+        return []
+    kept: list[dict] = []
+    for group in groups:
+        if _looks_like_catalog_page_group(group, catalog_titles):
+            continue
+        kept.extend(group)
+    return kept
 
 
 def chapter_start_lacks_body_evidence(
@@ -2563,9 +2621,23 @@ def chars_to_lines(chars):
 
 def build_page_blocks(chars, images, canvas_rects, seen_imgs):
     """把一次渲染(可能双页)拆成有序块列表: [{type:'text'/'img', ...}]
-       文字行和图片按屏幕 y 交错；左页整页在前，右页在后。"""
+       文字行和图片按屏幕 y 交错；左页整页在前，右页在后。
+
+       每个块带 page 标记（canvas 稳定 id，缺省用页序号）：双页布局下
+       「目录列举页」只占一侧，按 canvas 分组才能判准、也才能只丢那一侧。"""
     blocks = []
     pages = split_spread(dedupe_chars_by_position(chars))
+
+    def canvas_tag(page_chars, index):
+        """本页的 canvas id；没有 id 时用负数页序号兜底。"""
+        for c in page_chars or []:
+            try:
+                cid = int(c.get("cid"))
+            except (TypeError, ValueError):
+                continue
+            if cid > 0:
+                return cid
+        return -1 - index
 
     # 判定左右 canvas
     rects = sorted(canvas_rects, key=lambda r: r["left"])
@@ -2577,7 +2649,7 @@ def build_page_blocks(chars, images, canvas_rects, seen_imgs):
     left_imgs = [im for im in images if im["left"] < mid_x]
     right_imgs = [im for im in images if im["left"] >= mid_x]
 
-    def emit_page(page_chars, page_rect, page_imgs):
+    def emit_page(page_chars, page_rect, page_imgs, page_tag):
         lines = chars_to_lines(page_chars)
         items = []
         for ln in lines:
@@ -2589,11 +2661,12 @@ def build_page_blocks(chars, images, canvas_rects, seen_imgs):
         items.sort(key=lambda t: t[1])
         for typ, _y, payload in items:
             if typ == "text":
-                blocks.append({"type": "text", "text": payload})
+                blocks.append({"type": "text", "text": payload, "page": page_tag})
             else:
                 seen_imgs.add(payload["src"])
                 blocks.append({"type": "img", "src": payload["src"],
-                                "w": payload["w"], "h": payload["h"]})
+                                "w": payload["w"], "h": payload["h"],
+                                "page": page_tag})
 
     if len(pages) >= 2:
         # 多 canvas：左→右逐页输出；首屏图归左，其余可见图归右/末页
@@ -2607,10 +2680,11 @@ def build_page_blocks(chars, images, canvas_rects, seen_imgs):
                 pimgs = right_imgs
             else:
                 pimgs = []
-            emit_page(page_chars, page_rects[i], pimgs)
+            emit_page(page_chars, page_rects[i], pimgs, canvas_tag(page_chars, i))
     else:
         # 单页：图片全归这页，仍按 y 排
-        emit_page(pages[0] if pages else [], left_rect, left_imgs + right_imgs)
+        single = pages[0] if pages else []
+        emit_page(single, left_rect, left_imgs + right_imgs, canvas_tag(single, 0))
     return blocks
 
 
@@ -4138,8 +4212,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     catalog_page_repeat_hits,
                     note_catalog_page_seen(catalog_page_fps, last_page_fp),
                 )
-                last_page_lines = set()
-                return False
+                # 双页时目录常常只占一侧（另一侧是上一章收尾正文）：
+                # 只丢目录那一侧，别把同屏的正文一起扔掉。
+                kept = catalog_page_content_blocks(new_blocks, catalog_titles)
+                if not kept:
+                    last_page_lines = set()
+                    return False
+                new_blocks = kept
             page_fp = page_blocks_fingerprint(new_blocks)
             if page_fp and page_fp == last_page_fp:
                 return False
