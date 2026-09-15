@@ -1522,6 +1522,105 @@ def disk_chapter_titles(md_dir) -> list[str]:
     return titles
 
 
+# 回退重抓比对用的压缩：去空白/零宽字符/缺字占位符（□ 之类渲染差异不算改动）
+_REPEAT_IGNORE_CHARS_RE = re.compile(
+    r"[\s\u3000\u200b\u200c\u200d\ufeff\u2060□■◆◇＿_]+"
+)
+# 已导出章的正文行被新章覆盖到此比例，即认定「同一章被重抓」
+REPEAT_EXPORTED_COVER_RATIO = 0.6
+# 太短的章名在正文里天然会重复出现，不能当重抓证据
+REPEAT_EXPORTED_MIN_TITLE_KEY = 4
+
+
+def repeat_compare_text(text: str) -> str:
+    """回退重抓比对用的正文压缩文本：去空白、零宽字符与缺字占位符。"""
+    return _REPEAT_IGNORE_CHARS_RE.sub("", text or "")
+
+
+def exported_chapter_texts(md_dir) -> dict[str, tuple[str, set[str]]]:
+    """磁盘已导出章的正文摘要：章名压缩键 → (压缩全文, 已见正文行集合)。
+
+    诗词选集这类书里，阅读器 DOM 会残留上几章的 canvas 文本，回退重抓时
+    同一章会再落盘一次，成品出现重复章、章号与目录错位。落盘前用这份摘要
+    判断「这一章其实已经导出过」，从而只跳过、不占新章号。
+    """
+    out: dict[str, tuple[str, set[str]]] = {}
+    if not md_dir or not os.path.isdir(md_dir):
+        return out
+    raw_dir = os.path.join(os.path.dirname(md_dir), "raw")
+    for fn in sorted(f for f in os.listdir(md_dir) if f.endswith(".md")):
+        path = os.path.join(md_dir, fn)
+        key = compact_title_key(_md_chapter_title(path, raw_dir))
+        if not key:
+            continue
+        lines: set[str] = set()
+        try:
+            with open(path, encoding="utf-8") as f:
+                body = f.read()
+        except OSError:
+            continue
+        for line in body.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("!["):
+                continue
+            lines.add(line)
+        norm = repeat_compare_text(body)
+        prev = out.get(key)
+        if prev:
+            merged_lines = set(prev[1]) | lines
+            out[key] = (prev[0] + norm, merged_lines)
+        else:
+            out[key] = (norm, lines)
+    return out
+
+
+def repeat_exported_chapter_evidence(title, blocks, exported_texts) -> str:
+    """当前章是否是「已导出章的回退重抓」→ 返回原因；不是则返回空串。
+
+    判定（三者任一成立即算重复，宁可漏判也不能写坏成品）：
+    - 同名章已在磁盘导出，且本章没抓到正文（空占位章重复）；
+    - 同名章的压缩全文已完整出现在本章正文里（含 □ 之类渲染差异）；
+    - 同名章正文行有 ≥REPEAT_EXPORTED_COVER_RATIO 的比例在本章正文里重现。
+    """
+    key = compact_title_key(title)
+    if not key or len(key) < REPEAT_EXPORTED_MIN_TITLE_KEY:
+        return ""
+    prev = (exported_texts or {}).get(key)
+    if not prev:
+        return ""
+    disk_norm, disk_lines = prev
+    new_text = "".join(
+        (b.get("text") or "") for b in (blocks or []) if b.get("type") == "text"
+    )
+    new_norm = repeat_compare_text(new_text)
+    if not new_norm:
+        return "同名空章"
+    if disk_norm and disk_norm in new_norm:
+        return "正文与已导出章一致"
+    disk_lines = {line for line in disk_lines if len(repeat_compare_text(line)) >= 4}
+    if not disk_lines:
+        return ""
+    hit = sum(1 for line in disk_lines if repeat_compare_text(line) in new_norm)
+    ratio = hit / len(disk_lines)
+    if ratio >= REPEAT_EXPORTED_COVER_RATIO:
+        return f"正文 {int(ratio * 100)}% 与已导出章重合"
+    return ""
+
+
+def count_repeated_chapter(state: dict, title: str) -> int:
+    """累计「同一章重复落盘」次数；换章即清零。返回累计值。
+
+    只有同一章连续重复才可能是死循环。回退重抓是逐章回放（标题在变），
+    把不同章的重复累加起来会误报死循环。
+    """
+    key = compact_title_key(title)
+    if key != state.get("key"):
+        state["key"] = key
+        state["hits"] = 0
+    state["hits"] = int(state.get("hits", 0)) + 1
+    return state["hits"]
+
+
 def missing_catalog_chapters_on_disk(md_dir, catalog_titles) -> list[str]:
     """目录里有、但已落盘章标题里找不到的正文项（忽略封面/版权页等无正文项）。"""
     disk_titles = disk_chapter_titles(md_dir)
@@ -1861,6 +1960,9 @@ LAG_BACK_SYNC_CONFIRM = 2
 MAX_LAG_BACK_SYNC = 3
 # 回退只找当前章往前这么多位之内的章首（更靠前的多半是引文/目录残留）
 LAG_BACK_SCAN_DEPTH = 30
+# 回退目标还必须贴近顶栏此刻的位置：缓冲里的章首离顶栏太远时，
+# 多半是 canvas 残留的旧章标题，不是「阅读器还在更早章」的证据。
+LAG_BACK_HEADER_MAX_GAP = 3
 
 
 def earlier_catalog_chapter_in_blocks(
@@ -1873,8 +1975,10 @@ def earlier_catalog_chapter_in_blocks(
 
     只在前两项都成立时才认（宁可漏判，也不要无故回退重抓）：
     - 当前章能在目录定位，且阅读器顶栏确实落后于它（顶栏无法定位时不信）；
-    - 缓冲里出现比当前章早 ≥2 位的目录章首行（整行章名，或章名 + 短尾巴）
-      —— 说明正在抓的正文属于更早的章，当前章是「指针超前」。
+    - 缓冲里出现比当前章早 ≥2 位、且离顶栏位置不超过 LAG_BACK_HEADER_MAX_GAP
+      的目录章首行（整行章名，或章名 + 短尾巴）——说明正在抓的正文属于
+      顶栏所在的更早章，当前章是「指针超前」。离顶栏太远的章首多半是
+      canvas 残留的旧章标题，用它回退会把指针拽回几十章之前。
     返回最靠后的那个更早章（最接近当前章）。
     """
     if not blocks or not catalog_titles:
@@ -1885,7 +1989,7 @@ def earlier_catalog_chapter_in_blocks(
     header_idx = catalog_index(catalog_titles, header_title) if header_title else None
     if header_idx is None or header_idx >= cur:
         return ""
-    start = max(0, cur - LAG_BACK_SCAN_DEPTH)
+    start = max(0, cur - LAG_BACK_SCAN_DEPTH, header_idx - LAG_BACK_HEADER_MAX_GAP)
     candidates: dict[str, tuple[int, str]] = {}
     for idx in range(start, cur - 1):
         key = compact_title_key(catalog_titles[idx])
@@ -2344,19 +2448,25 @@ async def _title(page):
     注意：关闭态 DOM 里常残留「选中」目录项 class。若盲信该节点，
     目录点击后会把目标章名当成当前章，造成「跳转成功、正文仍在旧章」。
     仅当选中项自身可见且可点时才作为兜底。
+
+    还须防「陈旧节点」：阅读器重绘后 DOM 里会留下早先章节的顶栏节点，
+    盲取第一个带文字的节点会读到几十章之前的章名（随后回退重抓整段正文）。
+    因此先在所有候选里挑「可见」的，只有全不可见时才退回带文字的节点。
     """
     return await page.evaluate(
         """() => {
-            const visible = (el, minW=8, minH=8) => {
-                if (!el) return false;
+            const vw = window.innerWidth || 0;
+            const vh = window.innerHeight || 0;
+            const intersectArea = (r) => {
+                const w = Math.min(r.right, vw) - Math.max(r.left, 0);
+                const h = Math.min(r.bottom, vh) - Math.max(r.top, 0);
+                return w > 0 && h > 0 ? w * h : 0;
+            };
+            const shown = (el) => {
                 const st = window.getComputedStyle(el);
                 if (st.display === 'none' || st.visibility === 'hidden') return false;
                 if (parseFloat(st.opacity || '1') < 0.05) return false;
-                if (st.pointerEvents === 'none') return false;
-                const r = el.getBoundingClientRect();
-                return r.width >= minW && r.height >= minH
-                    && r.bottom > 0 && r.top < (window.innerHeight || 0)
-                    && r.right > 0 && r.left < (window.innerWidth || 0);
+                return st.pointerEvents !== 'none';
             };
             const sels = [
                 '.renderTargetPageInfo_header_chapterTitle',
@@ -2365,20 +2475,37 @@ async def _title(page):
                 '[class*="header_chapterTitle"]',
                 '[class*="chapterTitle"]',
             ];
-            for (const s of sels) {
-                const el = document.querySelector(s);
-                const t = (el?.textContent || '').trim();
-                if (t && visible(el, 4, 4)) return t;
-                // 顶栏节点偶发宽高为 0 但仍有文本，仍可采用
-                if (t && el) return t;
+            const cands = [];
+            for (let si = 0; si < sels.length; si++) {
+                const s = sels[si];
+                for (const el of document.querySelectorAll(s)) {
+                    const t = (el.textContent || '').trim();
+                    if (!t) continue;
+                    const r = el.getBoundingClientRect();
+                    const area = shown(el) ? intersectArea(r) : 0;
+                    cands.push({ t, visible: area >= 16, area, si });
+                }
             }
             // 仅当目录选中项真正可见时才采用（避免关闭态残留 selected）
             const active = document.querySelector(
                 '.readerCatalog_list_item_selected, .readerCatalog_list_item.selected, .readerCatalog_list_item.isActive, [class*="readerCatalog_list_item"][class*="selected"], [class*="readerCatalog_list_item"][class*="active"]'
             );
-            if (active && visible(active, 40, 12)) {
+            if (active) {
                 const at = (active.textContent || '').trim();
-                if (at) return at;
+                const r = active.getBoundingClientRect();
+                const area = shown(active) ? intersectArea(r) : 0;
+                // 目录选中项只是兜底：优先级低于所有顶栏选择器
+                if (at && area >= 480) {
+                    cands.push({ t: at, visible: true, area, si: sels.length });
+                }
+            }
+            const visible = cands.filter((c) => c.visible);
+            const pool = visible.length ? visible : cands;
+            if (pool.length) {
+                // 先按选择器优先级（保持原有取节点顺序），同级再取面积最大的
+                // （双页两个可见顶栏时，面积大的更可能是当前页）
+                pool.sort((a, b) => (a.si - b.si) || (b.area - a.area));
+                return pool[0].t;
             }
             return '';
         }"""
@@ -3512,8 +3639,12 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         page_num = 0
         # 会话内已落盘章节指纹；重复则说明切章回退/停滞
         saved_chapter_fps: set[str] = set()
-        dup_chapter_hits = [0]
         MAX_DUP_CHAPTER_HITS = 5
+        # 重复章计数状态：只有「同一章反复出现」才算死循环，
+        # 回退重抓时逐章回放（标题在变）不能累加成死循环
+        dup_chapter_state: dict = {}
+        # 已导出章正文摘要（磁盘 + 本会话）：识别回退重抓，见 commit_chapter
+        exported_texts = exported_chapter_texts(md_dir)
         # 跨会话也识别「同一章同一正文」：续传重开后避免附录重复落盘
         try:
             for name in sorted(
@@ -3886,6 +4017,16 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             allow_empty=True 时写入仅标题占位章，保证续传能越过空章。
             """
             nonlocal total_chars, total_imgs, chapters_this_session, reached_end
+            # 回退重抓防护：同名章已在磁盘导出且正文高度重合（或本章没抓到正文）
+            # → 阅读器退回了已导出章节，不能占新章号，否则成品出现重复章、
+            # 章号与目录错位，最后还会被去重计数误判成死循环。
+            repeat_why = repeat_exported_chapter_evidence(title, blocks, exported_texts)
+            if repeat_why:
+                print(
+                    f"  ↩  已导出章重复出现「{(title or '')[:32]}」"
+                    f"（{repeat_why}），跳过落盘、不占章号"
+                )
+                return 0, [], False
             fp = chapter_blocks_fingerprint(title, blocks)
             # 停滞前进也用 allow_empty=True 落盘；若仍放行重复指纹，会把同一附录
             # 写成 0039/0040/... 无限编号。有正文时无论是否 allow_empty 都去重。
@@ -3894,12 +4035,12 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 for b in (blocks or [])
             )
             if fp in saved_chapter_fps and (has_text or not allow_empty):
-                dup_chapter_hits[0] += 1
+                hits = count_repeated_chapter(dup_chapter_state, title)
                 print(
                     f"  ⚠️  重复章节内容「{(title or '')[:32]}」"
-                    f"（{dup_chapter_hits[0]}/{MAX_DUP_CHAPTER_HITS}），跳过落盘"
+                    f"（{hits}/{MAX_DUP_CHAPTER_HITS}），跳过落盘"
                 )
-                if dup_chapter_hits[0] >= MAX_DUP_CHAPTER_HITS:
+                if hits >= MAX_DUP_CHAPTER_HITS:
                     raise RuntimeError(
                         "章节进度疑似死循环：相同标题与正文反复出现。"
                         "常见原因是顶栏停在卷/作者名而内容切章已前进，"
@@ -3917,6 +4058,16 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             elif not saved:
                 return n, imgs, False
             saved_chapter_fps.add(fp)
+            # 本章正文登记进摘要，后续回退重抓到同一章时按重抓跳过
+            body, _imgs = render_chapter_md(title, blocks or [], 0)
+            key = compact_title_key(title)
+            if key:
+                prev = exported_texts.get(key)
+                lines = chapter_text_line_set(blocks)
+                exported_texts[key] = (
+                    (prev[0] if prev else "") + repeat_compare_text(body),
+                    (prev[1] if prev else set()) | lines,
+                )
             total_chars += n
             total_imgs += len(imgs)
             note = f" +{len(imgs)}图" if imgs else ""

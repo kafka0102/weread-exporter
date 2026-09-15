@@ -89,6 +89,32 @@ class TestEarlierCatalogChapterInBlocks(unittest.TestCase):
         )
         self.assertEqual(found, "历史阅读与诗歌创作")
 
+    def test_ignores_heading_far_from_header(self):
+        """canvas 残留的旧章标题不能把指针拽回去（刘克庄诗选事故的形状）。"""
+        catalog = ["扉页", "版权信息"] + [
+            f"第{i}首 诗题甲乙丙丁" for i in range(2, 40)
+        ]
+        found = export_precise.earlier_catalog_chapter_in_blocks(
+            blocks(catalog[30]),
+            catalog,
+            catalog[38],
+            catalog[37],
+        )
+        self.assertEqual(found, "")
+
+    def test_still_accepts_heading_near_header(self):
+        """顶栏附近章的章首出现在缓冲里 → 仍是「指针超前」证据。"""
+        catalog = ["扉页", "版权信息"] + [
+            f"第{i}首 诗题甲乙丙丁" for i in range(2, 40)
+        ]
+        found = export_precise.earlier_catalog_chapter_in_blocks(
+            blocks(catalog[35]),
+            catalog,
+            catalog[38],
+            catalog[37],
+        )
+        self.assertEqual(found, catalog[35])
+
 
 if __name__ == "__main__":
     unittest.main()
