@@ -940,6 +940,73 @@ def is_exact_chapter_title(text: str, chapter_title: str) -> bool:
     return bool(tk and titlek and tk == titlek)
 
 
+# 目录标题的尾部括号：「词牌（首句）」/「作者（五首）」；阅读器正文页只印主名
+_TITLE_TAIL_PAREN_RE = re.compile(r"[（(]([^（()）]{1,60})[)）]\s*$")
+_TITLE_COUNT_SUFFIX_RE = re.compile(r"^[一二三四五六七八九十百千零两0-9]+首$")
+# 首句佐证太短（「（上）」「（一）」这类）易被正文里的常用字误命中，只认 ≥2 字
+_TITLE_SUFFIX_MIN_KEY = 2
+
+
+def split_catalog_title_tail(title: str) -> tuple[str, list[str]]:
+    """目录标题 → (主名, 尾部括号内容列表)；没有尾部括号时返回 (标题, [])。
+
+    诗词选集的目录常写「忆王孙（齐云一炬起红烟）」「谢应芳（五首）」，
+    还有「清平乐（二首）（山翁归去）」这种连着两个括号的写法；阅读器正文页
+    只印主名「忆王孙」「谢应芳」「清平乐」，后面跟副题与正文。
+    """
+    normalized = normalize_catalog_title(title)
+    if not normalized:
+        return "", []
+    tails: list[str] = []
+    base = normalized
+    while True:
+        m = _TITLE_TAIL_PAREN_RE.search(base)
+        if not m:
+            break
+        head = base[:m.start()].strip()
+        if not head:
+            break
+        tails.insert(0, m.group(1).strip())
+        base = head
+    if not tails:
+        return normalized, []
+    return base, tails
+
+
+def title_base_matches_line(text: str, title: str, following_lines) -> bool:
+    """页面只印主名时，能否认成这个目录章首。
+
+    历史事故（明词三百首）：目录全是「词牌（首句）」/「作者（五首）」，正文页只印
+    「忆王孙」「谢应芳」。整行等于目录标题的要求永远不成立 → 逻辑章卡在
+    「谢应芳（五首）」再不动，一路翻到书末，反复重抓都出不了成品。
+
+    需下列之一成立，避免把同名小令（《念奴娇》有 12 处）切错：
+    - 括号里是首数（「五首」）：正文里本就不会出现；
+    - 括号里的首句能在紧随其后的几行里找到。
+    """
+    base, tails = split_catalog_title_tail(title)
+    if not base or not tails:
+        return False
+    t = strip_format_chars((text or "").strip())
+    if not t or compact_title_key(t) != compact_title_key(base):
+        return False
+    lines = [compact_title_key(line) for line in (following_lines or [])]
+    confirmed = False
+    for tail in tails:
+        if _TITLE_COUNT_SUFFIX_RE.fullmatch(tail):
+            # 「（五首）」「（二首）」是分组首数，正文里本就不会出现
+            confirmed = True
+            continue
+        key = compact_title_key(tail)
+        if len(key) < _TITLE_SUFFIX_MIN_KEY:
+            return False
+        if not any(key in line for line in lines):
+            # 首句对不上：可能是同名小令（《念奴娇》本书有 12 处），不能切
+            return False
+        confirmed = True
+    return confirmed
+
+
 def split_blocks_at_chapter_start(blocks, chapter_title: str, *, exact: bool = False):
     """在 blocks 中按 chapter_title 章首切分为 (before, after)。
 
@@ -958,6 +1025,16 @@ def split_blocks_at_chapter_start(blocks, chapter_title: str, *, exact: bool = F
     for i in range(n):
         if blocks[i].get("type") != "text":
             continue
+        # 主名之后的文本行：正文页只印主名时要靠首句佐证，见 title_base_matches_line
+        following: list[str] = []
+        for b in blocks[i + 1:]:
+            if b.get("type") != "text":
+                continue
+            piece = strip_format_chars((b.get("text") or "").strip())
+            if piece:
+                following.append(piece)
+            if len(following) >= 6:
+                break
         joined = ""
         for j in range(i, min(n, i + max_join)):
             b = blocks[j]
@@ -974,6 +1051,11 @@ def split_blocks_at_chapter_start(blocks, chapter_title: str, *, exact: bool = F
                 if exact
                 else is_chapter_start_text(joined, title)
             )
+            # 「主名 + 尾括号」两路都要认：正常切章（exact=False）和越章救援
+            # （exact=True，阅读器跳页漏章时用）都会碰到「忆王孙」/「杨基」
+            # 这类只印主名的正文行；不认就会一路翻到书末也切不开。
+            if not matched:
+                matched = title_base_matches_line(joined, title, following)
             if matched:
                 return blocks[:i], blocks[i:]
             jk = compact_title_key(joined)

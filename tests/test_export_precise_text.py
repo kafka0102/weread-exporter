@@ -1456,6 +1456,142 @@ class TestPrintedCatalogPageDetection(unittest.TestCase):
         )
 
 
+class TestCatalogTitleTailParen(unittest.TestCase):
+    """目录是「词牌（首句）」「作者（五首）」，正文页只印主名。
+
+    真实事故（明词三百首）：目录 476 项里 473 项带尾部括号，而阅读器正文页只印
+    「忆王孙」「谢应芳」。切章要求整行等于目录标题，永远不成立 —— 逻辑章卡在
+    「谢应芳（五首）」一路翻到书末，反复重抓都出不了成品（中间产物里同一章
+    被写了 6 遍）。
+    """
+
+    CATALOG = [
+        "扉页",
+        "版权信息",
+        "前言",
+        "谢应芳（五首）",
+        "忆王孙（齐云一炬起红烟）",
+        "点绛唇（老眼犹明）",
+        "一剪梅（一色苍然两阿翁）",
+        "水调歌头（战骨缟如雪）",
+        "蓦山溪（无端汤武）",
+        "陶宗仪（二首）",
+        "念奴娇（黄花白髮）",
+    ]
+
+    # 阅读器真实一屏：作者分组行 + 小传 + 三首词
+    PAGE = [
+        {"type": "text", "page": 4, "text": "谢应芳"},
+        {"type": "text", "page": 4,
+         "text": "谢应芳(1296—1392)，字子兰，号龟巢老人。武进（今属江苏）"},
+        {"type": "text", "page": 4,
+         "text": "人。以道义名节自励。终生布衣。元末至正年间隐居白鹤溪上，"},
+        {"type": "text", "page": 4,
+         "text": "筑室曰龟巢，授徒讲学为生。后避乱徙居苏州。明初洪武年间归"},
+        {"type": "text", "page": 4, "text": "忆王孙"},
+        {"type": "text", "page": 4, "text": "和熊元修苏州感兴"},
+        {"type": "text", "page": 4,
+         "text": "齐云一炬起红烟，顷刻烟销事已迁。折戟沉沙月烂船。"},
+        {"type": "text", "page": 4, "text": "问祈连，安得河清亿万年？"},
+        {"type": "text", "page": 4, "text": "【说明】"},
+        {"type": "text", "page": 4,
+         "text": "元末明初之际战乱频繁，百姓流离失所。此词为作者避乱苏州时"},
+        {"type": "text", "page": 4, "text": "所作。原词二首，词意相同，这是其中的第二首。"},
+        {"type": "text", "page": 5, "text": "点绛唇"},
+        {"type": "text", "page": 5, "text": "初度作"},
+        {"type": "text", "page": 5,
+         "text": "老眼犹明，著书未了馀生债。客来休怪，淡饭黄齑菜。"},
+    ]
+
+    def test_split_title_tail(self):
+        self.assertEqual(
+            export_precise.split_catalog_title_tail("忆王孙（齐云一炬起红烟）"),
+            ("忆王孙", ["齐云一炬起红烟"]),
+        )
+        self.assertEqual(
+            export_precise.split_catalog_title_tail("谢应芳（五首）"),
+            ("谢应芳", ["五首"]),
+        )
+        self.assertEqual(
+            export_precise.split_catalog_title_tail("前言"), ("前言", [])
+        )
+        # 连续两个括号：首数 + 首句
+        self.assertEqual(
+            export_precise.split_catalog_title_tail("清平乐（二首）（山翁归去）"),
+            ("清平乐", ["二首", "山翁归去"]),
+        )
+
+    def test_poem_title_with_first_line_matches(self):
+        self.assertTrue(
+            export_precise.title_base_matches_line(
+                "忆王孙", "忆王孙（齐云一炬起红烟）",
+                ["和熊元修苏州感兴", "齐云一炬起红烟，顷刻烟销事已迁。"],
+            )
+        )
+
+    def test_same_cipai_with_other_first_line_not_matched(self):
+        """《念奴娇》同名很多（本书 12 处），首句对不上就不能认。"""
+        self.assertFalse(
+            export_precise.title_base_matches_line(
+                "念奴娇", "念奴娇（黄花白髮）",
+                ["大江东去，浪淘尽，千古风流人物。"],
+            )
+        )
+
+    def test_author_group_count_suffix_matches(self):
+        self.assertTrue(
+            export_precise.title_base_matches_line(
+                "陶宗仪", "陶宗仪（二首）", ["南村辍耕录"]
+            )
+        )
+
+    def test_count_plus_first_line_both_checked(self):
+        """「清平乐（二首）（山翁归去）」：首数放行，首句仍要佐证。"""
+        self.assertTrue(
+            export_precise.title_base_matches_line(
+                "清平乐", "清平乐（二首）（山翁归去）",
+                ["其一", "山翁归去，玉洞花千树。"],
+            )
+        )
+        self.assertFalse(
+            export_precise.title_base_matches_line(
+                "清平乐", "清平乐（二首）（山翁归去）",
+                ["其一", "别样风光，此处不同。"],
+            )
+        )
+
+    def test_short_suffix_needs_no_evidence(self):
+        """短括号（「（上）」这类）不做正文佐证，避免被常用字误命中。"""
+        self.assertFalse(
+            export_precise.title_base_matches_line(
+                "第六章", "第六章（上）", ["上文说过，此处不再赘述"]
+            )
+        )
+
+    def test_real_page_splits_at_poem_title(self):
+        found = export_precise.find_chapter_split(
+            self.PAGE, self.CATALOG, "谢应芳（五首）"
+        )
+        self.assertIsNotNone(found)
+        nxt, before, after = found
+        self.assertEqual(nxt, "忆王孙（齐云一炬起红烟）")
+        self.assertEqual(before[0]["text"], "谢应芳")
+        self.assertEqual(before[-1]["text"], "筑室曰龟巢，授徒讲学为生。后避乱徙居苏州。明初洪武年间归")
+        self.assertEqual(after[0]["text"], "忆王孙")
+
+    def test_real_page_keeps_splitting_to_next_poem(self):
+        """切到「忆王孙」后，缓冲里还能继续切到「点绛唇」。"""
+        _nxt, _b, after = export_precise.find_chapter_split(
+            self.PAGE, self.CATALOG, "谢应芳（五首）"
+        )
+        found = export_precise.find_chapter_split(
+            after, self.CATALOG, "忆王孙（齐云一炬起红烟）"
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], "点绛唇（老眼犹明）")
+        self.assertEqual(found[2][0]["text"], "点绛唇")
+
+
 class TestFillMissingHelpers(unittest.TestCase):
     """补漏的取章与内容判定。
 
