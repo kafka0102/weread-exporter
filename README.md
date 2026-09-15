@@ -142,8 +142,30 @@ python repair_empty_chapters.py --refresh-shelf --dry-run
   章节数 ≤2 默认豁免（`--min-chapters` 可调）。
 - `--apply` 可加 `--limit N` / `--max-chapters N` 控制规模，逐本失败默认继续，
   `--fail-fast` 改为失败即停；写 JSON 前自动备份到 `output/<id>/backups/`。
-- 结构性损坏（章节缺失/正文被并进邻章）不适用本脚本，应整本重下，见
-  `docs/reports/merged-chapters-2026-09-13.md`。
+- 本脚本只补「章在、正文空」；「目录里有、却被并进邻章」的章节缺失用下一节的
+  `repair_missing_chapters.py` 重切，不必整本重下。
+
+### 5. 章节缺失重切（把并进邻章的章切回来）
+
+体检报告里「目录里有、导出章节里没有、标题在某章正文中独立成行」的书，正文其实都在
+文件里，只是章界错位。`repair_missing_chapters.py` 按目录章名在 md 里找切点，只切不改字：
+
+```bash
+# 空跑：列出可重切的书、补回章数与切点（默认模式，不改任何文件）
+python repair_missing_chapters.py --dry-run
+python repair_missing_chapters.py --dry-run --book <book_id> --json
+
+# 落盘：备份 → 重写 chapters/raw → 用同一管线重建成品 JSON
+python repair_missing_chapters.py --apply --book <book_id>
+```
+
+- 切点要求：标题整行相等、每章只用一次、目录顺序单调递增；卷标题、作者分组行、
+  折行标题与句中提及由 `detect_merged_chapters.missing_catalog_titles()` 排除。
+- 安全校验：切分后正文逐行必须与切分前**完全一致**，有任何丢失即整本放弃；
+  原本就存在的空章（只有标题的占位章）原样保留，不会因重切被吞掉。
+- 会重新编号章号（`ch_0001…`，因为确实插入了新章）；成品 JSON 与 `chapters/`、`raw/`
+  一起备份到 `output/<id>/backups/<时间戳>/`，出版信息从旧 JSON 继承。
+- 只在切点确实存在时才动文件，扫描口径与 `detect_merged_chapters.py` 的「章节缺失」一致。
 
 ## 输出
 
