@@ -219,6 +219,43 @@ class TestMissingChapterFill(unittest.TestCase):
                 ["0002.md", "0003.md", "0004.md", "0005.md", "0006.md"],
             )
 
+    def test_renumber_closes_gaps_in_order(self):
+        """补漏插章留下的空号要重排成连续章号，顺序不变。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = self.build(tmp)
+            raw_dir = str(Path(tmp) / "raw")
+            # 制造空号：把 0003 挪到 0009
+            os.replace(os.path.join(md_dir, "0003.md"), os.path.join(md_dir, "0009.md"))
+            titles_before = [
+                open(os.path.join(md_dir, f), encoding="utf-8").read().splitlines()[0]
+                for f in sorted(os.listdir(md_dir)) if f.endswith(".md")
+            ]
+            export_precise.renumber_chapter_files(md_dir, raw_dir)
+            files = sorted(f for f in os.listdir(md_dir) if f.endswith(".md"))
+            self.assertEqual(
+                files, ["0001.md", "0002.md", "0003.md", "0004.md", "0005.md"]
+            )
+            titles_after = [
+                open(os.path.join(md_dir, f), encoding="utf-8").read().splitlines()[0]
+                for f in files
+            ]
+            self.assertEqual(titles_before, titles_after)
+
+    def test_renumber_keeps_raw_in_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = self.build(tmp)
+            raw_dir = str(Path(tmp) / "raw")
+            (Path(raw_dir) / "0009.json").write_text(
+                json.dumps({"title": "念奴娇", "images": [], "text_len": 3}),
+                encoding="utf-8",
+            )
+            moved_md = os.path.join(md_dir, "0005.md")
+            os.replace(moved_md, os.path.join(md_dir, "0009.md"))
+            export_precise.renumber_chapter_files(md_dir, raw_dir)
+            self.assertFalse(os.path.exists(os.path.join(md_dir, "0009.md")))
+            self.assertTrue(os.path.exists(os.path.join(md_dir, "0005.md")))
+            self.assertTrue(os.path.exists(os.path.join(raw_dir, "0005.json")))
+
 
 class TestSplitRewindBlocks(unittest.TestCase):
     def test_rewind_keeps_current_chapter_text(self):
@@ -259,6 +296,75 @@ class TestSplitRewindBlocks(unittest.TestCase):
 
 
 class TestCountRepeatedChapter(unittest.TestCase):
+    def test_any_catalog_title_splits_off_later_chapters(self):
+        """补漏时正文里紧接着别的目录章（不是目录下一章）也要切掉。"""
+        catalog = ["橘花", "健忘一首", "病后访梅九绝", "杂咏一百首·项羽"]
+        before, after = export_precise.split_blocks_at_any_catalog_title(
+            blocks(
+                "健忘一首",
+                "刘克庄",
+                "昏昏健忘废专精，默坐空斋忽自惊。",
+                "病后访梅九绝",
+                "刘克庄",
+                "梦得因桃数左迁，长源为柳忤当权。",
+            ),
+            catalog,
+            exclude_title="健忘一首",
+        )
+        self.assertEqual(len(before), 3)
+        self.assertEqual(after[0]["text"], "病后访梅九绝")
+
+    def test_any_catalog_title_ignores_target_itself(self):
+        """本章章名（含简写差异）不能当成下一章边界。"""
+        catalog = ["哨遍", "念奴娇（木犀）", "念奴娇"]
+        before, after = export_precise.split_blocks_at_any_catalog_title(
+            blocks("念奴娇（木犀）", "刘克庄", "绕篱寻菊，菊犹迟、舍北芙蓉浑未。"),
+            catalog,
+            exclude_title="念奴娇（木犀）",
+        )
+        self.assertEqual(after, [])
+        self.assertEqual(len(before), 3)
+
+    def test_split_off_keeps_chapter_when_title_is_prefix_of_own_heading(self):
+        """「念奴娇」是「念奴娇（木犀）」的前缀：切分不能把本章自己切没。"""
+        catalog = ["哨遍", "念奴娇（木犀）", "念奴娇"]
+        kept, boundary = export_precise.split_off_next_chapter(
+            blocks(
+                "念奴娇（木犀）",
+                "刘克庄",
+                "绕篱寻菊，菊犹迟、舍北芙蓉浑未。",
+            ),
+            catalog,
+            "念奴娇（木犀）",
+            "念奴娇",
+        )
+        self.assertFalse(boundary)
+        self.assertEqual([b["text"] for b in kept][:1], ["念奴娇（木犀）"])
+        self.assertEqual(len(kept), 3)
+
+    def test_split_off_cuts_at_later_catalog_chapter(self):
+        """正文里紧接着别的目录章时切掉，并报告已碰到下一章。"""
+        catalog = ["橘花", "健忘一首", "病后访梅九绝", "杂咏一百首·项羽"]
+        kept, boundary = export_precise.split_off_next_chapter(
+            blocks(
+                "上一章残留",
+                "健忘一首",
+                "刘克庄",
+                "昏昏健忘废专精，默坐空斋忽自惊。",
+                "病后访梅九绝",
+                "刘克庄",
+                "梦得因桃数左迁，长源为柳忤当权。",
+            ),
+            catalog,
+            "健忘一首",
+            "杂咏一百首·项羽",
+        )
+        self.assertTrue(boundary)
+        self.assertEqual(
+            [b["text"] for b in kept],
+            ["健忘一首", "刘克庄", "昏昏健忘废专精，默坐空斋忽自惊。"],
+        )
+
     def test_same_chapter_accumulates(self):
         state = {}
         self.assertEqual(

@@ -1652,6 +1652,83 @@ def split_rewind_blocks(blocks, back_title) -> tuple[list, list]:
     return list(before), list(after)
 
 
+def split_blocks_at_any_catalog_title(
+    blocks, catalog_titles, *, exclude_title: str = ""
+) -> tuple[list, list]:
+    """在缓冲里按「任意目录章名」的章首切分：返回 (before, after)。
+
+    补漏时只认「目录里的下一章」不够：这本书紧接着的是别的目录章
+    （诗词选集的重复区块），照旧会一直抓到 max_pages，把后面几章正文
+    一起灌进本章。这里认任意其他目录章名（排除本章自己，含简写章名
+    不得误判：念奴娇（木犀）与念奴娇是两首）。
+    """
+    if not blocks or not catalog_titles:
+        return list(blocks or []), []
+    exclude = chapter_title_match_key(exclude_title)
+    keys: dict[str, str] = {}
+    for title in catalog_titles:
+        key = chapter_title_match_key(title)
+        if not key or key == exclude or len(key) < REPEAT_EXPORTED_MIN_TITLE_KEY:
+            continue
+        keys.setdefault(key, title)
+    if not keys:
+        return list(blocks or []), []
+    for i, b in enumerate(blocks):
+        if b.get("type") != "text":
+            continue
+        line = (b.get("text") or "").strip()
+        if not line or len(line) > _TITLE_LINE_MAX_LEN:
+            continue
+        key = chapter_title_match_key(line)
+        if not key:
+            continue
+        hit = keys.get(key)
+        if hit is None:
+            for k in keys:
+                if not key.startswith(k):
+                    continue
+                if len(key) - len(k) > CHAPTER_START_PREFIX_MAX_TAIL:
+                    continue
+                hit = keys[k]
+                break
+        if hit is None:
+            continue
+        return list(blocks[:i]), list(blocks[i:])
+    return list(blocks or []), []
+
+
+def split_off_next_chapter(
+    blocks, catalog_titles, title: str, next_title: str = ""
+) -> tuple[list, bool]:
+    """补漏采集用：只留本章内容，切掉后面别的章。返回 (本章块, 是否已碰到下一章)。
+
+    先定位本章章首（宽松匹配，含 canvas 简写与粘连尾巴），把章首之前的残留
+    丢掉；再在章首**之后**找下一章章首——否则「念奴娇」会匹配到本章的
+    「念奴娇（木犀）」，把整章当下一章切没。
+    """
+    blocks = list(blocks or [])
+    if not blocks:
+        return [], False
+    start = None
+    _pre, from_title = split_blocks_at_chapter_start(blocks, title)
+    if from_title:
+        start = len(blocks) - len(from_title)
+    # 只保留本章章首那一块作头，章首之前的残留直接丢
+    head = blocks[start: start + 1] if start is not None else []
+    scan = blocks[start + 1:] if start is not None else blocks
+    if not scan:
+        return head, False
+    before_next, after_next = [], []
+    if next_title:
+        before_next, after_next = split_blocks_at_chapter_start(scan, next_title)
+    if not after_next:
+        before_next, after_next = split_blocks_at_any_catalog_title(
+            scan, catalog_titles, exclude_title=title)
+    if after_next:
+        return head + list(before_next), True
+    return head + scan, False
+
+
 def missing_catalog_chapters_on_disk(md_dir, catalog_titles) -> list[str]:
     """目录里有、但已落盘章标题里找不到的正文项（忽略封面/版权页等无正文项）。"""
     disk_titles = disk_chapter_titles(md_dir)
@@ -1766,6 +1843,29 @@ def shift_chapter_files(md_dir, raw_dir, from_idx: int) -> int:
                 os.replace(src, dst)
         moved += 1
     return moved
+
+
+def renumber_chapter_files(md_dir, raw_dir) -> int:
+    """把章文件按现有顺序重排成连续章号（补漏插章后可能留下空号）。"""
+    if not md_dir or not os.path.isdir(md_dir):
+        return 0
+    numbered = sorted(
+        int(f[:-3]) for f in os.listdir(md_dir)
+        if f.endswith(".md") and f[:-3].isdigit()
+    )
+    tmp_prefix = "__renumber__"
+    staged: list[tuple[int, str, str]] = []
+    for order, idx in enumerate(numbered, 1):
+        for src_dir, suffix in ((md_dir, ".md"), (raw_dir, ".json")):
+            src = os.path.join(src_dir, f"{idx:04d}{suffix}")
+            if not os.path.exists(src):
+                continue
+            tmp = os.path.join(src_dir, f"{tmp_prefix}{order:04d}{suffix}")
+            os.replace(src, tmp)
+            staged.append((order, tmp, os.path.join(src_dir, f"{order:04d}{suffix}")))
+    for _order, tmp, dst in staged:
+        os.replace(tmp, dst)
+    return len(numbered)
 
 
 def merged_titles_in_dominant_chapter(md_dir, catalog_titles) -> list[str]:
@@ -3342,6 +3442,77 @@ def chapter_saved(text_len, images):
     return bool(text_len or images)
 
 
+# 目录项标题匹配（脚本内复用）：去零宽字符/进度文案，短标题只认全等
+CATALOG_TITLE_MATCH_JS = r"""
+    const strip = (s) => String(s || '')
+        .replace(/[\u200b\u200c\u200d\ufeff\u2060]/g, '')
+        .replace(/(当前读到|已读到|读到)\s*\d+\s*%?\s*$/g, '')
+        .replace(/\s*\d+\s*%\s*$/g, '')
+        .trim();
+    const compact = (s) => String(s || '')
+        .replace(/[\u200b\u200c\u200d\ufeff\u2060]/g, '')
+        .replace(/\s+/g, '');
+    const matchTitle = (t, tgt) => {
+        if (!t) return false;
+        if (!tgt) return true;
+        if (t === tgt) return true;
+        const tc = compact(t), gc = compact(tgt);
+        if (tc && gc && tc === gc) return true;
+        // 短标题只允许精确/压缩全等，避免「春日」点到「春日京中有怀」
+        if (gc.length <= 4 || tc.length <= 4) return false;
+        if (tc.startsWith(gc) || gc.startsWith(tc)) {
+            const b = Math.abs(tc.length - gc.length);
+            return Math.min(tc.length, gc.length) >= 4 && b <= 8;
+        }
+        return false;
+    };
+    const itemTitle = (el) => {
+        const titleEl = el.querySelector(
+            '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
+        );
+        return strip((titleEl && titleEl.textContent) || el.textContent || '');
+    };
+    const catalogItems = () => Array.from(
+        document.querySelectorAll('.readerCatalog_list_item')
+    ).filter((el) => !(el.closest && el.closest('form, [class*="searchInput"], [class*="SearchInput"]')));
+"""
+
+
+async def scroll_catalog_to_title(page, target_title: str) -> str:
+    """把目录列表精确滚到目标章（按 DOM 偏移，不靠索引比例估算）。
+
+    目录项长短不一，按「目录序号/总数」估算滚动位置会偏出屏幕，目标项既没进
+    视口、单向滚动又找不回来（汉宫春（呈张别驾）/健忘一首 就是这么漏跳的）。
+    找到就返回匹配到的原文，找不到返回空串。
+    """
+    target = normalize_catalog_title(target_title)
+    if not target:
+        return ""
+    return await page.evaluate(
+        f""" (target) => {{
+            {CATALOG_TITLE_MATCH_JS}
+            const sc = document.querySelector(
+                '.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]'
+            );
+            for (const el of catalogItems()) {{
+                const t = itemTitle(el);
+                if (!matchTitle(t, target)) continue;
+                const r = el.getBoundingClientRect();
+                if (sc) {{
+                    const cr = sc.getBoundingClientRect();
+                    sc.scrollTop = sc.scrollTop + (r.top - cr.top)
+                        - Math.max(0, (sc.clientHeight - r.height) / 2);
+                }} else {{
+                    el.scrollIntoView({{block: 'center'}});
+                }}
+                return t;
+            }}
+            return '';
+        }}""",
+        target,
+    ) or ""
+
+
 
 async def click_catalog_list_item(page, target_title: str = "") -> str:
     """用真实鼠标点击目录项（Vue 对纯 JS click 常无响应）。
@@ -3472,10 +3643,14 @@ async def goto_catalog_chapter(page, target_title: str, catalog_titles=None) -> 
             return ""
 
         land_fails = 0
+        # 先按 DOM 偏移把目标项精确滚进视口（按索引比例估算会滚过头，目标就再也找不回来）
+        scrolled_to = await scroll_catalog_to_title(page, target)
+        if scrolled_to:
+            await asyncio.sleep(max(0.05, float(SLEEP_READER_CATALOG_SCROLL) * 0.3))
         # 长目录（数百章）按索引先粗定位，再细滚找，避免末章滚不到
         cat_n = len(catalog_titles or [])
         cat_i = catalog_index(catalog_titles, target) if catalog_titles else None
-        if cat_i is not None and cat_n > 1:
+        if not scrolled_to and cat_i is not None and cat_n > 1:
             ratio = max(0.0, min(1.0, float(cat_i) / float(cat_n - 1)))
             try:
                 await page.evaluate(
@@ -5090,6 +5265,12 @@ async def fill_missing_chapters(
                     await asyncio.sleep(SLEEP_READER_PAGE_TURN)
                 await wait_stable(page, 0, timeout=2.5)
                 new_blocks = await capture_reader_page_blocks(page, seen_imgs)
+                if not new_blocks and page_i == 0:
+                    # 跳转后 canvas 可能还没重绘：重绘后再抓一次，别直接把整章判空
+                    await force_reader_repaint(page)
+                    await asyncio.sleep(SLEEP_READER_PAGE_RENDER)
+                    await wait_stable(page, 0, timeout=1.5)
+                    new_blocks = await capture_reader_page_blocks(page, seen_imgs)
                 fp = page_blocks_fingerprint(new_blocks)
                 if not new_blocks or (fp and fp == last_fp):
                     stale += 1
@@ -5099,13 +5280,12 @@ async def fill_missing_chapters(
                 last_fp = fp
                 stale = 0
                 blocks.extend(new_blocks)
-                if next_title:
-                    before_next, after_next = split_blocks_at_chapter_start(
-                        blocks, next_title)
-                    if after_next:
-                        blocks = list(before_next)
-                        break
-            # 掐掉跳转前残留的上一章尾巴：从目标章首开始留
+                trimmed, boundary = split_off_next_chapter(
+                    blocks, catalog_titles, title, next_title)
+                blocks = trimmed
+                if boundary:
+                    break
+            # 掐掉跳转前残留的上一章尾巴（split_off_next_chapter 已按章首切好）
             _pre, from_title = split_blocks_at_chapter_start(blocks, title)
             if from_title:
                 blocks = list(from_title)
@@ -5135,6 +5315,10 @@ async def fill_missing_chapters(
             else:
                 print(f"  ⚠️  补漏「{title[:24]}」落盘失败")
         await page.close(); await ctx.close()
+    # 插章会留下空号：收尾统一重排成连续章号，续传/JSON 顺序都更干净
+    renumbered = renumber_chapter_files(md_dir, raw_dir)
+    if filled and renumbered:
+        print(f"  章号已重排为连续 0001-{renumbered:04d}")
     rest = [t for _i, t in missing_catalog_positions(md_dir, catalog_titles)]
     if rest:
         hint = "、".join(t[:12] for t in rest[:5])
