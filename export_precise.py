@@ -3555,6 +3555,32 @@ def chapter_saved(text_len, images):
     return bool(text_len or images)
 
 
+def blocks_have_content(blocks) -> bool:
+    """块里是否有实际内容（文字行或图片）。
+
+    只有图片的章节是真实存在的：部分书的「作者简介」「插图」整页是扫描图片，
+    没有可提取的文字。补漏若只认文字，这类章会被判成「未抓到正文」永远补不上。
+    """
+    for b in blocks or []:
+        if b.get("type") == "img":
+            return True
+        if b.get("type") == "text" and (b.get("text") or "").strip():
+            return True
+    return False
+
+
+def chapters_to_fill(missing, max_chapters: int = 12) -> list[tuple[int, str]]:
+    """补漏本次要处理的章节：按目录顺序取前 N 个。
+
+    缺口比上限还多时（多半是先前的整本并章这类硬故障），取**最前面** N 章：
+    顺序可预期，剩下的缺口由调用方在日志里明确报出并提示整本重抓。
+    """
+    items = list(missing or [])
+    if max_chapters is None or max_chapters <= 0:
+        return items
+    return items[:max_chapters]
+
+
 # 目录项标题匹配（脚本内复用）：去零宽字符/进度文案，短标题只认全等
 CATALOG_TITLE_MATCH_JS = r"""
     const strip = (s) => String(s || '')
@@ -5356,7 +5382,13 @@ async def fill_missing_chapters(
         f"\n  补漏：目录里 {len(missing)} 个正文项没有章文件"
         f"（{hint}），目录跳转逐章补抓（上限 {max_chapters} 章）"
     )
-    todo = missing[-max_chapters:]
+    todo = chapters_to_fill(missing, max_chapters)
+    if len(todo) < len(missing):
+        print(
+            f"  ⚠️  缺口 {len(missing)} 章超过单次上限 {max_chapters}，"
+            f"本次按目录顺序先补最前面 {len(todo)} 章；"
+            f"剩余 {len(missing) - len(todo)} 章建议整本重抓"
+        )
     seen_imgs: set[str] = set()
     filled = 0
     async with async_playwright() as p:
@@ -5436,11 +5468,7 @@ async def fill_missing_chapters(
                 == chapter_title_match_key(title)
                 or bool(from_title)
             )
-            has_text = any(
-                b.get("type") == "text" and (b.get("text") or "").strip()
-                for b in blocks
-            )
-            if not (landed_ok and has_text):
+            if not (landed_ok and blocks_have_content(blocks)):
                 print(
                     f"  ⚠️  补漏「{title[:24]}」未抓到正文"
                     f"（顶栏「{(reader_title or '空')[:16]}」），跳过"

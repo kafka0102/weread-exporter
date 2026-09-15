@@ -1456,6 +1456,38 @@ class TestPrintedCatalogPageDetection(unittest.TestCase):
         )
 
 
+class TestFillMissingHelpers(unittest.TestCase):
+    """补漏的取章与内容判定。
+
+    真实事故（千古诗心一趣通「作者简介」）：该章整页是扫描图片，没有任何
+    可提取文字，补漏只认文字 → 判成「未抓到正文」直接跳过，这一章永远补不上。
+    """
+
+    def test_image_only_chapter_counts_as_content(self):
+        page = [
+            {"type": "text", "text": "   "},
+            {"type": "img", "src": "https://res.weread.qq.com/wrepub/epub_35681649_2",
+             "w": 1831, "h": 2717},
+        ]
+        self.assertTrue(export_precise.blocks_have_content(page))
+
+    def test_blank_page_has_no_content(self):
+        self.assertFalse(
+            export_precise.blocks_have_content([{"type": "text", "text": " \n "}])
+        )
+        self.assertFalse(export_precise.blocks_have_content([]))
+        self.assertFalse(export_precise.blocks_have_content(None))
+
+    def test_chapters_to_fill_takes_earliest_when_capped(self):
+        missing = [(i, f"第{i}章") for i in range(20)]
+        todo = export_precise.chapters_to_fill(missing, 12)
+        self.assertEqual([i for i, _t in todo], list(range(12)))
+
+    def test_chapters_to_fill_keeps_all_when_under_cap(self):
+        missing = [(3, "作者简介")]
+        self.assertEqual(export_precise.chapters_to_fill(missing, 12), missing)
+
+
 class TestTwoPageSpreadCatalogSide(unittest.TestCase):
     """双页布局：目录页只占一屏的一侧时也要判出来。
 
