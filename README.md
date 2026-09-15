@@ -60,6 +60,10 @@ python export_precise.py --list data/new_books.txt --prefer-largest-screen
 
 # 无头导出（仅当 cache/browser_profile 已有登录信息时真正生效；否则回退有头）
 python export_precise.py d31323b0813abaf26g0137c2 --headless --prefer-largest-screen
+
+# 只补漏：已有 output/<id>/chapters 里有目录章缺失时，目录跳转补抓并重建 JSON
+# （正常导出结束后也会自动跑一次补漏；插章时章号自动顺延）
+python export_precise.py d31323b0813abaf26g0137c2 --fill-missing --prefer-largest-screen
 ```
 
 - 首次运行会弹出浏览器要求扫码登录，会话自动保存在 `cache/browser_profile/`，后续复用

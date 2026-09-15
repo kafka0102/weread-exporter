@@ -26,8 +26,10 @@ from book_json import (
     chapter_sleep_seconds,
     filter_forbidden_books,
     filter_pending_books,
+    find_existing_book_json,
     iter_batch_book_ids,
     load_chapters_from_export_dir,
+    parse_shelf_line,
     write_book_json,
 )
 from env_config import (
@@ -76,6 +78,7 @@ def format_elapsed(seconds):
     return f"{minutes:.1f} 分钟"
 
 DEFAULT_NEW_BOOKS = Path("data") / "new_books.txt"
+DEFAULT_SHELF_BOOKS = Path("data") / "shelf_books.txt"
 
 
 def reader_viewport(width=None, height=None, *, prefer_largest=None):
@@ -1537,14 +1540,16 @@ def repeat_compare_text(text: str) -> str:
     return _REPEAT_IGNORE_CHARS_RE.sub("", text or "")
 
 
-def exported_chapter_texts(md_dir) -> dict[str, tuple[str, set[str]]]:
-    """磁盘已导出章的正文摘要：章名压缩键 → (压缩全文, 已见正文行集合)。
+def exported_chapter_texts(md_dir) -> dict[str, dict]:
+    """磁盘已导出章的正文摘要：章名压缩键 → {norm, lines, path, idx}。
 
     诗词选集这类书里，阅读器 DOM 会残留上几章的 canvas 文本，回退重抓时
     同一章会再落盘一次，成品出现重复章、章号与目录错位。落盘前用这份摘要
     判断「这一章其实已经导出过」，从而只跳过、不占新章号。
+
+    norm 只含正文（去掉 md 标题行与图片行），便于与 canvas 抓到的正文比对。
     """
-    out: dict[str, tuple[str, set[str]]] = {}
+    out: dict[str, dict] = {}
     if not md_dir or not os.path.isdir(md_dir):
         return out
     raw_dir = os.path.join(os.path.dirname(md_dir), "raw")
@@ -1564,13 +1569,17 @@ def exported_chapter_texts(md_dir) -> dict[str, tuple[str, set[str]]]:
             if not line or line.startswith("#") or line.startswith("!["):
                 continue
             lines.add(line)
-        norm = repeat_compare_text(body)
+        norm = repeat_compare_text("".join(lines))
+        try:
+            idx = int(fn[:-3])
+        except ValueError:
+            idx = 0
         prev = out.get(key)
         if prev:
-            merged_lines = set(prev[1]) | lines
-            out[key] = (prev[0] + norm, merged_lines)
+            prev["lines"] |= lines
+            prev["norm"] += norm
         else:
-            out[key] = (norm, lines)
+            out[key] = {"norm": norm, "lines": lines, "path": path, "idx": idx}
     return out
 
 
@@ -1585,10 +1594,11 @@ def repeat_exported_chapter_evidence(title, blocks, exported_texts) -> str:
     key = compact_title_key(title)
     if not key or len(key) < REPEAT_EXPORTED_MIN_TITLE_KEY:
         return ""
-    prev = (exported_texts or {}).get(key)
-    if not prev:
+    entry = (exported_texts or {}).get(key)
+    if not entry:
         return ""
-    disk_norm, disk_lines = prev
+    disk_norm = str(entry.get("norm") or "")
+    disk_lines = entry.get("lines") or set()
     new_text = "".join(
         (b.get("text") or "") for b in (blocks or []) if b.get("type") == "text"
     )
@@ -1621,6 +1631,27 @@ def count_repeated_chapter(state: dict, title: str) -> int:
     return state["hits"]
 
 
+def split_rewind_blocks(blocks, back_title) -> tuple[list, list]:
+    """回退重抓前的缓冲切分：返回 (要保留的前缀, 回退后继续用的尾巴)。
+
+    判定回退时缓冲里出现了更早章的章首：该章首之前的内容属于当前章，
+    应当按当前章落盘后再回退，否则会把当前章整首丢掉（诗词选集里残留的
+    旧章标题常挂在当前章正文之后）。找不到切点时返回 ([], [])，照旧清缓冲。
+    """
+    if not blocks or not back_title:
+        return [], []
+    before, after = split_blocks_at_chapter_start(blocks, back_title)
+    if not after:
+        return [], []
+    keep = [
+        b for b in (before or [])
+        if b.get("type") == "text" and (b.get("text") or "").strip()
+    ]
+    if not keep:
+        return [], list(after)
+    return list(before), list(after)
+
+
 def missing_catalog_chapters_on_disk(md_dir, catalog_titles) -> list[str]:
     """目录里有、但已落盘章标题里找不到的正文项（忽略封面/版权页等无正文项）。"""
     disk_titles = disk_chapter_titles(md_dir)
@@ -1635,6 +1666,106 @@ def missing_catalog_chapters_on_disk(md_dir, catalog_titles) -> list[str]:
         if catalog_index(disk_titles, title) is None:
             missing.append(title)
     return missing
+
+
+def chapter_title_match_key(text: str) -> str:
+    """章名比对键：压缩空白 + 去掉「第N章/第N课」前缀。
+
+    目录与 canvas 常一个带章序前缀一个不带，比对时要对齐；但**不做**前缀
+    包含匹配——「念奴娇」与「念奴娇（木犀）」是两首不同的词。
+    """
+    key = compact_title_key(text)
+    if not key:
+        return ""
+    _prefix, rest = split_chapter_ordinal_prefix(key)
+    return rest or key
+
+
+def match_disk_chapters_to_catalog(md_dir, catalog_titles) -> list[tuple[int, int | None]]:
+    """按文件顺序把已落盘章对到目录序号：[(章号, 目录序号或 None)]。
+
+    贪心 + 保序：每个章文件只认「当前位置之后」的第一条同名目录项，
+    这样目录里的同名章（组诗）也能一一对上；对不上的返回 None（如书名页）。
+    """
+    if not md_dir or not os.path.isdir(md_dir) or not catalog_titles:
+        return []
+    raw_dir = os.path.join(os.path.dirname(md_dir), "raw")
+    cat_keys = [chapter_title_match_key(t) for t in catalog_titles]
+    out: list[tuple[int, int | None]] = []
+    cursor = 0
+    for fn in sorted(f for f in os.listdir(md_dir) if f.endswith(".md")):
+        try:
+            idx = int(fn[:-3])
+        except ValueError:
+            continue
+        key = chapter_title_match_key(_md_chapter_title(os.path.join(md_dir, fn), raw_dir))
+        hit = None
+        if key:
+            for j in range(cursor, len(cat_keys)):
+                if cat_keys[j] == key:
+                    hit = j
+                    break
+        if hit is None:
+            out.append((idx, None))
+        else:
+            out.append((idx, hit))
+            cursor = hit + 1
+    return out
+
+
+def missing_catalog_positions(md_dir, catalog_titles) -> list[tuple[int, str]]:
+    """目录里有、章文件里没有的正文项 → [(目录序号, 章名)]，按目录顺序。"""
+    if not catalog_titles:
+        return []
+    matched = {
+        cat_idx
+        for _file_idx, cat_idx in match_disk_chapters_to_catalog(md_dir, catalog_titles)
+        if cat_idx is not None
+    }
+    out: list[tuple[int, str]] = []
+    for i, title in enumerate(catalog_titles):
+        if i in matched:
+            continue
+        if is_non_content_catalog_title(title):
+            continue
+        if _SECTION_LIKE_CATALOG_TITLE_RE.match(normalize_catalog_title(title)):
+            continue
+        out.append((i, title))
+    return out
+
+
+def insertion_file_index(md_dir, catalog_titles, target_catalog_idx: int) -> int:
+    """补漏章该插到哪个章号之前（1-based）；返回章号，没有更早章时返回 1。"""
+    k = 1
+    for file_idx, cat_idx in match_disk_chapters_to_catalog(md_dir, catalog_titles):
+        if cat_idx is None:
+            continue
+        if cat_idx < target_catalog_idx:
+            k = file_idx + 1
+        else:
+            break
+    return k
+
+
+def shift_chapter_files(md_dir, raw_dir, from_idx: int) -> int:
+    """把章号 ≥ from_idx 的 md/raw 整体 +1（从大到小改名），返回移动数量。"""
+    if not md_dir or not os.path.isdir(md_dir):
+        return 0
+    numbered = sorted(
+        int(f[:-3]) for f in os.listdir(md_dir)
+        if f.endswith(".md") and f[:-3].isdigit()
+    )
+    moved = 0
+    for idx in sorted((i for i in numbered if i >= int(from_idx)), reverse=True):
+        for src_dir, suffix in ((md_dir, ".md"), (raw_dir, ".json")):
+            src = os.path.join(src_dir, f"{idx:04d}{suffix}")
+            if not os.path.exists(src):
+                continue
+            dst = os.path.join(src_dir, f"{idx + 1:04d}{suffix}")
+            if not os.path.exists(dst):
+                os.replace(src, dst)
+        moved += 1
+    return moved
 
 
 def merged_titles_in_dominant_chapter(md_dir, catalog_titles) -> list[str]:
@@ -3645,6 +3776,28 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         dup_chapter_state: dict = {}
         # 已导出章正文摘要（磁盘 + 本会话）：识别回退重抓，见 commit_chapter
         exported_texts = exported_chapter_texts(md_dir)
+
+        def remember_exported_text(title, blocks, idx=None):
+            """把刚落盘的章正文登记进摘要，供后续回退重抓判定。"""
+            key = compact_title_key(title)
+            if not key:
+                return
+            entry = exported_texts.setdefault(
+                key, {"norm": "", "lines": set(), "path": "", "idx": idx or ch_idx})
+            body, _imgs = render_chapter_md(title, blocks or [], 0)
+            body_lines = [
+                line.strip()
+                for line in body.splitlines()
+                if line.strip()
+                and not line.startswith("#")
+                and not line.startswith("![")
+            ]
+            entry["norm"] = str(entry.get("norm") or "") + repeat_compare_text(
+                "".join(body_lines)
+            )
+            entry["lines"] = set(entry.get("lines") or set()) | chapter_text_line_set(
+                blocks
+            )
         # 跨会话也识别「同一章同一正文」：续传重开后避免附录重复落盘
         try:
             for name in sorted(
@@ -4027,13 +4180,31 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     f"（{repeat_why}），跳过落盘、不占章号"
                 )
                 return 0, [], False
-            fp = chapter_blocks_fingerprint(title, blocks)
-            # 停滞前进也用 allow_empty=True 落盘；若仍放行重复指纹，会把同一附录
-            # 写成 0039/0040/... 无限编号。有正文时无论是否 allow_empty 都去重。
+            # 同名占位空章（「顶栏超前且无正文」时先写的）补到真正文：直接覆盖原文件，
+            # 不新增章号，免得同一章在成品里出现「空章 + 正文章」两份。
             has_text = any(
                 b.get("type") == "text" and (b.get("text") or "").strip()
                 for b in (blocks or [])
             )
+            placeholder = (exported_texts or {}).get(compact_title_key(title))
+            if placeholder and has_text and not placeholder.get("lines"):
+                n, imgs = save_chapter(
+                    title, blocks, placeholder.get("idx") or ch_idx,
+                    md_dir, raw_dir)
+                if chapter_saved(n, imgs):
+                    total_chars += n
+                    total_imgs += len(imgs)
+                    chapters_this_session += 1
+                    remember_exported_text(
+                        title, blocks, placeholder.get("idx") or ch_idx)
+                    print(
+                        f"  ✍️  同名空占位章补上正文「{(title or '')[:32]}」"
+                        f"（编号 {placeholder.get('idx')}），不新增章号"
+                    )
+                    return n, imgs, False
+            fp = chapter_blocks_fingerprint(title, blocks)
+            # 停滞前进也用 allow_empty=True 落盘；若仍放行重复指纹，会把同一附录
+            # 写成 0039/0040/... 无限编号。有正文时无论是否 allow_empty 都去重。
             if fp in saved_chapter_fps and (has_text or not allow_empty):
                 hits = count_repeated_chapter(dup_chapter_state, title)
                 print(
@@ -4059,15 +4230,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 return n, imgs, False
             saved_chapter_fps.add(fp)
             # 本章正文登记进摘要，后续回退重抓到同一章时按重抓跳过
-            body, _imgs = render_chapter_md(title, blocks or [], 0)
-            key = compact_title_key(title)
-            if key:
-                prev = exported_texts.get(key)
-                lines = chapter_text_line_set(blocks)
-                exported_texts[key] = (
-                    (prev[0] if prev else "") + repeat_compare_text(body),
-                    (prev[1] if prev else set()) | lines,
-                )
+            remember_exported_text(title, blocks)
             total_chars += n
             total_imgs += len(imgs)
             note = f" +{len(imgs)}图" if imgs else ""
@@ -4325,11 +4488,27 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if back_title and lag_back_sync_hits >= LAG_BACK_SYNC_CONFIRM:
                 lag_back_sync_used += 1
                 lag_back_sync_hits = 0
+                # 回退前先把「更早章首之前」这一截按当前章落盘：诗词选集里残留的
+                # 旧章标题常挂在当前章正文之后，直接丢缓冲会把当前章整首丢掉
+                # （刘克庄诗选「健忘一首」就是这么漏的）。
+                kept_text = ""
+                before_back, after_back = split_rewind_blocks(ch_blocks, back_title)
+                if before_back:
+                    n, _imgs, saved = await commit_chapter(
+                        current_chapter, before_back,
+                        note_suffix=" [回退前保留]")
+                    if saved:
+                        ch_idx += 1
+                        kept_text = (
+                            f"先落盘已抓到的「{(current_chapter or '')[:16]}」正文，"
+                        )
+                        await sleep_between_chapters(n)
                 print(
                     f"    … 逻辑章「{(current_chapter or '')[:20]}」已超前、"
-                    f"正文回到更早的「{back_title[:20]}」：清掉超前缓冲回退重抓"
+                    f"正文回到更早的「{back_title[:20]}」：{kept_text}"
+                    f"清掉超前缓冲回退重抓"
                 )
-                adopt_chapter_blocks([])
+                adopt_chapter_blocks(after_back)
                 current_chapter = (
                     resolve_chapter_title(back_title, catalog_titles) or back_title
                 )
@@ -4832,6 +5011,139 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         return book_title, book_author, chapters_this_session, total_chars, ch_idx, reached_end, request_reopen
 
 
+async def capture_reader_page_blocks(page, seen_imgs=None):
+    """抓阅读器当前页的有序块（不做章节级去重），供补漏逐页采集使用。"""
+    chars = await page.evaluate("() => window.__wr_chars")
+    rects = await page.evaluate(CANVAS_RECTS_JS)
+    imgs = await page.evaluate(VIEWPORT_IMGS_JS)
+    return build_page_blocks(
+        chars, imgs, rects, seen_imgs if seen_imgs is not None else set()
+    )
+
+
+async def fill_missing_chapters(
+    book_id, md_dir, raw_dir, catalog_path, *, headless=False,
+    reader_width=None, reader_height=None, force_single_page=None,
+    prefer_largest=None, max_chapters=12, max_pages=12,
+) -> list[str]:
+    """补漏：目录里有、章文件里没有的正文项，目录跳过去逐页补抓并插回原位置。
+
+    线性翻页偶发跳过短章（顶栏读空、章名写法不同、回退重抓时丢缓冲），
+    整本重抓代价大，这里只补缺口。返回仍缺的章名列表。
+    """
+    catalog_titles = load_catalog_titles(catalog_path) if catalog_path else []
+    missing = missing_catalog_positions(md_dir, catalog_titles)
+    if not missing:
+        return []
+    hint = "、".join(t[:12] for _i, t in missing[:5])
+    print(
+        f"\n  补漏：目录里 {len(missing)} 个正文项没有章文件"
+        f"（{hint}），目录跳转逐章补抓（上限 {max_chapters} 章）"
+    )
+    todo = missing[-max_chapters:]
+    seen_imgs: set[str] = set()
+    filled = 0
+    async with async_playwright() as p:
+        viewport = reader_viewport(
+            reader_width, reader_height, prefer_largest=prefer_largest)
+        ctx = await launch_weread_context(
+            p, headless=headless, viewport=viewport)
+        if not await ensure_logged_in(ctx, allow_interactive_login=not headless):
+            await ctx.close()
+            print("  ⚠️  补漏跳过：登录态不可用")
+            return [t for _i, t in missing]
+        page = await ctx.new_page()
+        await page.add_init_script(CANVAS_HOOK)
+        await page.goto(
+            f"https://weread.qq.com/web/reader/{book_id}",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        await asyncio.sleep(SLEEP_READER_AFTER_LOAD)
+        await ensure_horizontal_paging_mode(page)
+        await focus_reader_for_keyboard(page)
+        # 倒序补：先补靠后的章，前面章的章号不受插入影响
+        for cat_idx, title in reversed(todo):
+            next_title = (
+                catalog_titles[cat_idx + 1]
+                if cat_idx + 1 < len(catalog_titles) else ""
+            )
+            landed = await goto_catalog_chapter(page, title, catalog_titles)
+            for _ in range(3):
+                await close_reader_catalog(page)
+                if not await is_reader_catalog_open(page):
+                    break
+            await blur_reader_inputs(page)
+            await focus_reader_for_keyboard(page)
+            if not landed:
+                print(f"  ⚠️  补漏「{title[:24]}」目录跳转未确认，跳过")
+                continue
+            # 跳转后页面已渲染：先抓当前页（绝不能先 __wr_reset）
+            blocks: list[dict] = []
+            last_fp = ""
+            stale = 0
+            for page_i in range(max_pages + 1):
+                if page_i:
+                    await page.evaluate(
+                        "() => window.__wr_reset && window.__wr_reset()")
+                    await turn_reader_page(page, method="arrow")
+                    await asyncio.sleep(SLEEP_READER_PAGE_TURN)
+                await wait_stable(page, 0, timeout=2.5)
+                new_blocks = await capture_reader_page_blocks(page, seen_imgs)
+                fp = page_blocks_fingerprint(new_blocks)
+                if not new_blocks or (fp and fp == last_fp):
+                    stale += 1
+                    if stale >= 2:
+                        break
+                    continue
+                last_fp = fp
+                stale = 0
+                blocks.extend(new_blocks)
+                if next_title:
+                    before_next, after_next = split_blocks_at_chapter_start(
+                        blocks, next_title)
+                    if after_next:
+                        blocks = list(before_next)
+                        break
+            # 掐掉跳转前残留的上一章尾巴：从目标章首开始留
+            _pre, from_title = split_blocks_at_chapter_start(blocks, title)
+            if from_title:
+                blocks = list(from_title)
+            reader_title = await read_chapter_title(page, catalog_titles)
+            landed_ok = (
+                chapter_title_match_key(reader_title)
+                == chapter_title_match_key(title)
+                or bool(from_title)
+            )
+            has_text = any(
+                b.get("type") == "text" and (b.get("text") or "").strip()
+                for b in blocks
+            )
+            if not (landed_ok and has_text):
+                print(
+                    f"  ⚠️  补漏「{title[:24]}」未抓到正文"
+                    f"（顶栏「{(reader_title or '空')[:16]}」），跳过"
+                )
+                continue
+            target_k = insertion_file_index(md_dir, catalog_titles, cat_idx)
+            shift_chapter_files(md_dir, raw_dir, target_k)
+            n, imgs = save_chapter(title, blocks, target_k, md_dir, raw_dir)
+            if chapter_saved(n, imgs):
+                filled += 1
+                note = f" +{len(imgs)}图" if imgs else ""
+                print(f"  ✍️  补漏：{title[:28]} {n}字，插入章号 {target_k:04d}{note}")
+            else:
+                print(f"  ⚠️  补漏「{title[:24]}」落盘失败")
+        await page.close(); await ctx.close()
+    rest = [t for _i, t in missing_catalog_positions(md_dir, catalog_titles)]
+    if rest:
+        hint = "、".join(t[:12] for t in rest[:5])
+        print(f"  补漏结束：补上 {filled} 章，仍缺 {len(rest)} 章（{hint}）")
+    else:
+        print(f"  补漏结束：补上 {filled} 章，目录已对齐")
+    return rest
+
+
 def download_all_images(raw_dir, img_dir):
     os.makedirs(img_dir, exist_ok=True)
     tasks = []
@@ -4874,6 +5186,39 @@ def finalize_book_json(book_id, book_title, book_author, book_dir, out_dir):
     )
     path = write_book_json(out_dir, book)
     return path, book
+
+
+def load_shelf_meta(book_id, out_dir):
+    """补漏重建 JSON 时取书名/作者：优先已有成品 JSON，其次书架清单。"""
+    try:
+        existing = find_existing_book_json(out_dir, book_id)
+    except Exception:
+        existing = None
+    if existing is not None:
+        try:
+            with open(existing, encoding="utf-8") as f:
+                data = json.load(f)
+            title = str(data.get("title") or "")
+            author = str(data.get("author") or "")
+            if title:
+                return title, author
+        except Exception:
+            pass
+    for line in _iter_shelf_list_lines():
+        parsed = parse_shelf_line(line)
+        if parsed and parsed[0] == book_id:
+            return parsed[1] or book_id, parsed[2] or ""
+    return book_id, ""
+
+
+def _iter_shelf_list_lines():
+    """依次读书架/新书清单里的行（补漏取名用，读不到就返回空）。"""
+    for path in (DEFAULT_SHELF_BOOKS, DEFAULT_NEW_BOOKS):
+        try:
+            with open(path, encoding="utf-8") as f:
+                yield from f.read().splitlines()
+        except OSError:
+            continue
 
 
 async def export_one_book(
@@ -5005,6 +5350,28 @@ async def export_one_book(
     else:
         print("  （跳过图片下载；需要时加 --download-images）")
 
+    # 线性翻页偶发跳过短章：抓完再按目录核对一边，缺的用目录跳转补回来，
+    # 否则成品会静默少章。
+    if os.path.isfile(catalog_path):
+        try:
+            still_missing = await fill_missing_chapters(
+                book_id, md_dir, raw_dir, catalog_path,
+                headless=headless,
+                reader_width=reader_width,
+                reader_height=reader_height,
+                force_single_page=force_single_page,
+                prefer_largest=prefer_largest,
+            )
+        except Exception as e:
+            still_missing = []
+            print(f"  ⚠️  补漏阶段异常（不影响已抓内容）: {e}")
+        if still_missing:
+            print(
+                f"  ⚠️  目录仍有 {len(still_missing)} 章没有正文"
+                f"（{'、'.join(t[:16] for t in still_missing[:6])}）；"
+                "成品 JSON 缺这些章，建议用 detect_merged_chapters 复检后重抓。"
+            )
+
     total_files = sorted(f for f in os.listdir(md_dir) if f.endswith(".md"))
     if not total_files:
         raise RuntimeError(f"章节目录为空，无法写 JSON：{md_dir}")
@@ -5113,6 +5480,11 @@ def parse_args(argv=None):
         help="导出结束后下载插图（默认不下载）",
     )
     parser.add_argument(
+        "--fill-missing",
+        action="store_true",
+        help="只补漏：按目录核对已有 output/<id>/chapters，缺的章目录跳转补抓后重建 JSON",
+    )
+    parser.add_argument(
         "--out-dir",
         default=str(DEFAULT_BOOKS_DIR),
         help=f"JSON 输出目录（默认 {DEFAULT_BOOKS_DIR})",
@@ -5196,6 +5568,34 @@ async def async_main(argv=None):
         "  🖥️  目标屏幕: "
         + ("优先外接大屏" if prefer_largest else "优先笔记本内建屏")
     )
+    if args.fill_missing:
+        if not args.book:
+            print("  ❌ --fill-missing 需要指定 book_id")
+            return 2
+        book_id = resolve_book_id(args.book)
+        book_dir = os.path.join("output", book_id)
+        md_dir = os.path.join(book_dir, "chapters")
+        raw_dir = os.path.join(book_dir, "raw")
+        catalog_path = os.path.join(book_dir, "_catalog.json")
+        if not os.path.isfile(catalog_path) or not os.path.isdir(md_dir):
+            print(f"  ❌ 缺少中间产物：{book_dir}（先跑一次导出）")
+            return 1
+        still_missing = await fill_missing_chapters(
+            book_id, md_dir, raw_dir, catalog_path,
+            headless=headless,
+            reader_width=args.reader_width,
+            reader_height=args.reader_height,
+            force_single_page=force_single_page,
+            prefer_largest=prefer_largest,
+        )
+        book_title, book_author = load_shelf_meta(book_id, args.out_dir)
+        json_path, _book = finalize_book_json(
+            book_id, book_title, book_author, book_dir, args.out_dir)
+        print(f"  📦 json: {json_path}")
+        if still_missing:
+            print(f"  ⚠️  仍有 {len(still_missing)} 章未补上：{'、'.join(still_missing[:5])}")
+            return 1
+        return 0
     if args.book:
         book_id = resolve_book_id(args.book)
         print(f"  Book ID: {book_id}")
