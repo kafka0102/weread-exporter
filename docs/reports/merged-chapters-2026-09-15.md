@@ -3,8 +3,9 @@
 > 背景：2026-09-15 对 `detect_merged_chapters.py` 命中的 5 本书重抓
 > （词林正韵、千古诗心一趣通、迦陵说词讲稿、楚辞专论、中国古典诗文诵读），
 > 先清空成品与 `output/<id>/` 再跑 `python export_precise.py --prefer-largest-screen`。
-> 5 本跑完后复检，其中 **词林正韵仍然失败**，据此定位到 `export_precise.py`
-> 的切章判定 bug 并修复（commit `8871111`）。
+> 5 本跑完后复检，**词林正韵、迦陵说词讲稿仍然失败**，据此定位到 `export_precise.py`
+> 两个独立的切章判定 bug 并分别修复（commit `8871111`：顶栏停在书名时永不切章；
+> commit `702b09d`：双页布局下本章目录页只占一侧时漏判）。
 
 ## 一、重抓结果
 
@@ -84,8 +85,8 @@ find_chapter_split(blocks, cat, "")        = ("第1章", 1, 114)  ← 走回落�
 
 ### 证据（阅读器实测）
 
-用 `.scratch/probe_chapter_pages.py` 打开阅读器逐屏导出块（不改产物），
-「总　序」之后那一屏：
+用临时探针（Playwright 打开阅读器，跳到「总　序」后逐屏 dump `__wr_chars`
+还原每页文本，不入库、不改产物）复现，「总　序」之后那一屏是：
 
 ```text
 canvas 0 (cid=4, cl=230)  12 行总序收尾正文
