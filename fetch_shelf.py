@@ -37,6 +37,9 @@ from weread_session import SHELF_URL, ensure_logged_in, launch_weread_context
 DATA_DIR = "data"
 DEFAULT_OUT = os.path.join(DATA_DIR, "shelf_books.txt")
 READER_URL_TMPL = "https://weread.qq.com/web/reader/{book_id}"
+# 当前屏内连续这么多本已在本地书架，就不再往下翻。
+# 视口不足该本数时，按从上到下首次出现的顺序跨屏累计。0 表示滚完全部。
+DEFAULT_KNOWN_STREAK = 10
 
 _READER_ID_RE = re.compile(r"/reader/([A-Za-z0-9]+)")
 
@@ -252,6 +255,70 @@ def apply_existing_authors(books, existing):
     return books
 
 
+def observe_shelf_page(seen, carry, page_ids, known_ids, threshold):
+    """看完一页后决定要不要再请求下一页。返回 (跨页连续计数, 是否停止)。
+
+    当前页按顺序连续 ``threshold`` 本已在 ``known_ids`` 里即停止。单页本数不够时，
+    只把本页首次出现的书接到上一页留下的连续计数（已见过的不重复计，避免虚拟列表
+    重叠把同一本算多次）。遇到本地没有的合法 reader id 则清零；纯数字等非法 id
+    跳过，既不计也不打断。``threshold <= 0`` 或本地书架为空时不停止。
+
+    本页任意位置一旦凑满，即使页末被一本新书打断，也不再请求下一页
+    （这一页里已经拿到的书仍然保留）。``seen`` 会被原地更新。
+    """
+    if threshold <= 0 or not known_ids:
+        return carry, False
+
+    page_run = 0
+    stop = False
+    for raw in page_ids or []:
+        bid = str(raw or "").strip()
+        if not is_reader_book_id(bid):
+            continue
+        if bid in known_ids:
+            page_run += 1
+            if page_run >= threshold:
+                stop = True
+        else:
+            page_run = 0
+
+    run = carry
+    for raw in page_ids or []:
+        bid = str(raw or "").strip()
+        if not is_reader_book_id(bid) or bid in seen:
+            continue
+        seen.add(bid)
+        if bid in known_ids:
+            run += 1
+            if run >= threshold:
+                stop = True
+        else:
+            run = 0
+    return run, stop
+
+
+def merge_partial_shelf(fetched, existing):
+    """提前停页时写回：先放本次抓到的书，再接上没扫到的旧书。
+
+    未翻到的书仍保留，避免半截结果覆盖整个书架文件。同一 id 以本次抓取为准。
+    """
+    seen = set()
+    merged = []
+    for book in fetched or []:
+        bid = str(book.get("id") or "").strip()
+        if not bid or bid in seen:
+            continue
+        seen.add(bid)
+        merged.append(book)
+    for book in existing or []:
+        bid = str(book.get("id") or "").strip()
+        if not bid or bid in seen:
+            continue
+        seen.add(bid)
+        merged.append(book)
+    return merged
+
+
 
 
 # 从当前页面 DOM 提取书籍列表 [{id, title, author}]。
@@ -461,13 +528,16 @@ async def fetch_shelf(
     enrich_author=True,
     author_interval=None,
     max_scrolls=80,
+    known_streak=DEFAULT_KNOWN_STREAK,
 ):
     """抓取书架书籍列表并写入 out_path，返回合并后的书籍列表。
 
     书架按批懒加载（约每屏/每次 syncBook 100 本）。滚动过程中：
     - 累积各屏 DOM 中的 reader id（防止虚拟列表只保留窗口内节点）
     - 合计统计计入 API 全部 bookId（含数字短 id），避免误判「无增长」提前停
-    - 大步滚动 + 触底，连续 max_no_new 次无新书后结束
+    - 本地书架已有连续 known_streak 本（当前屏凑满，或跨屏按首次出现累计）
+      则不再往下滚；未翻到的旧书与本次结果合并写回
+    - 否则大步滚动 + 触底，连续 max_no_new 次无新书后结束
     """
     if sleep_seconds is None:
         sleep_seconds = SLEEP_SHELF_SCROLL
@@ -508,16 +578,45 @@ async def fetch_shelf(
         await page.goto(SHELF_URL, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(SLEEP_SHELF_AFTER_LOAD)
 
+        existing_books = load_shelf_books(out_path)
+        known_ids = {b["id"] for b in existing_books if b.get("id")}
+        existing_authors = {
+            b["id"]: b["author"]
+            for b in existing_books
+            if b.get("id") and (b.get("author") or "").strip()
+        }
+        seen_reader_ids = set()
+        known_run = 0
+        stopped_for_known = False
+
+        def consider_page(snapshot):
+            nonlocal known_run, stopped_for_known
+            page_ids = [b.get("id") for b in (snapshot or [])]
+            known_run, hit = observe_shelf_page(
+                seen_reader_ids, known_run, page_ids, known_ids, known_streak)
+            if hit:
+                stopped_for_known = True
+
+        def run_note():
+            if known_streak <= 0:
+                return ""
+            return f" / 连续已有 {known_run}"
+
         dom_acc = {}
         snapshot = await extract_dom_books(page)
         accumulate_dom_books(dom_acc, snapshot)
+        consider_page(snapshot)
         prev = _total_unique(list(dom_acc.values()), api_books)
         print(f"  首屏: DOM累计 {len(dom_acc)} 本（本屏 {len(snapshot)}） / "
-              f"API {len(api_books)} 本 / 合计 {prev}")
+              f"API {len(api_books)} 本 / 合计 {prev}{run_note()}")
 
         no_new = 0
         scroll = 0
-        while no_new < max_no_new and scroll < max_scrolls:
+        while (
+            not stopped_for_known
+            and no_new < max_no_new
+            and scroll < max_scrolls
+        ):
             scroll += 1
             # 慢滚动：滚轮 + 大步 window.scroll，接近底部时沉底以触发下一批 syncBook
             await page.mouse.move(600, 400)
@@ -526,18 +625,26 @@ async def fetch_shelf(
             await asyncio.sleep(sleep_seconds)
             snapshot = await extract_dom_books(page)
             accumulate_dom_books(dom_acc, snapshot)
+            consider_page(snapshot)
             cur = _total_unique(list(dom_acc.values()), api_books)
             grew = cur - prev
             print(f"  滚动 #{scroll}: DOM累计 {len(dom_acc)}（本屏 {len(snapshot)}） / "
-                  f"API {len(api_books)} / 合计 {cur}（+{grew}）")
+                  f"API {len(api_books)} / 合计 {cur}（+{grew}）{run_note()}")
+            if stopped_for_known:
+                break
             no_new = 0 if grew > 0 else no_new + 1
             prev = cur
 
-        if scroll >= max_scrolls and no_new < max_no_new:
+        merged = merge_books(list(dom_acc.values()), api_books)
+        apply_existing_authors(merged, existing_authors)
+        if stopped_for_known:
+            merged = merge_partial_shelf(merged, existing_books)
+            fresh = sum(1 for b in merged if b.get("id") not in known_ids)
+            print(f"  连续 {known_streak} 本已在本地书架，停止继续翻页"
+                  f"（本次新看到 {fresh} 本，未翻到的旧书仍保留）")
+        elif scroll >= max_scrolls and no_new < max_no_new:
             print(f"  ⚠️  已达最大滚动次数 {max_scrolls}，提前结束懒加载")
 
-        merged = merge_books(list(dom_acc.values()), api_books)
-        apply_existing_authors(merged, load_existing_authors(out_path))
         write_shelf_books(out_path, merged)
         with_author = sum(1 for b in merged if b["author"])
         print(f"\n  列表阶段完成: {len(merged)} 本（有作者 {with_author}/{len(merged)}）"
@@ -607,6 +714,12 @@ def main():
                         help="连续无新书停止阈值（默认 5；书架按批懒加载，过小会提前停）")
     parser.add_argument("--max-scrolls", type=int, default=80,
                         help="懒加载最大滚动次数（默认 80，防止死循环）")
+    parser.add_argument(
+        "--known-streak", type=int, default=DEFAULT_KNOWN_STREAK,
+        help=("当前屏内连续这么多本已在本地书架，或跨屏连续累计达到该值，"
+              "就停止继续翻页（默认 "
+              f"{DEFAULT_KNOWN_STREAK}；0 表示滚完全部）"),
+    )
     parser.add_argument("--out", default=DEFAULT_OUT, help="输出 txt 路径（一行一条：ID,书名,作者）")
     parser.add_argument(
         "--no-enrich-author", action="store_true",
@@ -642,6 +755,7 @@ def main():
             enrich_author=not args.no_enrich_author,
             author_interval=author_interval,
             max_scrolls=args.max_scrolls,
+            known_streak=args.known_streak,
         ))
 
 

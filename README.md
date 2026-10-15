@@ -102,6 +102,9 @@ python fetch_shelf.py --headless
 # 调整滚动节奏（默认见 .env SLEEP_SHELF_SCROLL，连续 3 次无新书停止）
 python fetch_shelf.py --sleep 5 --max-no-new 6
 
+# 连续 10 本本地已有就停止翻页；0 表示滚完全部
+python fetch_shelf.py --known-streak 10
+
 # 跳过「作者为空时打开详情补全」
 python fetch_shelf.py --no-enrich-author
 
@@ -110,10 +113,11 @@ python fetch_shelf.py --author-interval 8
 ```
 
 - 慢滚动触发懒加载（`/web/shelf/syncBook` 约每批 100 本），跨屏**累积** DOM reader id，避免只抓到首批
+- 本地 `shelf_books.txt` 已有的书按从上到下计数：当前屏里连续 10 本都已收录，或视口较小、跨屏把连续计数凑满 10，就不再往下滚。本次抓到的书和没翻到的旧书合并写回，避免半截结果覆盖整个书架。`--known-streak 0` 关闭该提前停止
 - 默认 `--max-no-new 5`；书特别多时可加大 `--max-scrolls`
 - 每本书提取 `id`、`title`、`author`，存为 `data/shelf_books.txt`（一行一条，逗号分隔：ID,书名,作者；书名/作者中的逗号替换为空格）
 - 书架页禁用 F12 不影响抓取：`id`/`title` 取自页面 DOM，`author` 优先取自拦截的书架接口；**仍为空时再打开阅读器详情补全**（已有作者的书不打开；相邻两本默认间隔 5s）
-- 参数：`--headless`、`--sleep` 滚动间隔、`--max-no-new`、`--out`、`--no-enrich-author`、`--author-interval`
+- 参数：`--headless`、`--sleep` 滚动间隔、`--max-no-new`、`--known-streak`、`--out`、`--no-enrich-author`、`--author-interval`
 - 所有点击/跳转类等待见 `.env` / `AGENTS.md`（`SLEEP_*`）
 
 > 登录过期时 `--headless` 无法弹扫码页，去掉 `--headless` 重新扫一次即可。
@@ -258,7 +262,9 @@ download_images.py:
 
 fetch_shelf.py:
   复用缓存登录打开书架 → 慢滚动触发懒加载
+    → 当前屏连续已有 N 本则停止翻页，否则滚到没有新书
     → DOM 抓 id/title + 拦截书架接口取 author → 按 book_id 合并去重
+    → 提前停止时保留未翻到的旧书
     → author 仍为空则逐本打开阅读器补全（已有作者跳过；间隔 SLEEP_BOOK_DETAIL_INTERVAL）
     → 写 data/shelf_books.txt
 ```

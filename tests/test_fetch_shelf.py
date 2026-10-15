@@ -9,6 +9,8 @@ from fetch_shelf import (
     format_book_line,
     is_reader_book_id,
     merge_books,
+    merge_partial_shelf,
+    observe_shelf_page,
     sanitize_csv_field,
     write_shelf_books,
     _total_unique,
@@ -255,6 +257,128 @@ class TestShelfTxtFormat(unittest.TestCase):
                 content = f.read()
         self.assertEqual(content, "1,A B,C\n2,D,E F\n")
 
+
+def _rid(n):
+    """合法 reader id：含字母且长度 >= 16。"""
+    return f"b{n:015d}"
+
+
+class TestObserveShelfPage(unittest.TestCase):
+    def test_nine_known_does_not_stop(self):
+        ids = [_rid(i) for i in range(9)]
+        carry, stop = observe_shelf_page(set(), 0, ids, set(ids), 10)
+        self.assertFalse(stop)
+        self.assertEqual(carry, 9)
+
+    def test_ten_known_on_one_page_stops(self):
+        ids = [_rid(i) for i in range(10)]
+        carry, stop = observe_shelf_page(set(), 0, ids, set(ids), 10)
+        self.assertTrue(stop)
+        self.assertEqual(carry, 10)
+
+    def test_already_seen_page_still_stops_when_screen_is_all_known(self):
+        ids = [_rid(i) for i in range(10)]
+        carry, stop = observe_shelf_page(set(ids), 0, ids, set(ids), 10)
+        self.assertTrue(stop)
+        self.assertEqual(carry, 0)
+
+    def test_run_broken_by_new_book(self):
+        known = {_rid(i) for i in range(10)}
+        ids = (
+            [_rid(i) for i in range(5)]
+            + [_rid(100)]
+            + [_rid(i) for i in range(5, 10)]
+        )
+        carry, stop = observe_shelf_page(set(), 0, ids, known, 10)
+        self.assertFalse(stop)
+        self.assertEqual(carry, 5)
+
+    def test_full_run_then_new_book_still_stops_next_page(self):
+        ids = [_rid(i) for i in range(10)] + [_rid(100)]
+        known = {_rid(i) for i in range(10)}
+        carry, stop = observe_shelf_page(set(), 0, ids, known, 10)
+        self.assertTrue(stop)
+        self.assertEqual(carry, 0)
+
+    def test_short_pages_accumulate_without_double_counting_overlap(self):
+        known = {_rid(i) for i in range(20)}
+        seen = set()
+        carry, stop = observe_shelf_page(
+            seen, 0, [_rid(i) for i in range(6)], known, 10)
+        self.assertFalse(stop)
+        self.assertEqual(carry, 6)
+        # 下一屏与上一屏重叠，只计入新出现的 4 本
+        carry, stop = observe_shelf_page(
+            seen, carry, [_rid(i) for i in range(4, 10)], known, 10)
+        self.assertTrue(stop)
+        self.assertEqual(carry, 10)
+
+    def test_same_screen_twice_does_not_inflate_streak(self):
+        ids = [_rid(i) for i in range(8)]
+        seen = set()
+        carry, stop = observe_shelf_page(seen, 0, ids, set(ids), 10)
+        self.assertFalse(stop)
+        carry, stop = observe_shelf_page(seen, carry, ids, set(ids), 10)
+        self.assertFalse(stop)
+        self.assertEqual(carry, 8)
+
+    def test_new_book_resets_carry_into_the_next_page(self):
+        known = {_rid(i) for i in range(20)}
+        seen = set()
+        page1 = [_rid(i) for i in range(6)] + [_rid(100)]
+        carry, stop = observe_shelf_page(seen, 0, page1, known, 10)
+        self.assertFalse(stop)
+        self.assertEqual(carry, 0)
+        carry, stop = observe_shelf_page(
+            seen, carry, [_rid(i) for i in range(6, 10)], known, 10)
+        self.assertFalse(stop)
+        self.assertEqual(carry, 4)
+
+    def test_numeric_id_does_not_break_run(self):
+        ids = [_rid(0), _rid(1), "3300215708", _rid(2)]
+        known = {_rid(0), _rid(1), _rid(2)}
+        _, stop = observe_shelf_page(set(), 0, ids, known, 3)
+        self.assertTrue(stop)
+
+    def test_disabled_or_empty_local_shelf_never_stops(self):
+        ids = [_rid(i) for i in range(10)]
+        seen = set()
+        carry, stop = observe_shelf_page(seen, 3, ids, set(ids), 0)
+        self.assertFalse(stop)
+        self.assertEqual(carry, 3)
+        self.assertEqual(seen, set())
+        carry, stop = observe_shelf_page(set(), 0, ids, set(), 10)
+        self.assertFalse(stop)
+        self.assertEqual(carry, 0)
+
+
+class TestMergePartialShelf(unittest.TestCase):
+    def test_keeps_unfetched_tail_and_prefers_fetched_copy(self):
+        fetched = [
+            {"id": _rid(0), "title": "新", "author": "甲"},
+            {"id": _rid(1), "title": "更新", "author": ""},
+        ]
+        existing = [
+            {"id": _rid(1), "title": "旧", "author": "乙"},
+            {"id": _rid(2), "title": "尾", "author": "丙"},
+        ]
+        merged = merge_partial_shelf(fetched, existing)
+        self.assertEqual(
+            [b["id"] for b in merged], [_rid(0), _rid(1), _rid(2)])
+        self.assertEqual(merged[0]["title"], "新")
+        self.assertEqual(merged[1]["title"], "更新")
+        self.assertEqual(merged[1]["author"], "")
+        self.assertEqual(merged[2], existing[1])
+
+    def test_skips_duplicate_existing_ids(self):
+        book = {"id": _rid(1), "title": "A", "author": ""}
+        merged = merge_partial_shelf([book], [book, book])
+        self.assertEqual(merged, [book])
+
+    def test_empty_fetch_keeps_existing(self):
+        existing = [{"id": _rid(1), "title": "A", "author": "甲"}]
+        self.assertEqual(merge_partial_shelf([], existing), existing)
+        self.assertEqual(merge_partial_shelf(None, None), [])
 
 
 if __name__ == "__main__":
