@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """书架书去重：shelf_books vs forbid / 本地已下载 / ebook-info / 书架重名。
 
-匹配 ebook-info 与书架内部重名时只比「归一化主书名」，不比作者：
+判定「重复」的口径是**书名 + 作者都对得上**：
 - 去掉装饰性括号（珍藏本、全二册、丛书名等）
 - 保留期刊/学刊期数括号（第N期、第N辑、第N卷、第N本第N期、年份+期数等）
 - 去掉横线/冒号后的副标题
-- 压缩空白与期数标点后全等 → 视为重复
-- 书架（及 new/dup 已处理列表）中同主书名只保留第一本，其余进 dup
+- 压缩空白与期数标点后全等 = 书名相同
+- 作者按人名 token 比对（去朝代标记与「著/编/选注/主编」等角色词，至少一人相同）
+- **书名 + 作者都对得上**才算重复；同名异作者（不同选注者/不同版本）当新书
+- 任一侧拿不到作者 token 时退回「按书名判重」
+- 书架（及 new/dup 已处理列表）中同书名同作者只保留第一本，其余进 dup
 
-两条例外（2026-10-17）：
-- **书名以诗集/全集/选集/诗选/词选结尾**：个人诗集常重名，不按名字判重（跳过
-  ebook-info 与书架重名），只有 forbid / 本地已下载仍判 dup。
-- **书架前 HEAD_NEW_COUNT 本（默认 500，按 shelf_books.txt 顺序）**：只要不在 forbid
-  里就一律当新书（连「本地已下载」也不排除），已在 dup 的会迁回 new。
+判定优先级：
+
+1. forbid（禁止下载）
+2. 本地已下载（`BOOKS_DIR` 里已有 `{id}_*.json`）——**已下载的书永远不进 new_books.txt**
+3. ebook-info 同名 + 作者对得上 → dup
+4. 书架内更早的同名同作者条目 → dup
+5. 书架前 HEAD_NEW_COUNT 本（默认 500，按 shelf_books.txt 顺序）→ new
+6. 其余 → new
 
 用法：
     python dedupe_shelf_books.py
@@ -42,8 +48,6 @@ DEFAULT_NEW = DATA_DIR / "new_books.txt"
 
 # 书架前 N 本：不在 forbid 里就一律当新书（按 shelf_books.txt 顺序数）
 HEAD_NEW_COUNT = 500
-# 以这些后缀结尾的书名不按名字判重（个人诗集常重名，仍需保留）
-KEEP_NAME_SUFFIXES = ("诗集", "全集", "选集", "诗选", "词选")
 
 # 半角/全角括号内容（非嵌套，循环处理；期数括号保留内文）
 _PAREN_RE = re.compile(r"[（(]([^（）()]*)[）)]")
@@ -82,6 +86,16 @@ _CN_DIGITS = {
 }
 _CN_UNITS = {"十": 10, "百": 100, "千": 1000}
 _PUNCT_DROP = ("·", "・", ".", "/", "／", "、", ",", "，")
+# 作者比对：去朝代/国别标记（[宋]【北宋】）与角色词（著/编/选注/主编…）；
+# 圆括号里的别名（如「王晓磊（六神磊磊）」）保留内容，只去括号本身。
+_AUTHOR_ERA_RE = re.compile(r"[\[【][^\]】]*[\]】]")
+_AUTHOR_PAREN_RE = re.compile(r"[（()）]")
+_AUTHOR_ROLE_RE = re.compile(
+    r"(著|编著|编选|选编|选注|评注|注评|笺注|校注|校点|点校|整理|主编|副主编|"
+    r"导读|译注|注释|集评|审校|修订|编译|编撰|解注|笺释|选评|评析|编注|校笺|"
+    r"疏证|考释|辑录|辑校|校订|注译|全译|等|编|注|选|译|校|辑)"
+)
+_AUTHOR_SPLIT_RE = re.compile(r"[\s,，、；;·/／]+")
 
 
 def _parse_cn_or_arabic_int(token: str) -> int | None:
@@ -136,19 +150,23 @@ def _title_keeps_issue_paren(title: str) -> bool:
     return any(_is_issue_paren(m.group(1)) for m in _PAREN_RE.finditer(str(title or "")))
 
 
-def title_keeps_name(title: str | None) -> bool:
-    """书名（原文或归一化后）是否以诗集/全集/选集/诗选/词选结尾。
+def author_tokens(author: str | None) -> frozenset[str]:
+    """作者串 → 人名 token 集合（去朝代标记与「著/编/选注/主编」等角色词，丢单字）。"""
+    s = _AUTHOR_ERA_RE.sub(" ", str(author or ""))
+    s = _AUTHOR_PAREN_RE.sub(" ", s)
+    s = _AUTHOR_ROLE_RE.sub(" ", s)
+    return frozenset(t for t in _AUTHOR_SPLIT_RE.split(s) if len(t) >= 2)
 
-    命中的书名不参与「按名字判重」（ebook-info 同名、书架内重名），
-    因为个人诗集常重名但仍需保留。
+
+def authors_match(want: frozenset[str], have: frozenset[str]) -> bool:
+    """作者是否对得上（至少一人相同）。
+
+    任一侧拿不到 token（作者缺失/全是角色词）时退回「按书名判重」，
+    避免因作者信息不全把重复书当新书。
     """
-    raw = str(title or "").strip()
-    if not raw:
-        return False
-    for text in (normalize_title(raw), raw):
-        if text.endswith(KEEP_NAME_SUFFIXES):
-            return True
-    return False
+    if not want or not have:
+        return True
+    return bool(want & have)
 
 
 def normalize_title(title: str | None) -> str:
@@ -213,14 +231,25 @@ def load_id_set_from_lines(path: Path) -> set[str]:
     return ids
 
 
-def load_title_keys_from_lines(path: Path) -> set[str]:
-    """从 shelf 格式文件收集归一化主书名（空标题跳过）。"""
-    keys: set[str] = set()
-    for _book_id, title, _author, _raw in load_shelf_lines(path):
+def load_title_author_keys(path: Path) -> dict[str, set[frozenset[str]]]:
+    """从 shelf 格式文件收集 {归一化主书名: {作者 token 集, ...}}（空标题跳过）。"""
+    out: dict[str, set[frozenset[str]]] = {}
+    for _book_id, title, author, _raw in load_shelf_lines(path):
         key = normalize_title(title)
-        if key:
-            keys.add(key)
-    return keys
+        if not key:
+            continue
+        out.setdefault(key, set()).add(author_tokens(author))
+    return out
+
+
+def merge_title_author_keys(
+    *maps: dict[str, set[frozenset[str]]],
+) -> dict[str, set[frozenset[str]]]:
+    out: dict[str, set[frozenset[str]]] = {}
+    for m in maps:
+        for key, authors in m.items():
+            out.setdefault(key, set()).update(authors)
+    return out
 
 
 def load_forbid_ids(path: Path) -> set[str]:
@@ -315,14 +344,15 @@ def migrate_stale_from_new(
 ) -> list[tuple[str, str]]:
     """把 new 中按当前规则已属 dup 的书迁到 dup。
 
-    含：forbid / 本地已下载 / ebook-info / 与已有 dup 或 new 内先前条目重名。
+    含：forbid / 本地已下载（已下载的书不进 new）/ ebook-info 同名同作者 /
+    与已有 dup 或 new 内先前条目同名同作者。
     返回 [(raw_line, reason), ...]。
     """
     if not new_path.is_file():
         return []
     lines = new_path.read_text(encoding="utf-8").splitlines()
     # 已在 dup 中的书名视为已占用；new 内按出现顺序只保留第一本
-    seen_title_keys = load_title_keys_from_lines(dup_path)
+    seen = load_title_author_keys(dup_path)
     keep: list[str] = []
     moved: list[tuple[str, str]] = []
     for line in lines:
@@ -330,14 +360,15 @@ def migrate_stale_from_new(
         if not parsed:
             keep.append(line.rstrip("\n"))
             continue
-        book_id, title, _author = parsed
+        book_id, title, author = parsed
         bucket, reason = classify_book(
             book_id,
             title,
+            author,
             forbid_ids=forbid_ids,
             downloaded_ids=downloaded_ids,
             ebook_keys=ebook_keys,
-            seen_title_keys=seen_title_keys,
+            seen_title_authors=seen,
             head_new_ids=head_new_ids,
         )
         if bucket == "dup":
@@ -346,7 +377,7 @@ def migrate_stale_from_new(
             keep.append(line.rstrip("\n"))
         key = normalize_title(title)
         if key:
-            seen_title_keys.add(key)
+            seen.setdefault(key, set()).add(author_tokens(author))
     if not moved:
         return []
 
@@ -370,15 +401,15 @@ def migrate_stale_from_dup(
 ) -> list[tuple[str, str]]:
     """把 dup 中按当前规则不再算重复的书迁回 new。
 
-    救回三类：括号内带期数/卷次/年份的条目、以诗集/全集/选集/诗选/词选结尾的书名、
-    书架前 N 本（不在 forbid 里）。其余普通书仍留 dup，避免把历史误入 dup 的条目一并捞出。
-    forbid / 本地已下载仍留 dup。
+    救回三类误判：括号内带期数/卷次/年份的条目、同名但作者对不上（旧规则按书名
+    误判为重复）、书架前 N 本。其余普通书仍留 dup，避免把手工/历史录入的条目一并捞出。
+    forbid / 本地已下载（已下载的书不进 new）仍留 dup。
     返回 [(raw_line, reason), ...]。
     """
     if not dup_path.is_file():
         return []
     lines = dup_path.read_text(encoding="utf-8").splitlines()
-    seen_title_keys = load_title_keys_from_lines(new_path)
+    seen = load_title_author_keys(new_path)
     keep: list[str] = []
     moved: list[tuple[str, str]] = []
     for line in lines:
@@ -386,20 +417,21 @@ def migrate_stale_from_dup(
         if not parsed:
             keep.append(line.rstrip("\n"))
             continue
-        book_id, title, _author = parsed
+        book_id, title, author = parsed
         bucket, reason = classify_book(
             book_id,
             title,
+            author,
             forbid_ids=forbid_ids,
             downloaded_ids=downloaded_ids,
             ebook_keys=ebook_keys,
-            seen_title_keys=seen_title_keys,
+            seen_title_authors=seen,
             head_new_ids=head_new_ids,
         )
         raw = line.rstrip("\n")
         if bucket == "new" and (
             _title_keeps_issue_paren(title)
-            or title_keeps_name(title)
+            or reason == "new-diff-author"
             or (head_new_ids is not None and book_id in head_new_ids)
         ):
             moved.append((raw, reason))
@@ -407,7 +439,7 @@ def migrate_stale_from_dup(
             keep.append(raw)
         key = normalize_title(title)
         if key:
-            seen_title_keys.add(key)
+            seen.setdefault(key, set()).add(author_tokens(author))
     if not moved:
         return []
     if dry_run:
@@ -439,33 +471,51 @@ def migrate_downloaded_from_new(
 def classify_book(
     book_id: str,
     title: str,
+    author: str = "",
     *,
     forbid_ids: set[str],
     downloaded_ids: set[str],
     ebook_keys: dict[str, list[dict]],
-    seen_title_keys: set[str] | None = None,
+    seen_title_authors: dict[str, set[frozenset[str]]] | None = None,
     head_new_ids: set[str] | None = None,
 ) -> tuple[str, str]:
     """返回 (bucket, reason)。bucket 为 'dup' 或 'new'。
 
-    seen_title_keys：已占用的归一化主书名（书架/new/dup 内先前条目）。
-    命中时原因 shelf-title-dup；调用方负责在处理后把当前书名加入该集合。
-    head_new_ids：书架前 N 本的 ID（不在 forbid 里就一律当新书，原因 new-head）。
-    书名以诗集/全集/选集/诗选/词选结尾时不按名字判重（原因 new-suffix）。
+    判定重复的口径是**书名 + 作者都对得上**：
+
+    1. forbid → dup
+    2. 本地已下载 → dup（已下载的书不进 new）
+    3. ebook-info 同名 + 作者对得上 → dup（ebook-info）
+    4. 书架内更早的同名同作者条目 → dup（shelf-title-dup）
+    5. 书架前 N 本 → new（new-head）
+    6. 其余 → new；其中「同名但作者对不上」给原因 new-diff-author
+
+    seen_title_authors：已占用的 {归一化主书名: {作者 token 集}}（书架/new/dup 内
+    先前条目）。调用方负责在处理后把当前书名与作者加入该映射。
+    head_new_ids：书架前 N 本的 ID（非 forbid、非已下载就一律当新书）。
     """
     if book_id in forbid_ids:
         return "dup", "forbid"
-    if head_new_ids and book_id in head_new_ids:
-        return "new", "new-head"
     if book_id in downloaded_ids:
         return "dup", "downloaded"
-    if title_keeps_name(title):
-        return "new", "new-suffix"
     key = normalize_title(title)
+    want = author_tokens(author)
+    same_title_only = False
     if key and key in ebook_keys:
-        return "dup", "ebook-info"
-    if seen_title_keys is not None and key and key in seen_title_keys:
-        return "dup", "shelf-title-dup"
+        if any(
+            authors_match(want, author_tokens(item.get("authorName")))
+            for item in ebook_keys[key]
+        ):
+            return "dup", "ebook-info"
+        same_title_only = True
+    if seen_title_authors is not None and key and key in seen_title_authors:
+        if any(authors_match(want, have) for have in seen_title_authors[key]):
+            return "dup", "shelf-title-dup"
+        same_title_only = True
+    if head_new_ids and book_id in head_new_ids:
+        return "new", "new-head"
+    if same_title_only:
+        return "new", "new-diff-author"
     return "new", "new"
 
 
@@ -547,9 +597,9 @@ def run(
             if parsed:
                 processed.add(parsed[0])
 
-    # new/dup 已处理条目的归一化书名均已占用（migrate 只在两者间移动，集合不变）
-    seen_title_keys = load_title_keys_from_lines(dup_path) | load_title_keys_from_lines(
-        new_path
+    # new/dup 已处理条目的书名 + 作者均已占用（migrate 只在两者间移动，映射不变）
+    seen_title_authors = merge_title_author_keys(
+        load_title_author_keys(dup_path), load_title_author_keys(new_path)
     )
 
     todo = [row for row in shelf if row[0] not in processed]
@@ -562,7 +612,7 @@ def run(
         "ebook-info": 0,
         "shelf-title-dup": 0,
         "new-head": 0,
-        "new-suffix": 0,
+        "new-diff-author": 0,
         "new": 0,
     }
 
@@ -570,16 +620,17 @@ def run(
         bucket, reason = classify_book(
             book_id,
             title,
+            author,
             forbid_ids=forbid_ids,
             downloaded_ids=downloaded_ids,
             ebook_keys=ebook_keys,
-            seen_title_keys=seen_title_keys,
+            seen_title_authors=seen_title_authors,
             head_new_ids=head_new_ids,
         )
         reasons[reason] = reasons.get(reason, 0) + 1
         key = normalize_title(title)
         if key:
-            seen_title_keys.add(key)
+            seen_title_authors.setdefault(key, set()).add(author_tokens(author))
         # 写出原样行
         line = raw if raw.strip() else format_shelf_line(book_id, title, author)
         if bucket == "dup":
@@ -656,7 +707,7 @@ def _print_report(result: dict) -> None:
         f"ebook-info={r.get('ebook-info', 0)}, "
         f"shelf-title-dup={r.get('shelf-title-dup', 0)}, "
         f"new-head={r.get('new-head', 0)}, "
-        f"new-suffix={r.get('new-suffix', 0)}, "
+        f"new-diff-author={r.get('new-diff-author', 0)}, "
         f"new={r.get('new', 0)}"
     )
     if result["dry_run"]:

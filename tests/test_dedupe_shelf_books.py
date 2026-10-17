@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 
 from dedupe_shelf_books import (
+    author_tokens,
+    authors_match,
     classify_book,
     load_downloaded_ids,
     load_ebook_title_keys,
@@ -13,7 +15,6 @@ from dedupe_shelf_books import (
     normalize_title,
     parse_shelf_line,
     run,
-    title_keeps_name,
 )
 
 
@@ -149,24 +150,41 @@ class TestNormalizeTitle(unittest.TestCase):
         )
 
 
-class TestTitleKeepsName(unittest.TestCase):
-    """以诗集/全集/选集/诗选/词选结尾的书名不参与按名字判重。"""
+class TestAuthorTokens(unittest.TestCase):
+    """作者比对：去朝代标记与角色词，按人名 token 取交集。"""
 
-    def test_suffix_hits(self):
-        for title in [
-            "白居易诗选",
-            "唐诗选：上下",
-            "唐诗选-上下",
-            "李太白全集",
-            "乐府诗集",
-            "陶渊明诗文选集",
-            "词选",
-        ]:
-            self.assertTrue(title_keeps_name(title), title)
+    def test_strip_dynasty_and_role_words(self):
+        self.assertIn("王英志", author_tokens("王英志选注"))
+        self.assertIn("王英志", author_tokens("王英志 选注"))
+        self.assertIn("纳兰容若", author_tokens("[清]纳兰容若"))
+        self.assertIn("郭茂倩", author_tokens("【北宋】郭茂倩 编著；周兴陆 解注"))
+        self.assertIn("叶元章", author_tokens("[清]朱彝尊著 叶元章 钟夏选注"))
+        # 圆括号里的别名保留
+        self.assertIn("六神磊磊", author_tokens("王晓磊（六神磊磊）"))
+        self.assertEqual(author_tokens(""), frozenset())
+        self.assertEqual(author_tokens(None), frozenset())
+        # 单字/全是角色词 → 拿不到 token，退回按书名判重
+        self.assertEqual(author_tokens("甲"), frozenset())
+        self.assertEqual(author_tokens("选注"), frozenset())
 
-    def test_suffix_misses(self):
-        for title in ["词品", "续词品", "全唐诗", "花间集", "", None]:
-            self.assertFalse(title_keeps_name(title), title)
+    def test_match_rules(self):
+        # 至少一人相同即算对得上（作者串写法不同也能匹配）
+        self.assertTrue(
+            authors_match(author_tokens("王英志选注"), author_tokens("王英志 选注"))
+        )
+        self.assertTrue(
+            authors_match(
+                author_tokens("[清]朱彝尊著 叶元章 钟夏选注"),
+                author_tokens("朱彝尊 著；叶元章；钟夏 选注"),
+            )
+        )
+        # 同名异作者：不同选注者/不同版本
+        self.assertFalse(
+            authors_match(author_tokens("王志清"), author_tokens("陈铁民 选注"))
+        )
+        # 任一侧没有可比对的 token 时退回「按书名判重」
+        self.assertTrue(authors_match(author_tokens(""), author_tokens("陈铁民 选注")))
+        self.assertTrue(authors_match(author_tokens("佚名"), author_tokens("")))
 
 
 class TestParseAndLoad(unittest.TestCase):
@@ -231,11 +249,36 @@ class TestClassify(unittest.TestCase):
         )
         self.assertEqual((bucket, reason), ("dup", "downloaded"))
 
-    def test_ebook_title_only_ignores_author(self):
-        # 同名异作者也算 dup
+    def test_ebook_same_title_and_author_is_dup(self):
+        # 书名 + 作者都对得上才算重复（作者串写法不同也能匹配）
+        bucket, reason = classify_book(
+            "sid",
+            "袁枚诗选",
+            "王英志选注",
+            forbid_ids=set(),
+            downloaded_ids=set(),
+            ebook_keys={"袁枚诗选": [{"bookName": "袁枚诗选", "authorName": "王英志 选注"}]},
+        )
+        self.assertEqual((bucket, reason), ("dup", "ebook-info"))
+
+    def test_ebook_same_title_other_author_is_new(self):
+        # 同名异书（不同选注者/不同版本）当新书
+        bucket, reason = classify_book(
+            "sid",
+            "王维诗选",
+            "王志清",
+            forbid_ids=set(),
+            downloaded_ids=set(),
+            ebook_keys={"王维诗选": [{"bookName": "王维诗选", "authorName": "陈铁民 选注"}]},
+        )
+        self.assertEqual((bucket, reason), ("new", "new-diff-author"))
+
+    def test_ebook_title_only_when_author_missing(self):
+        # 任一侧拿不到作者 token 时退回按书名判重
         bucket, reason = classify_book(
             "sid",
             "古今词话",
+            "",
             forbid_ids=set(),
             downloaded_ids=set(),
             ebook_keys={"古今词话": [{"bookName": "古今词话", "authorName": "沈雄"}]},
@@ -262,46 +305,48 @@ class TestClassify(unittest.TestCase):
         )
         self.assertEqual((bucket, reason), ("new", "new"))
 
-    def test_shelf_title_dup(self):
+    def test_shelf_title_dup_same_author(self):
         bucket, reason = classify_book(
             "sid2",
             "词品（珍藏本）",
+            "甲某",
             forbid_ids=set(),
             downloaded_ids=set(),
             ebook_keys={},
-            seen_title_keys={"词品"},
+            seen_title_authors={"词品": {author_tokens("甲某")}},
         )
         self.assertEqual((bucket, reason), ("dup", "shelf-title-dup"))
+
+    def test_shelf_title_other_author_is_new(self):
+        bucket, reason = classify_book(
+            "sid2",
+            "词品（珍藏本）",
+            "乙某",
+            forbid_ids=set(),
+            downloaded_ids=set(),
+            ebook_keys={},
+            seen_title_authors={"词品": {author_tokens("甲某")}},
+        )
+        self.assertEqual((bucket, reason), ("new", "new-diff-author"))
 
     def test_shelf_title_dup_after_higher_priority(self):
         # forbid 优先于重名
         bucket, reason = classify_book(
             "sid",
             "词品",
+            "甲某",
             forbid_ids={"sid"},
             downloaded_ids=set(),
             ebook_keys={},
-            seen_title_keys={"词品"},
+            seen_title_authors={"词品": {author_tokens("甲某")}},
         )
         self.assertEqual((bucket, reason), ("dup", "forbid"))
 
-    def test_suffix_title_ignores_ebook_info_and_shelf_dup(self):
-        """诗集/全集/选集/诗选/词选 结尾：ebook-info 同名、书架同名都不算 dup。"""
-        ebook_keys = {"白居易诗选": [{"bookName": "白居易诗选", "authorName": "孙明君"}]}
-        bucket, reason = classify_book(
-            "sid",
-            "白居易诗选",
-            forbid_ids=set(),
-            downloaded_ids=set(),
-            ebook_keys=ebook_keys,
-            seen_title_keys={"白居易诗选"},
-        )
-        self.assertEqual((bucket, reason), ("new", "new-suffix"))
-
-    def test_suffix_title_still_forbid_and_downloaded(self):
+    def test_forbid_and_downloaded_first(self):
         bucket, reason = classify_book(
             "sid",
             "李太白全集",
+            "[唐]李白",
             forbid_ids={"sid"},
             downloaded_ids=set(),
             ebook_keys={},
@@ -310,30 +355,60 @@ class TestClassify(unittest.TestCase):
         bucket, reason = classify_book(
             "sid2",
             "李太白全集",
+            "[唐]李白",
             forbid_ids=set(),
             downloaded_ids={"sid2"},
             ebook_keys={},
         )
         self.assertEqual((bucket, reason), ("dup", "downloaded"))
 
-    def test_head_new_ids_override_downloaded_and_ebook_info(self):
-        """书架前 N 本：不在 forbid 里就一律当新书。"""
-        ebook_keys = {"词品": [{"bookName": "词品"}]}
+    def test_downloaded_wins_over_head_new(self):
+        """已下载的书不进 new_books.txt，前 N 本规则也不例外。"""
         bucket, reason = classify_book(
             "sid",
             "词品",
+            "杨慎",
             forbid_ids=set(),
             downloaded_ids={"sid"},
+            ebook_keys={},
+            head_new_ids={"sid"},
+        )
+        self.assertEqual((bucket, reason), ("dup", "downloaded"))
+
+    def test_head_new_ids_override_title_only_match(self):
+        """书架前 N 本：同名异作者（书名对得上、作者对不上）也当新书。"""
+        ebook_keys = {"词品": [{"bookName": "词品", "authorName": "杨慎"}]}
+        bucket, reason = classify_book(
+            "sid",
+            "词品",
+            "高林广",
+            forbid_ids=set(),
+            downloaded_ids=set(),
             ebook_keys=ebook_keys,
-            seen_title_keys={"词品"},
+            seen_title_authors={"词品": {author_tokens("沈雄")}},
             head_new_ids={"sid"},
         )
         self.assertEqual((bucket, reason), ("new", "new-head"))
+
+    def test_head_new_ids_do_not_override_same_book(self):
+        """前 N 本里「同名同作者」仍判 dup。"""
+        ebook_keys = {"词品": [{"bookName": "词品", "authorName": "杨慎"}]}
+        bucket, reason = classify_book(
+            "sid",
+            "词品",
+            "杨慎",
+            forbid_ids=set(),
+            downloaded_ids=set(),
+            ebook_keys=ebook_keys,
+            head_new_ids={"sid"},
+        )
+        self.assertEqual((bucket, reason), ("dup", "ebook-info"))
 
     def test_head_new_ids_still_forbid_first(self):
         bucket, reason = classify_book(
             "sid",
             "词品",
+            "杨慎",
             forbid_ids={"sid"},
             downloaded_ids=set(),
             ebook_keys={},
@@ -414,18 +489,20 @@ class TestMigrateAndRun(unittest.TestCase):
                 dry_run=False,
             )
             self.assertEqual(result["todo"], 6)
-            # forbid+dl+ebook+ebook-same-title+shelf-title-dup
-            self.assertEqual(result["dup"], 5)
-            self.assertEqual(result["new"], 1)
+            # dup: forbid + downloaded + ebook-info(同名同作者)
+            self.assertEqual(result["dup"], 3)
+            # new: 同名异作者（古今词话 杨湜 vs 沈雄）、续词品、续词品（注释本）
+            self.assertEqual(result["new"], 3)
             self.assertEqual(result["reasons"]["downloaded"], 1)
-            self.assertEqual(result["reasons"]["shelf-title-dup"], 1)
+            self.assertEqual(result["reasons"]["ebook-info"], 1)
+            self.assertEqual(result["reasons"]["new-diff-author"], 2)
             dup_text = dup.read_text(encoding="utf-8")
             new_text = new.read_text(encoding="utf-8")
             self.assertIn("idforbid", dup_text)
             self.assertIn("iddl", dup_text)
             self.assertIn("idebook", dup_text)
-            self.assertIn("idsame", dup_text)
-            self.assertIn("iddupname", dup_text)
+            self.assertIn("idsame", new_text)
+            self.assertIn("iddupname", new_text)
             self.assertIn("idnew", new_text)
             self.assertNotIn("idnew", dup_text)
 
@@ -435,7 +512,7 @@ class TestMigrateAndRun(unittest.TestCase):
             new_p = Path(td) / "new.txt"
             dup_p = Path(td) / "dup.txt"
             new_p.write_text(
-                "a,词品,甲\nb,词品（珍藏本）,乙\n",
+                "a,词品,甲某\nb,词品（珍藏本）,甲某\nc,词品（全本）,乙某\n",
                 encoding="utf-8",
             )
             dup_p.write_text("", encoding="utf-8")
@@ -451,8 +528,9 @@ class TestMigrateAndRun(unittest.TestCase):
             )
             self.assertEqual(len(moved), 1)
             self.assertEqual(moved[0][1], "shelf-title-dup")
-            self.assertEqual(new_p.read_text(encoding="utf-8").strip(), "a,词品,甲")
-            self.assertIn("b,词品（珍藏本）,乙", dup_p.read_text(encoding="utf-8"))
+            self.assertIn("a,词品,甲某", new_p.read_text(encoding="utf-8"))
+            self.assertIn("c,词品（全本）,乙某", new_p.read_text(encoding="utf-8"))
+            self.assertIn("b,词品（珍藏本）,甲某", dup_p.read_text(encoding="utf-8"))
 
     def test_classify_keeps_distinct_journal_issues(self):
         ebook_keys = {
@@ -481,13 +559,14 @@ class TestMigrateAndRun(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             new_p = Path(td) / "new.txt"
             dup_p = Path(td) / "dup.txt"
-            new_p.write_text("a,词品,甲\n", encoding="utf-8")
+            new_p.write_text("a,词品,甲某\n", encoding="utf-8")
             dup_p.write_text(
                 "\n".join(
                     [
-                        "b,词品（珍藏本）,乙",
+                        "b,词品（珍藏本）,乙某",
                         "c,励耘学刊（2019年第2辑/总第30辑）,杜桂萍",
                         "d,励耘学刊（2024年第1辑/总第39辑）,杜桂萍",
+                        "e,文学概论讲义,老舍",
                     ]
                 )
                 + "\n",
@@ -507,12 +586,14 @@ class TestMigrateAndRun(unittest.TestCase):
                 dry_run=False,
             )
             moved_ids = {parse_shelf_line(line)[0] for line, _reason in moved}
-            self.assertEqual(moved_ids, {"c", "d"})
+            # b：同名异作者（旧规则按书名误判）；c/d：期刊期数不同；e：无同名，仍留 dup
+            self.assertEqual(moved_ids, {"b", "c", "d"})
             new_text = new_p.read_text(encoding="utf-8")
             dup_text = dup_p.read_text(encoding="utf-8")
             self.assertIn("c,励耘学刊（2019年第2辑/总第30辑）,杜桂萍", new_text)
             self.assertIn("d,励耘学刊（2024年第1辑/总第39辑）,杜桂萍", new_text)
-            self.assertIn("b,词品（珍藏本）,乙", dup_text)
+            self.assertIn("b,词品（珍藏本）,乙某", new_text)
+            self.assertIn("e,文学概论讲义,老舍", dup_text)
             self.assertNotIn("励耘学刊", dup_text)
 
     def test_migrate_dup_skips_non_issue_stale_entries(self):
@@ -537,7 +618,7 @@ class TestMigrateAndRun(unittest.TestCase):
             self.assertIn("x,文学概论讲义,老舍", dup_p.read_text(encoding="utf-8"))
             self.assertIn("y,励耘学刊（2019年第2辑/总第30辑）,杜桂萍", new_p.read_text(encoding="utf-8"))
 
-    def test_run_keeps_first_shelf_title_only(self):
+    def test_run_shelf_dup_needs_same_author(self):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             shelf = td_path / "shelf.txt"
@@ -549,7 +630,10 @@ class TestMigrateAndRun(unittest.TestCase):
             books.mkdir()
 
             shelf.write_text(
-                "id1,古今词话,[宋]杨湜\nid2,古今词话,沈雄\nid3,词品,甲\n",
+                "id1,古今词话,[宋]杨湜\n"
+                "id2,古今词话,杨湜\n"
+                "id3,古今词话,沈雄\n"
+                "id4,词品,甲\n",
                 encoding="utf-8",
             )
             forbid.write_text("", encoding="utf-8")
@@ -567,14 +651,18 @@ class TestMigrateAndRun(unittest.TestCase):
                 head_new_count=0,
                 dry_run=False,
             )
-            self.assertEqual(result["new"], 2)
+            self.assertEqual(result["new"], 3)
             self.assertEqual(result["dup"], 1)
             self.assertEqual(result["reasons"]["shelf-title-dup"], 1)
+            self.assertEqual(result["reasons"]["new-diff-author"], 1)
             new_text = new.read_text(encoding="utf-8")
             dup_text = dup.read_text(encoding="utf-8")
             self.assertIn("id1,古今词话,[宋]杨湜", new_text)
-            self.assertIn("id3,词品,甲", new_text)
-            self.assertIn("id2,古今词话,沈雄", dup_text)
+            self.assertIn("id4,词品,甲", new_text)
+            # 同名同作者 → 只留第一本
+            self.assertIn("id2,古今词话,杨湜", dup_text)
+            # 同名异作者（杨湜 vs 沈雄 是两本不同的书）→ 都保留
+            self.assertIn("id3,古今词话,沈雄", new_text)
 
     def _make_case(self, td_path: Path, shelf_text: str, ebook_entries: list[dict]):
         shelf = td_path / "shelf.txt"
@@ -593,15 +681,15 @@ class TestMigrateAndRun(unittest.TestCase):
         new.write_text("", encoding="utf-8")
         return shelf, forbid, ebook, dup, new, books
 
-    def test_run_keeps_suffix_title_but_dedupes_other(self):
-        """诗选结尾的书：ebook-info 同名也当新书；其他书名照旧判 dup。"""
+    def test_run_dedupes_same_book_and_keeps_other_author(self):
+        """同名同作者判 dup；同名异作者（不同选注者）当新书。"""
         with tempfile.TemporaryDirectory() as td:
             paths = self._make_case(
                 Path(td),
-                "id1,王维诗选,王志清\nid2,词品,杨慎\n",
+                "id1,王维诗选,王志清\nid2,袁枚诗选,王英志选注\n",
                 [
                     {"bookName": "王维诗选", "authorName": "陈铁民 选注"},
-                    {"bookName": "词品", "authorName": "杨慎"},
+                    {"bookName": "袁枚诗选", "authorName": "王英志 选注"},
                 ],
             )
             shelf, forbid, ebook, dup, new, books = paths
@@ -615,23 +703,22 @@ class TestMigrateAndRun(unittest.TestCase):
                 head_new_count=0,
                 dry_run=False,
             )
-            self.assertEqual(result["reasons"]["new-suffix"], 1)
+            self.assertEqual(result["reasons"]["new-diff-author"], 1)
             self.assertEqual(result["reasons"]["ebook-info"], 1)
             self.assertIn("id1,王维诗选,王志清", new.read_text(encoding="utf-8"))
-            self.assertIn("id2,词品,杨慎", dup.read_text(encoding="utf-8"))
+            self.assertIn("id2,袁枚诗选,王英志选注", dup.read_text(encoding="utf-8"))
 
-    def test_run_head_new_count_overrides_downloaded(self):
-        """书架前 N 本（不含 forbid）连「本地已下载」也忽略。"""
+    def test_run_head_new_count_skips_downloaded(self):
+        """书架前 N 本：非 forbid、非已下载的一律当新书；已下载仍进 dup。"""
         with tempfile.TemporaryDirectory() as td:
             paths = self._make_case(
                 Path(td),
-                "idforbid,禁书,人\nid1,已下载甲,人\nid2,已下载乙,人\n",
+                "idforbid,禁书,人\nid1,已下载甲,人\nid2,未下载乙,人\n",
                 [],
             )
             shelf, forbid, ebook, dup, new, books = paths
             forbid.write_text("idforbid\n", encoding="utf-8")
             (books / "id1_已下载甲.json").write_text("{}", encoding="utf-8")
-            (books / "id2_已下载乙.json").write_text("{}", encoding="utf-8")
             result = run(
                 shelf_path=shelf,
                 forbid_path=forbid,
@@ -642,14 +729,16 @@ class TestMigrateAndRun(unittest.TestCase):
                 head_new_count=3,
                 dry_run=False,
             )
-            # 前 3 本里除 forbid 外都是 new-head
-            self.assertEqual(result["reasons"]["new-head"], 2)
+            self.assertEqual(result["reasons"]["new-head"], 1)
             self.assertEqual(result["reasons"]["forbid"], 1)
+            self.assertEqual(result["reasons"]["downloaded"], 1)
             new_text = new.read_text(encoding="utf-8")
-            self.assertIn("id1,已下载甲,人", new_text)
-            self.assertIn("id2,已下载乙,人", new_text)
+            dup_text = dup.read_text(encoding="utf-8")
+            self.assertIn("id2,未下载乙,人", new_text)
+            self.assertNotIn("id1,已下载甲,人", new_text)
+            self.assertIn("id1,已下载甲,人", dup_text)
 
-            # 关掉前 N 本规则后，已下载的回到 dup
+            # 关掉前 N 本规则后，未下载的那本仍是新书（没有任何规则拦它）
             result = run(
                 shelf_path=shelf,
                 forbid_path=forbid,
@@ -660,36 +749,49 @@ class TestMigrateAndRun(unittest.TestCase):
                 head_new_count=0,
                 dry_run=False,
             )
+            self.assertEqual(result["migrated_new_to_dup"], 0)
             self.assertEqual(result["migrated_dup_to_new"], 0)
             dup_text = dup.read_text(encoding="utf-8")
+            new_text = new.read_text(encoding="utf-8")
             self.assertIn("id1,已下载甲,人", dup_text)
-            self.assertIn("id2,已下载乙,人", dup_text)
+            self.assertIn("id2,未下载乙,人", new_text)
 
-    def test_migrate_dup_to_new_for_head_and_suffix(self):
-        """dup 里前 N 本、以及诗集结尾的书，按新规则迁回 new。"""
+    def test_migrate_dup_to_new_for_head_and_other_author(self):
+        """dup 里前 N 本、以及同名异作者的书，按新规则迁回 new。"""
         with tempfile.TemporaryDirectory() as td:
             new_p = Path(td) / "new.txt"
             dup_p = Path(td) / "dup.txt"
             new_p.write_text("", encoding="utf-8")
             dup_p.write_text(
-                "head1,全唐诗,佚名\nsuf1,王维诗选,王志清\nplain1,文学概论讲义,老舍\n",
+                "head1,全唐诗,佚名\n"
+                "suf1,王维诗选,王志清\n"
+                "same1,王维诗选,陈铁民 选注\n"
+                "dl1,已下载书,某人\n"
+                "plain1,文学概论讲义,老舍\n",
                 encoding="utf-8",
             )
             moved = migrate_stale_from_dup(
                 dup_p,
                 new_p,
                 forbid_ids=set(),
-                downloaded_ids=set(),
-                ebook_keys={"王维诗选": [{"bookName": "王维诗选"}]},
+                downloaded_ids={"dl1"},
+                ebook_keys={
+                    "王维诗选": [{"bookName": "王维诗选", "authorName": "陈铁民 选注"}]
+                },
                 head_new_ids={"head1"},
                 dry_run=False,
             )
             moved_ids = {parse_shelf_line(line)[0] for line, _reason in moved}
+            # head1：前 N 本；suf1：同名异作者（ebook 那本是陈铁民选注）
             self.assertEqual(moved_ids, {"head1", "suf1"})
             new_text = new_p.read_text(encoding="utf-8")
+            dup_text = dup_p.read_text(encoding="utf-8")
             self.assertIn("head1,全唐诗,佚名", new_text)
             self.assertIn("suf1,王维诗选,王志清", new_text)
-            self.assertIn("plain1,文学概论讲义,老舍", dup_p.read_text(encoding="utf-8"))
+            # 同名同作者、已下载、无同名 → 仍留 dup
+            self.assertIn("same1,王维诗选,陈铁民 选注", dup_text)
+            self.assertIn("dl1,已下载书,某人", dup_text)
+            self.assertIn("plain1,文学概论讲义,老舍", dup_text)
 
     def test_run_skips_empty_title_rows(self):
         """抓取残行（空书名）不写进 new。"""

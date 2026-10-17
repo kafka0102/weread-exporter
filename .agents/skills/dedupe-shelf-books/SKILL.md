@@ -1,14 +1,14 @@
 ---
 name: dedupe-shelf-books
-description: 把 data/shelf_books.txt 与 data/forbid_books.txt、data/ebook-info.json、本地已导出目录（默认 ~/data/weixin/books）比对，按「归一化主书名」判断重复，分别落到 data/dup_books.txt / data/new_books.txt。期刊/学刊括号内的期数、卷次、年份予以保留；以「诗集/全集/选集/诗选/词选」结尾的书名不按名字判重；书架前 500 本不在 forbid 里的一律当新书。优先运行 python dedupe_shelf_books.py（导出后也要再跑，才能把已下载 ID 从 new 迁到 dup；规则收紧后会把误判 dup 迁回 new）。触发：书架去重、找重复书/新书、生成 dup_books/new_books、剔除已下载。
+description: 把 data/shelf_books.txt 与 data/forbid_books.txt、data/ebook-info.json、本地已导出目录（默认 ~/data/weixin/books）比对，按「归一化主书名 + 作者」判断重复，分别落到 data/dup_books.txt / data/new_books.txt。期刊/学刊括号内的期数、卷次、年份予以保留；同名同作者才算重复，同名异作者（不同选注者/版本）当新书；已下载的书绝不进 new_books.txt；书架前 500 本不在 forbid 里的一律当新书。优先运行 python dedupe_shelf_books.py（导出后也要再跑，才能把已下载 ID 从 new 迁到 dup；规则收紧后会把误判 dup 迁回 new）。触发：书架去重、找重复书/新书、生成 dup_books/new_books、剔除已下载。
 ---
 
 # Skill: 书架书去重
 
 判断微信读书**书架书**（`data/shelf_books.txt`）是否应归入：
 
-- `data/dup_books.txt`：禁止下载 / 本地已导出 / 电子书库已有 / **书架（或已处理列表）同主书名重复**
-- `data/new_books.txt`：待导出新书（**同主书名只保留第一本**）
+- `data/dup_books.txt`：禁止下载 / 本地已导出 / 电子书库已有同名同作者 / **书架（或已处理列表）同名同作者重复**
+- `data/new_books.txt`：待导出新书（**同名同作者只保留第一本**；**已下载的书不写进来**）
 
 **优先直接跑脚本**，不要手写匹配：
 
@@ -26,7 +26,7 @@ python dedupe_shelf_books.py --head-new-count 0
 |------|------|------|
 | `data/shelf_books.txt` | 输入：书架 | 每行 `ID,书名,作者名` |
 | `data/forbid_books.txt` | 输入：禁止下载 | 每行 weread bookId（可 `ID,书名,作者`，只取 ID） |
-| `data/ebook-info.json` | 输入：电子书库 | JSON 数组；只用 `bookName`（**不比作者**） |
+| `data/ebook-info.json` | 输入：电子书库 | JSON 数组；用 `bookName` + `authorName`（**同名同作者才算重复**） |
 | `~/data/weixin/books/`（或 `BOOKS_DIR`） | 输入：本地已导出 | 文件名 `{weread_id}_书名.json`，按 `_` 前 ID 匹配 |
 | `data/dup_books.txt` | 输出：重复/禁止/已下载 | `ID,书名,作者名`，**追加** |
 | `data/new_books.txt` | 输出：新书 | 同上，**追加**（迁移清理时会重写） |
@@ -39,42 +39,45 @@ python dedupe_shelf_books.py --head-new-count 0
 对每本未处理过的书架书，按优先级：
 
 1. **forbid**：shelf `ID` ∈ `forbid_ids` → **dup**
-2. **head-new**：shelf `ID` 落在 `shelf_books.txt` **前 `--head-new-count` 本（默认 500）**里 → **new**（原因 `new-head`；**连「本地已下载」也不排除**，只有 forbid 拦得住）
-3. **downloaded**：shelf `ID` ∈ 本地 `*.json` 文件名前缀 → **dup**
-4. **new-suffix**：书名（原文或归一化后）以 **诗集 / 全集 / 选集 / 诗选 / 词选** 结尾 → **new**（原因 `new-suffix`；跳过下面两条**按名字**判重的规则）
-5. **ebook-info**：**归一化主书名**与库中任一 `bookName` 归一化结果相同 → **dup**（**作者不同也算重复**）
-6. **shelf-title-dup**：**归一化主书名**已出现在 `dup_books` / `new_books` 或本轮更早处理的书架书中 → **dup**（**书架重名只留第一本**，不比作者）
-7. 否则 → **new**，并把该主书名记为已占用
+2. **downloaded**：shelf `ID` ∈ 本地 `*.json` 文件名前缀 → **dup**（**已下载的书绝不进 `new_books.txt`**）
+3. **ebook-info**：**归一化主书名**与库中 `bookName` 相同，**且作者对得上** → **dup**
+4. **shelf-title-dup**：**归一化主书名 + 作者**已出现在 `dup_books` / `new_books` 或本轮更早处理的书架书中 → **dup**
+5. **head-new**：shelf `ID` 落在 `shelf_books.txt` **前 `--head-new-count` 本（默认 500）**里 → **new**（原因 `new-head`）
+6. 否则 → **new**（若书名撞上 ebook-info / 书架条目、只是作者对不上，原因记 `new-diff-author`）
 
-### 例外一：诗集类书名不按名字判重（`new-suffix`）
+### 判定口径：同名 + 同作者才算重复
 
-书名（原文或归一化后）以 `诗集` / `全集` / `选集` / `诗选` / `词选` 结尾时，**不参与按名字判重**：
-个人诗集常重名（同一书名对应不同选注者/不同版本），仅凭书名撞车就剔除会误伤。
+书名归一化后相同，**并且作者至少一人相同**，才判 dup：
 
-- 只有 **forbid** 与 **本地已下载** 仍判 dup。
-- 命中的书即使与 ebook-info 同名（哪怕作者也对得上）也当新书。
+- 作者串先去掉朝代/国别标记（`[宋]`、`【北宋】`）与角色词（`著`、`编`、`选注`、`主编`、
+  `校注`、`评注`、`整理`…），再按空白/逗号/分号切开取人名 token，两侧取交集非空即算对得上。
+  圆括号里的别名保留（`王晓磊（六神磊磊）` 能与 `六神磊磊` 对上）。
+- **任一侧拿不到人名 token**（作者为空、只写角色词、单字）时，退回「按书名判重」。
+- 因此**同名异作者**（同一书名不同选注者/不同版本，如 `王维诗选` 王志清 vs 陈铁民 选注）
+  一律当**新书**，原因 `new-diff-author`。
 
 | shelf | 对照 | 结果 |
 |-------|------|------|
-| `王维诗选` / 王志清 | ebook `王维诗选` / 陈铁民 选注 | **new**（`new-suffix`） |
-| `白居易诗选` / 王志清 | ebook `白居易诗选` / 孙明君 评注 | **new**（`new-suffix`） |
-| 书架内 `李太白全集` 两本 | —— | 两本都 **new** |
-| `李太白全集` | 本地已有 `*.json` | **dup**（`downloaded`） |
-| `词品` | ebook `词品` | **dup**（`ebook-info`，不在后缀表里） |
+| `袁枚诗选` / 王英志选注 | ebook `袁枚诗选` / 王英志 选注 | **dup**（`ebook-info`，作者对得上） |
+| `王维诗选` / 王志清 | ebook `王维诗选` / 陈铁民 选注 | **new**（`new-diff-author`） |
+| `白居易诗选` / 王志清 | ebook `白居易诗选` / 孙明君 评注 | **new**（`new-diff-author`） |
+| 书架内 `古今词话` 杨湜 / 沈雄 | —— | 都 **new**（同名异作者是两本不同的书） |
+| 书架内 `词品` 甲 / `词品（珍藏本）` 甲 | —— | 第二本 **dup**（`shelf-title-dup`） |
+| `李太白全集` | 本地已有 `*.json` | **dup**（`downloaded`，已下载不进 new） |
 
-### 例外二：书架前 500 本一律当新书（`new-head`）
+### 例外：书架前 500 本一律当新书（`new-head`）
 
-按 `data/shelf_books.txt` 的**文件顺序**取前 `--head-new-count` 本（默认 **500**），只要不在
-`forbid_books.txt` 里，就一律当**新书**（原因 `new-head`）——**不排除已下载、不排除 ebook-info
-同名、不排除书架同名**。这批书通常是正在按顺序处理的段落（含大量个人诗集/全集），
-需要留在 `new_books.txt` 里。
+按 `data/shelf_books.txt` 的**文件顺序**取前 `--head-new-count` 本（默认 **500**），
+在**不违反上面 1—4 条**的前提下当**新书**（原因 `new-head`）：也就是「非 forbid、非已下载、
+且不是同名同作者」的书一律留在 `new_books.txt` 里。这批书通常是正在按顺序处理的段落。
 
-- 需要恢复旧行为时用 `--head-new-count 0`。
+- 已下载的书仍进 dup（用户明确要求）；同名同作者仍进 dup。
+- 需要关闭时用 `--head-new-count 0`。
 - 顺序以 `shelf_books.txt` 当前内容为准；重新抓书架后位置会变，前 500 本随之变化。
 
 ### 书名归一化（`normalize_title`）
 
-只比主标题，不比作者：
+只归一化主标题（作者另行比对，见上）：
 
 1. **括号**：半角 `()` / 全角 `（）`，可循环多次  
    - **装饰性括号整段去掉**（珍藏本、插图注释版、全N册/套装、丛书名、第N版等）  
@@ -104,30 +107,30 @@ python dedupe_shelf_books.py --head-new-count 0
 | shelf | 对照 | 结果 |
 |-------|------|------|
 | `长安诗酒汴京花：全二册` | ebook `长安诗酒汴京花（全二册）` | **dup**（主标题相同） |
-| `古今词话` / 杨湜 | ebook `古今词话` / 沈雄 | **dup**（作者不同也算） |
+| `古今词话` / 杨湜 | ebook `古今词话` / 沈雄 | **new**（同名异作者是两本不同的书） |
 | `续词品` | 仅有 `词品` | **new**（主标题不同） |
-| 书架先后 `古今词话` 杨湜 / `古今词话` 沈雄 | （库中无） | 第一本 **new**，第二本 **dup**（`shelf-title-dup`） |
-| `词品` 与 `词品（珍藏本）` | 书架内两本 | 归一化同为 `词品` → 只留先出现的一本 |
+| 书架先后 `古今词话` 杨湜 / `古今词话` 沈雄 | （库中无） | 两本都 **new**（作者不同） |
+| 书架先后 `词品` 甲 / `词品（珍藏本）` 甲 | 书架内两本 | 归一化同为 `词品`、作者同为甲 → 第二本 **dup** |
 | `励耘学刊（2019年第2辑/总第30辑）` | ebook `励耘学刊（2025年第1辑 总第41辑）` | **new**（期数不同） |
 | `乐府学（第十一辑）` | ebook `乐府学（第11辑）` | **dup**（期数等同） |
 | `唐代文学研究年鉴（2016）` | ebook `唐代文学研究年鉴（2023）` | **new**（年份不同） |
-| `王维诗选` / 王志清 | ebook `王维诗选` / 陈铁民 选注 | **new**（后缀例外，不按名字判重） |
-| `词品`（书架第 300 本） | ebook `词品` | **new**（`new-head`，前 500 本一律当新书） |
+| `王维诗选` / 王志清 | ebook `王维诗选` / 陈铁民 选注 | **new**（`new-diff-author`） |
+| `词品`（书架第 300 本） | 本地已有 `*.json` | **dup**（`downloaded`，已下载不进 new） |
 
 ## 处理流程（与脚本一致）
 
 1. 读 `shelf_books.txt`、`forbid_books.txt`、本地 books 目录、`ebook-info.json`
-2. **回扫 new_books**：按当前规则（forbid / 书架前 N 本 / 本地已下载 / 诗集类后缀 / 归一化书名命中 ebook-info / 与 dup 或 new 内先前条目重名）再判一次；已属 dup 的迁入 `dup_books` 并从 new 删除
+2. **回扫 new_books**：按当前规则（forbid / 本地已下载 / 同名同作者命中 ebook-info / 与 dup 或 new 内先前条目同名同作者 / 书架前 N 本）再判一次；已属 dup 的迁入 `dup_books` 并从 new 删除
 3. **回扫 dup_books**：按当前规则不再算重复的，迁回 `new_books`。只救回三类，避免把历史误入 dup 的普通书一并捞出：
    - 书名含期刊期数括号（第N期/辑/卷/册/本、年份等）
-   - 书名以 诗集/全集/选集/诗选/词选 结尾（`new-suffix`）
+   - 同名但作者对不上（旧规则按书名误判，`new-diff-author`）
    - `ID` 落在书架前 N 本里（`new-head`）
 
    forbid / 本地已下载仍留 dup。
 4. 已出现在 `dup_books` 或 `new_books` 的 ID → 跳过（可重复运行）
-5. 已占用书名集合 = `dup_books` ∪ `new_books` 中所有归一化主书名
-6. 对剩余 todo 按上面规则分类；每处理一本（无论 dup/new）都把其主书名加入已占用集合，**追加**写入（不覆盖已有内容）
-7. 汇报：forbid 数、本地已下载数、前 N 本规则命中的 ID 数、跳过的空书名残行数、new→dup 迁移数、dup→new 迁回数、本轮 dup/new 及原因拆分（含 `shelf-title-dup` / `new-head` / `new-suffix`）
+5. 已占用集合 = `dup_books` ∪ `new_books` 中所有「归一化主书名 → 作者 token 集」
+6. 对剩余 todo 按上面规则分类；每处理一本（无论 dup/new）都把「主书名 + 作者」加入已占用集合，**追加**写入（不覆盖已有内容）
+7. 汇报：forbid 数、本地已下载数、前 N 本规则命中的 ID 数、跳过的空书名残行数、new→dup 迁移数、dup→new 迁回数、本轮 dup/new 及原因拆分（含 `shelf-title-dup` / `new-head` / `new-diff-author`）
 
 
 ## 重要：导出后必须重跑
@@ -140,7 +143,7 @@ python dedupe_shelf_books.py --head-new-count 0
 1. 生成清单：`python dedupe_shelf_books.py`
 2. 批量导出：`python export_precise.py --list data/new_books.txt ...`
 3. **导出一批后立刻再跑** `python dedupe_shelf_books.py`  
-   → 脚本会把 new 里已下载的 ID **迁移**到 `dup_books.txt`（原因 `downloaded`），并顺带清掉 new 内按当前规则已属 dup 的条目；同时把 dup 里带期刊期数、按当前规则不再算重复的条目 **迁回** new
+   → 脚本会把 new 里已下载的 ID **迁移**到 `dup_books.txt`（原因 `downloaded`），并顺带清掉 new 内按当前规则已属 dup 的条目；同时把 dup 里带期刊期数、同名异作者、前 500 本等按当前规则不再算重复的条目 **迁回** new
 
 若只看「上次生成的 new_books」而不重跑，会误以为 skill 没剔除已下载书——那是**清单过期**，不是匹配逻辑失效。可用 `--dry-run` 先看将迁移多少本。
 
@@ -151,7 +154,8 @@ python dedupe_shelf_books.py --head-new-count 0
 - **只追加** dup/new（迁移清理 new 时例外会重写）
 - 空书名不参与书名占用（无法归一化出 key）
 - **空书名残行直接跳过**：`shelf_books.txt` 里被换行拆散的残行（如 `编,,`、`副主编,,`）不参与判重、也不写进 dup/new，脚本会汇报跳过条数
-- 前 N 本规则只按 `shelf_books.txt` 当前顺序生效；`--head-new-count 0` 关闭
+- 前 N 本规则只按 `shelf_books.txt` 当前顺序生效；`--head-new-count 0` 关闭。它不越过 forbid、已下载、同名同作者这三条
+- 作者比对是**人名 token 取交集**的启发式：异体字/繁体/别名对不上时会把同书当新书（如 `钱钟书` vs `钱锺书`、`余佳韵` vs `余佳韻`、`松原郎` vs `松原朗`、`孟棨` vs `孟启`）。这类书若要剔除，直接加进 `data/forbid_books.txt`
 - 不要手改匹配逻辑绕过脚本；若规则要变，改 `dedupe_shelf_books.py` 与本 skill（两处 skill 文件保持一致）
 - 期刊期数只识别括号内（或标题正文里已有）的「第N期/辑/卷/册/本」「第N本第N期」及年份；`第N版`、`全N册`、`套装`、不含「第」的丛书名（如 `聚学文丛三辑`）仍当装饰去掉
 
@@ -160,3 +164,4 @@ python dedupe_shelf_books.py --head-new-count 0
 - 脚本：`dedupe_shelf_books.py`
 - 单测：`tests/test_dedupe_shelf_books.py`
 - 书名归一化入口：`normalize_title()`
+- 作者比对入口：`author_tokens()` / `authors_match()`
