@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import dedupe_shelf_books
 from dedupe_shelf_books import (
     author_tokens,
     authors_match,
@@ -16,6 +17,13 @@ from dedupe_shelf_books import (
     parse_shelf_line,
     run,
 )
+
+ZHCONV_AVAILABLE = dedupe_shelf_books.zhconv is not None
+
+
+def occ(title: str, author: str, order=(0, 0), other_id: str = "other-id"):
+    """造一条「占用」记录：同名同作者的另一本，默认顺序键排在当前这本之前。"""
+    return {normalize_title(title): [(other_id, author_tokens(author), order)]}
 
 
 class TestNormalizeTitle(unittest.TestCase):
@@ -186,6 +194,26 @@ class TestAuthorTokens(unittest.TestCase):
         self.assertTrue(authors_match(author_tokens(""), author_tokens("陈铁民 选注")))
         self.assertTrue(authors_match(author_tokens("佚名"), author_tokens("")))
 
+    def test_variant_and_typo_tolerance(self):
+        # 三字以上、只差一个字：异体字/形近字（池北偶谈 王士禛 / 王士祯）
+        self.assertTrue(
+            authors_match(author_tokens("[清]王士禛"), author_tokens("[清]王士祯 尹小林 审校"))
+        )
+        self.assertTrue(
+            authors_match(author_tokens("松原郎"), author_tokens("【日】松原朗"))
+        )
+        self.assertTrue(
+            authors_match(author_tokens("钱钟书"), author_tokens("钱锺书 选注"))
+        )
+        # 两字姓名只差一字不认：李白 / 李贺 是两个人
+        self.assertFalse(authors_match(author_tokens("李白"), author_tokens("李贺")))
+
+    @unittest.skipUnless(ZHCONV_AVAILABLE, "未安装 zhconv")
+    def test_traditional_to_simplified(self):
+        self.assertTrue(
+            authors_match(author_tokens("歐陽修"), author_tokens("欧阳修"))
+        )
+
 
 class TestParseAndLoad(unittest.TestCase):
     def test_parse_shelf_line(self):
@@ -313,7 +341,8 @@ class TestClassify(unittest.TestCase):
             forbid_ids=set(),
             downloaded_ids=set(),
             ebook_keys={},
-            seen_title_authors={"词品": {author_tokens("甲某")}},
+            occupied=occ("词品", "甲某"),
+            order=(1, 2),
         )
         self.assertEqual((bucket, reason), ("dup", "shelf-title-dup"))
 
@@ -325,9 +354,52 @@ class TestClassify(unittest.TestCase):
             forbid_ids=set(),
             downloaded_ids=set(),
             ebook_keys={},
-            seen_title_authors={"词品": {author_tokens("甲某")}},
+            occupied=occ("词品", "甲某"),
+            order=(1, 2),
         )
         self.assertEqual((bucket, reason), ("new", "new-diff-author"))
+
+    def test_shelf_title_same_book_kept_when_earliest(self):
+        """同名同作者但对方排在后面（自己是最靠前那本）→ 不算重复。"""
+        bucket, reason = classify_book(
+            "sid2",
+            "词品（珍藏本）",
+            "甲某",
+            forbid_ids=set(),
+            downloaded_ids=set(),
+            ebook_keys={},
+            occupied=occ("词品", "甲某", order=(1, 9)),
+            order=(1, 2),
+        )
+        self.assertEqual((bucket, reason), ("new", "new"))
+
+    def test_shelf_title_stale_entry_blocks(self):
+        """不在书架上的历史条目（顺序键 (0, n)）仍然占位。"""
+        bucket, reason = classify_book(
+            "sid2",
+            "词品",
+            "甲某",
+            forbid_ids=set(),
+            downloaded_ids=set(),
+            ebook_keys={},
+            occupied=occ("词品", "甲某", order=(0, 3)),
+            order=(1, 2),
+        )
+        self.assertEqual((bucket, reason), ("dup", "shelf-title-dup"))
+
+    def test_shelf_title_dup_with_variant_author(self):
+        """已下载那本是「王士禛」，书架这本写「王士祯」→ 仍是同一本，判 dup。"""
+        bucket, reason = classify_book(
+            "sid2",
+            "池北偶谈",
+            "[清]王士祯 尹小林 审校",
+            forbid_ids=set(),
+            downloaded_ids=set(),
+            ebook_keys={},
+            occupied=occ("池北偶谈", "[清]王士禛"),
+            order=(1, 2),
+        )
+        self.assertEqual((bucket, reason), ("dup", "shelf-title-dup"))
 
     def test_shelf_title_dup_after_higher_priority(self):
         # forbid 优先于重名
@@ -338,7 +410,8 @@ class TestClassify(unittest.TestCase):
             forbid_ids={"sid"},
             downloaded_ids=set(),
             ebook_keys={},
-            seen_title_authors={"词品": {author_tokens("甲某")}},
+            occupied=occ("词品", "甲某"),
+            order=(1, 2),
         )
         self.assertEqual((bucket, reason), ("dup", "forbid"))
 
@@ -385,7 +458,8 @@ class TestClassify(unittest.TestCase):
             forbid_ids=set(),
             downloaded_ids=set(),
             ebook_keys=ebook_keys,
-            seen_title_authors={"词品": {author_tokens("沈雄")}},
+            occupied=occ("词品", "沈雄"),
+            order=(1, 2),
             head_new_ids={"sid"},
         )
         self.assertEqual((bucket, reason), ("new", "new-head"))
@@ -495,7 +569,8 @@ class TestMigrateAndRun(unittest.TestCase):
             self.assertEqual(result["new"], 3)
             self.assertEqual(result["reasons"]["downloaded"], 1)
             self.assertEqual(result["reasons"]["ebook-info"], 1)
-            self.assertEqual(result["reasons"]["new-diff-author"], 2)
+            # 古今词话（杨湜 vs 沈雄）、续词品 与 续词品（注释本）（杨夔生 vs 另一人）
+            self.assertEqual(result["reasons"]["new-diff-author"], 3)
             dup_text = dup.read_text(encoding="utf-8")
             new_text = new.read_text(encoding="utf-8")
             self.assertIn("idforbid", dup_text)

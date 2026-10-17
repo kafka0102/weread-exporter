@@ -1,1 +1,4 @@
 playwright>=1.40
+# 书架去重（dedupe_shelf_books.py）：作者名繁简归一；没装也能跑，只是
+# 「歐陽修 / 欧阳修」这类写法对不上，会当新书
+zhconv>=1.4
