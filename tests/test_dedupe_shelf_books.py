@@ -13,6 +13,7 @@ from dedupe_shelf_books import (
     normalize_title,
     parse_shelf_line,
     run,
+    title_keeps_name,
 )
 
 
@@ -148,6 +149,26 @@ class TestNormalizeTitle(unittest.TestCase):
         )
 
 
+class TestTitleKeepsName(unittest.TestCase):
+    """以诗集/全集/选集/诗选/词选结尾的书名不参与按名字判重。"""
+
+    def test_suffix_hits(self):
+        for title in [
+            "白居易诗选",
+            "唐诗选：上下",
+            "唐诗选-上下",
+            "李太白全集",
+            "乐府诗集",
+            "陶渊明诗文选集",
+            "词选",
+        ]:
+            self.assertTrue(title_keeps_name(title), title)
+
+    def test_suffix_misses(self):
+        for title in ["词品", "续词品", "全唐诗", "花间集", "", None]:
+            self.assertFalse(title_keeps_name(title), title)
+
+
 class TestParseAndLoad(unittest.TestCase):
     def test_parse_shelf_line(self):
         self.assertEqual(
@@ -264,6 +285,62 @@ class TestClassify(unittest.TestCase):
         )
         self.assertEqual((bucket, reason), ("dup", "forbid"))
 
+    def test_suffix_title_ignores_ebook_info_and_shelf_dup(self):
+        """诗集/全集/选集/诗选/词选 结尾：ebook-info 同名、书架同名都不算 dup。"""
+        ebook_keys = {"白居易诗选": [{"bookName": "白居易诗选", "authorName": "孙明君"}]}
+        bucket, reason = classify_book(
+            "sid",
+            "白居易诗选",
+            forbid_ids=set(),
+            downloaded_ids=set(),
+            ebook_keys=ebook_keys,
+            seen_title_keys={"白居易诗选"},
+        )
+        self.assertEqual((bucket, reason), ("new", "new-suffix"))
+
+    def test_suffix_title_still_forbid_and_downloaded(self):
+        bucket, reason = classify_book(
+            "sid",
+            "李太白全集",
+            forbid_ids={"sid"},
+            downloaded_ids=set(),
+            ebook_keys={},
+        )
+        self.assertEqual((bucket, reason), ("dup", "forbid"))
+        bucket, reason = classify_book(
+            "sid2",
+            "李太白全集",
+            forbid_ids=set(),
+            downloaded_ids={"sid2"},
+            ebook_keys={},
+        )
+        self.assertEqual((bucket, reason), ("dup", "downloaded"))
+
+    def test_head_new_ids_override_downloaded_and_ebook_info(self):
+        """书架前 N 本：不在 forbid 里就一律当新书。"""
+        ebook_keys = {"词品": [{"bookName": "词品"}]}
+        bucket, reason = classify_book(
+            "sid",
+            "词品",
+            forbid_ids=set(),
+            downloaded_ids={"sid"},
+            ebook_keys=ebook_keys,
+            seen_title_keys={"词品"},
+            head_new_ids={"sid"},
+        )
+        self.assertEqual((bucket, reason), ("new", "new-head"))
+
+    def test_head_new_ids_still_forbid_first(self):
+        bucket, reason = classify_book(
+            "sid",
+            "词品",
+            forbid_ids={"sid"},
+            downloaded_ids=set(),
+            ebook_keys={},
+            head_new_ids={"sid"},
+        )
+        self.assertEqual((bucket, reason), ("dup", "forbid"))
+
 
 class TestMigrateAndRun(unittest.TestCase):
     def test_migrate_downloaded_from_new(self):
@@ -333,6 +410,7 @@ class TestMigrateAndRun(unittest.TestCase):
                 dup_path=dup,
                 new_path=new,
                 books_dir=books,
+                head_new_count=0,
                 dry_run=False,
             )
             self.assertEqual(result["todo"], 6)
@@ -486,6 +564,7 @@ class TestMigrateAndRun(unittest.TestCase):
                 dup_path=dup,
                 new_path=new,
                 books_dir=books,
+                head_new_count=0,
                 dry_run=False,
             )
             self.assertEqual(result["new"], 2)
@@ -496,6 +575,144 @@ class TestMigrateAndRun(unittest.TestCase):
             self.assertIn("id1,古今词话,[宋]杨湜", new_text)
             self.assertIn("id3,词品,甲", new_text)
             self.assertIn("id2,古今词话,沈雄", dup_text)
+
+    def _make_case(self, td_path: Path, shelf_text: str, ebook_entries: list[dict]):
+        shelf = td_path / "shelf.txt"
+        forbid = td_path / "forbid.txt"
+        ebook = td_path / "ebook.json"
+        dup = td_path / "dup.txt"
+        new = td_path / "new.txt"
+        books = td_path / "books"
+        books.mkdir()
+        shelf.write_text(shelf_text, encoding="utf-8")
+        forbid.write_text("", encoding="utf-8")
+        ebook.write_text(
+            json.dumps(ebook_entries, ensure_ascii=False), encoding="utf-8"
+        )
+        dup.write_text("", encoding="utf-8")
+        new.write_text("", encoding="utf-8")
+        return shelf, forbid, ebook, dup, new, books
+
+    def test_run_keeps_suffix_title_but_dedupes_other(self):
+        """诗选结尾的书：ebook-info 同名也当新书；其他书名照旧判 dup。"""
+        with tempfile.TemporaryDirectory() as td:
+            paths = self._make_case(
+                Path(td),
+                "id1,王维诗选,王志清\nid2,词品,杨慎\n",
+                [
+                    {"bookName": "王维诗选", "authorName": "陈铁民 选注"},
+                    {"bookName": "词品", "authorName": "杨慎"},
+                ],
+            )
+            shelf, forbid, ebook, dup, new, books = paths
+            result = run(
+                shelf_path=shelf,
+                forbid_path=forbid,
+                ebook_path=ebook,
+                dup_path=dup,
+                new_path=new,
+                books_dir=books,
+                head_new_count=0,
+                dry_run=False,
+            )
+            self.assertEqual(result["reasons"]["new-suffix"], 1)
+            self.assertEqual(result["reasons"]["ebook-info"], 1)
+            self.assertIn("id1,王维诗选,王志清", new.read_text(encoding="utf-8"))
+            self.assertIn("id2,词品,杨慎", dup.read_text(encoding="utf-8"))
+
+    def test_run_head_new_count_overrides_downloaded(self):
+        """书架前 N 本（不含 forbid）连「本地已下载」也忽略。"""
+        with tempfile.TemporaryDirectory() as td:
+            paths = self._make_case(
+                Path(td),
+                "idforbid,禁书,人\nid1,已下载甲,人\nid2,已下载乙,人\n",
+                [],
+            )
+            shelf, forbid, ebook, dup, new, books = paths
+            forbid.write_text("idforbid\n", encoding="utf-8")
+            (books / "id1_已下载甲.json").write_text("{}", encoding="utf-8")
+            (books / "id2_已下载乙.json").write_text("{}", encoding="utf-8")
+            result = run(
+                shelf_path=shelf,
+                forbid_path=forbid,
+                ebook_path=ebook,
+                dup_path=dup,
+                new_path=new,
+                books_dir=books,
+                head_new_count=3,
+                dry_run=False,
+            )
+            # 前 3 本里除 forbid 外都是 new-head
+            self.assertEqual(result["reasons"]["new-head"], 2)
+            self.assertEqual(result["reasons"]["forbid"], 1)
+            new_text = new.read_text(encoding="utf-8")
+            self.assertIn("id1,已下载甲,人", new_text)
+            self.assertIn("id2,已下载乙,人", new_text)
+
+            # 关掉前 N 本规则后，已下载的回到 dup
+            result = run(
+                shelf_path=shelf,
+                forbid_path=forbid,
+                ebook_path=ebook,
+                dup_path=dup,
+                new_path=new,
+                books_dir=books,
+                head_new_count=0,
+                dry_run=False,
+            )
+            self.assertEqual(result["migrated_dup_to_new"], 0)
+            dup_text = dup.read_text(encoding="utf-8")
+            self.assertIn("id1,已下载甲,人", dup_text)
+            self.assertIn("id2,已下载乙,人", dup_text)
+
+    def test_migrate_dup_to_new_for_head_and_suffix(self):
+        """dup 里前 N 本、以及诗集结尾的书，按新规则迁回 new。"""
+        with tempfile.TemporaryDirectory() as td:
+            new_p = Path(td) / "new.txt"
+            dup_p = Path(td) / "dup.txt"
+            new_p.write_text("", encoding="utf-8")
+            dup_p.write_text(
+                "head1,全唐诗,佚名\nsuf1,王维诗选,王志清\nplain1,文学概论讲义,老舍\n",
+                encoding="utf-8",
+            )
+            moved = migrate_stale_from_dup(
+                dup_p,
+                new_p,
+                forbid_ids=set(),
+                downloaded_ids=set(),
+                ebook_keys={"王维诗选": [{"bookName": "王维诗选"}]},
+                head_new_ids={"head1"},
+                dry_run=False,
+            )
+            moved_ids = {parse_shelf_line(line)[0] for line, _reason in moved}
+            self.assertEqual(moved_ids, {"head1", "suf1"})
+            new_text = new_p.read_text(encoding="utf-8")
+            self.assertIn("head1,全唐诗,佚名", new_text)
+            self.assertIn("suf1,王维诗选,王志清", new_text)
+            self.assertIn("plain1,文学概论讲义,老舍", dup_p.read_text(encoding="utf-8"))
+
+    def test_run_skips_empty_title_rows(self):
+        """抓取残行（空书名）不写进 new。"""
+        with tempfile.TemporaryDirectory() as td:
+            paths = self._make_case(
+                Path(td),
+                "id1,词品,杨慎\n编,,\n",
+                [],
+            )
+            shelf, forbid, ebook, dup, new, books = paths
+            result = run(
+                shelf_path=shelf,
+                forbid_path=forbid,
+                ebook_path=ebook,
+                dup_path=dup,
+                new_path=new,
+                books_dir=books,
+                head_new_count=0,
+                dry_run=False,
+            )
+            self.assertEqual(result["skipped_empty_title"], 1)
+            self.assertEqual(result["todo"], 1)
+            self.assertNotIn("编,,", new.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -8,9 +8,16 @@
 - 压缩空白与期数标点后全等 → 视为重复
 - 书架（及 new/dup 已处理列表）中同主书名只保留第一本，其余进 dup
 
+两条例外（2026-10-17）：
+- **书名以诗集/全集/选集/诗选/词选结尾**：个人诗集常重名，不按名字判重（跳过
+  ebook-info 与书架重名），只有 forbid / 本地已下载仍判 dup。
+- **书架前 HEAD_NEW_COUNT 本（默认 500，按 shelf_books.txt 顺序）**：只要不在 forbid
+  里就一律当新书（连「本地已下载」也不排除），已在 dup 的会迁回 new。
+
 用法：
     python dedupe_shelf_books.py
     python dedupe_shelf_books.py --dry-run
+    python dedupe_shelf_books.py --head-new-count 0   # 关闭前 N 本规则
     BOOKS_DIR=~/data/weixin/books python dedupe_shelf_books.py
 """
 from __future__ import annotations
@@ -32,6 +39,11 @@ DEFAULT_FORBID = DATA_DIR / "forbid_books.txt"
 DEFAULT_EBOOK_INFO = DATA_DIR / "ebook-info.json"
 DEFAULT_DUP = DATA_DIR / "dup_books.txt"
 DEFAULT_NEW = DATA_DIR / "new_books.txt"
+
+# 书架前 N 本：不在 forbid 里就一律当新书（按 shelf_books.txt 顺序数）
+HEAD_NEW_COUNT = 500
+# 以这些后缀结尾的书名不按名字判重（个人诗集常重名，仍需保留）
+KEEP_NAME_SUFFIXES = ("诗集", "全集", "选集", "诗选", "词选")
 
 # 半角/全角括号内容（非嵌套，循环处理；期数括号保留内文）
 _PAREN_RE = re.compile(r"[（(]([^（）()]*)[）)]")
@@ -122,6 +134,21 @@ def _replace_paren(match: re.Match[str]) -> str:
 def _title_keeps_issue_paren(title: str) -> bool:
     """原书名是否含应保留的期数括号。"""
     return any(_is_issue_paren(m.group(1)) for m in _PAREN_RE.finditer(str(title or "")))
+
+
+def title_keeps_name(title: str | None) -> bool:
+    """书名（原文或归一化后）是否以诗集/全集/选集/诗选/词选结尾。
+
+    命中的书名不参与「按名字判重」（ebook-info 同名、书架内重名），
+    因为个人诗集常重名但仍需保留。
+    """
+    raw = str(title or "").strip()
+    if not raw:
+        return False
+    for text in (normalize_title(raw), raw):
+        if text.endswith(KEEP_NAME_SUFFIXES):
+            return True
+    return False
 
 
 def normalize_title(title: str | None) -> str:
@@ -283,6 +310,7 @@ def migrate_stale_from_new(
     forbid_ids: set[str],
     downloaded_ids: set[str],
     ebook_keys: dict[str, list[dict]],
+    head_new_ids: set[str] | None = None,
     dry_run: bool = False,
 ) -> list[tuple[str, str]]:
     """把 new 中按当前规则已属 dup 的书迁到 dup。
@@ -310,6 +338,7 @@ def migrate_stale_from_new(
             downloaded_ids=downloaded_ids,
             ebook_keys=ebook_keys,
             seen_title_keys=seen_title_keys,
+            head_new_ids=head_new_ids,
         )
         if bucket == "dup":
             moved.append((line.rstrip("\n"), reason))
@@ -336,12 +365,14 @@ def migrate_stale_from_dup(
     forbid_ids: set[str],
     downloaded_ids: set[str],
     ebook_keys: dict[str, list[dict]],
+    head_new_ids: set[str] | None = None,
     dry_run: bool = False,
 ) -> list[tuple[str, str]]:
-    """把 dup 中「含期刊期数」且按当前规则不再算重复的书迁回 new。
+    """把 dup 中按当前规则不再算重复的书迁回 new。
 
-    只救回括号内带期数/卷次/年份的条目，避免把历史误入 dup 的普通书一并捞出。
-    forbid / 本地已下载 / ebook-info / 同主书名已占用的仍留 dup。
+    救回三类：括号内带期数/卷次/年份的条目、以诗集/全集/选集/诗选/词选结尾的书名、
+    书架前 N 本（不在 forbid 里）。其余普通书仍留 dup，避免把历史误入 dup 的条目一并捞出。
+    forbid / 本地已下载仍留 dup。
     返回 [(raw_line, reason), ...]。
     """
     if not dup_path.is_file():
@@ -363,9 +394,14 @@ def migrate_stale_from_dup(
             downloaded_ids=downloaded_ids,
             ebook_keys=ebook_keys,
             seen_title_keys=seen_title_keys,
+            head_new_ids=head_new_ids,
         )
         raw = line.rstrip("\n")
-        if bucket == "new" and _title_keeps_issue_paren(title):
+        if bucket == "new" and (
+            _title_keeps_issue_paren(title)
+            or title_keeps_name(title)
+            or (head_new_ids is not None and book_id in head_new_ids)
+        ):
             moved.append((raw, reason))
         else:
             keep.append(raw)
@@ -408,16 +444,23 @@ def classify_book(
     downloaded_ids: set[str],
     ebook_keys: dict[str, list[dict]],
     seen_title_keys: set[str] | None = None,
+    head_new_ids: set[str] | None = None,
 ) -> tuple[str, str]:
     """返回 (bucket, reason)。bucket 为 'dup' 或 'new'。
 
     seen_title_keys：已占用的归一化主书名（书架/new/dup 内先前条目）。
     命中时原因 shelf-title-dup；调用方负责在处理后把当前书名加入该集合。
+    head_new_ids：书架前 N 本的 ID（不在 forbid 里就一律当新书，原因 new-head）。
+    书名以诗集/全集/选集/诗选/词选结尾时不按名字判重（原因 new-suffix）。
     """
     if book_id in forbid_ids:
         return "dup", "forbid"
+    if head_new_ids and book_id in head_new_ids:
+        return "new", "new-head"
     if book_id in downloaded_ids:
         return "dup", "downloaded"
+    if title_keeps_name(title):
+        return "new", "new-suffix"
     key = normalize_title(title)
     if key and key in ebook_keys:
         return "dup", "ebook-info"
@@ -443,6 +486,7 @@ def run(
     dup_path: Path = DEFAULT_DUP,
     new_path: Path = DEFAULT_NEW,
     books_dir: Path | None = None,
+    head_new_count: int = HEAD_NEW_COUNT,
     dry_run: bool = False,
 ) -> dict:
     if not shelf_path.is_file():
@@ -454,6 +498,14 @@ def run(
     forbid_ids = load_forbid_ids(forbid_path)
     downloaded_ids = load_downloaded_ids(books_dir)
     ebook_keys = load_ebook_title_keys(ebook_path)
+    all_shelf_rows = load_shelf_lines(shelf_path)
+    # 空书名行（抓取时被换行拆散的残行）既不能导出也不能参与判重，直接跳过
+    shelf = [row for row in all_shelf_rows if row[1].strip()]
+    skipped_empty_title = len(all_shelf_rows) - len(shelf)
+    # 书架前 N 本（不在 forbid 里的一律当新书）
+    head_new_ids = (
+        {row[0] for row in shelf[:head_new_count]} if head_new_count > 0 else set()
+    )
 
     moved_pairs = migrate_stale_from_new(
         new_path,
@@ -461,6 +513,7 @@ def run(
         forbid_ids=forbid_ids,
         downloaded_ids=downloaded_ids,
         ebook_keys=ebook_keys,
+        head_new_ids=head_new_ids,
         dry_run=dry_run,
     )
     rescued_pairs = migrate_stale_from_dup(
@@ -469,6 +522,7 @@ def run(
         forbid_ids=forbid_ids,
         downloaded_ids=downloaded_ids,
         ebook_keys=ebook_keys,
+        head_new_ids=head_new_ids,
         dry_run=dry_run,
     )
     moved = [line for line, _ in moved_pairs]
@@ -498,7 +552,6 @@ def run(
         new_path
     )
 
-    shelf = load_shelf_lines(shelf_path)
     todo = [row for row in shelf if row[0] not in processed]
 
     dup_lines: list[str] = []
@@ -508,6 +561,8 @@ def run(
         "downloaded": 0,
         "ebook-info": 0,
         "shelf-title-dup": 0,
+        "new-head": 0,
+        "new-suffix": 0,
         "new": 0,
     }
 
@@ -519,6 +574,7 @@ def run(
             downloaded_ids=downloaded_ids,
             ebook_keys=ebook_keys,
             seen_title_keys=seen_title_keys,
+            head_new_ids=head_new_ids,
         )
         reasons[reason] = reasons.get(reason, 0) + 1
         key = normalize_title(title)
@@ -540,6 +596,9 @@ def run(
         "books_dir_exists": books_dir.is_dir(),
         "forbid_count": len(forbid_ids),
         "downloaded_count": len(downloaded_ids),
+        "head_new_count": head_new_count,
+        "head_new_ids": len(head_new_ids),
+        "skipped_empty_title": skipped_empty_title,
         "migrated_new_to_dup": len(moved),
         "migrated_reasons": moved_reasons,
         "migrated_dup_to_new": len(rescued),
@@ -563,6 +622,12 @@ def _print_report(result: dict) -> None:
         f"{'' if result['books_dir_exists'] else '（目录不存在，已跳过）'}"
     )
     print(f"books_dir: {result['books_dir']}")
+    print(
+        f"书架前 {result.get('head_new_count', 0)} 本规则: "
+        f"{result.get('head_new_ids', 0)} 个 ID（不在 forbid 里的一律当新书）"
+    )
+    if result.get("skipped_empty_title"):
+        print(f"跳过空书名残行: {result['skipped_empty_title']} 行")
     print(f"本轮 new→dup 迁移: {result['migrated_new_to_dup']} 本")
     mr = result.get("migrated_reasons") or {}
     if mr:
@@ -590,6 +655,8 @@ def _print_report(result: dict) -> None:
         f"downloaded={r.get('downloaded', 0)}, "
         f"ebook-info={r.get('ebook-info', 0)}, "
         f"shelf-title-dup={r.get('shelf-title-dup', 0)}, "
+        f"new-head={r.get('new-head', 0)}, "
+        f"new-suffix={r.get('new-suffix', 0)}, "
         f"new={r.get('new', 0)}"
     )
     if result["dry_run"]:
@@ -618,6 +685,12 @@ def main(argv: list[str] | None = None) -> int:
         help=f"本地已导出目录（默认 {BOOKS_DIR}）",
     )
     parser.add_argument(
+        "--head-new-count",
+        type=int,
+        default=HEAD_NEW_COUNT,
+        help=f"书架前 N 本不在 forbid 里就一律当新书（默认 {HEAD_NEW_COUNT}，0=关闭）",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="只汇报，不写 dup/new",
@@ -631,6 +704,7 @@ def main(argv: list[str] | None = None) -> int:
             dup_path=args.dup,
             new_path=args.new,
             books_dir=args.books_dir,
+            head_new_count=args.head_new_count,
             dry_run=args.dry_run,
         )
     except FileNotFoundError as e:
