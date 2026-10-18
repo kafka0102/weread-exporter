@@ -113,6 +113,24 @@ class TestBookJsonHelpers(unittest.TestCase):
             4.0,
         )
 
+    def test_export_dir_chapters_use_numeric_chapter_order(self):
+        """超过 9999 章时章号是 5 位：字典序会把 10000.md 排到 1001.md 前面。"""
+        with tempfile.TemporaryDirectory() as td:
+            book_dir = Path(td) / "output" / "bid"
+            md_dir = book_dir / "chapters"
+            raw_dir = book_dir / "raw"
+            md_dir.mkdir(parents=True)
+            raw_dir.mkdir(parents=True)
+            for idx, title in ((1, "潘阆"), (1001, "陌上郎"), (10000, "刘珙")):
+                (md_dir / f"{idx:04d}.md").write_text(
+                    f"# {title}\n\n正文。\n", encoding="utf-8"
+                )
+                (raw_dir / f"{idx:04d}.json").write_text(
+                    json.dumps({"title": title}), encoding="utf-8"
+                )
+            pairs = book_json.load_chapters_from_export_dir(book_dir)
+            self.assertEqual([name for name, _md in pairs], ["潘阆", "陌上郎", "刘珙"])
+
     def test_batch_list_and_filter_pending(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

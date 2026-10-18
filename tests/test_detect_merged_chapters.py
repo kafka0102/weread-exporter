@@ -315,6 +315,22 @@ class ScanDirectoryTests(unittest.TestCase):
             self.assertEqual(result["findings"][0]["book_id"], "cccc3333")
             self.assertEqual(result["findings"][0]["level"], "严重")
 
+    def test_output_chapters_use_numeric_chapter_order(self):
+        """5 位章号（10000.md）不能按字典序排到最前，否则最大章编号错位。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            chapter_dir = Path(tmp) / "output" / "dddd4444" / "chapters"
+            chapter_dir.mkdir(parents=True)
+            for idx in (1001, 2001, 3001, 4001):
+                (chapter_dir / f"{idx:04d}.md").write_text(
+                    f"# 第{idx}章\n\n" + "正文内容。" * 40, encoding="utf-8"
+                )
+            (chapter_dir / "10000.md").write_text(
+                "# 后记\n\n" + "正文内容。" * 40000, encoding="utf-8"
+            )
+            result = dm.analyze_chapter_mds(chapter_dir)
+            self.assertIsNotNone(result)
+            self.assertEqual(result["top_index"], 5)
+
     def test_tsv_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "report.tsv"

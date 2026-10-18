@@ -412,5 +412,32 @@ class TestCountRepeatedChapter(unittest.TestCase):
         )
 
 
+class TestReplaySkipStreak(unittest.TestCase):
+    """连续跳过「已导出章」的计数：整段回放的识别依据。"""
+
+    def test_streak_accumulates_across_titles(self):
+        """回放是逐章往前推进的（标题一直在变），换章不能清零。"""
+        state = {}
+        for i, title in enumerate(("满庭霜·述怀", "满庭霜·和前", "满庭霜·再和"), 1):
+            self.assertEqual(
+                export_precise.count_replay_skip_streak(state, title), i
+            )
+        self.assertEqual(state["last_title"], "满庭霜·再和")
+
+    def test_reset_on_new_chapter_saved(self):
+        state = {}
+        export_precise.count_replay_skip_streak(state, "满庭霜·述怀")
+        export_precise.count_replay_skip_streak(state, "满庭霜·和前")
+        export_precise.reset_replay_skip_streak(state)
+        self.assertEqual(state["hits"], 0)
+        self.assertEqual(
+            export_precise.count_replay_skip_streak(state, "满庭霜·再和"), 1
+        )
+
+    def test_limit_is_a_whole_book_replay_not_a_rewind(self):
+        """回退重抓只回放刚过去的几章，阈值必须明显高于它。"""
+        self.assertGreaterEqual(export_precise.REPLAY_EXPORTED_SKIP_LIMIT, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

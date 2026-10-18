@@ -30,6 +30,19 @@ def book_json_filename(book_id: str, title: str) -> str:
     return f"{book_id}_{safe_book_title_for_filename(title)}.json"
 
 
+def chapter_file_order(path: Path) -> tuple[int, str]:
+    """章文件排序键：按章号数值升序。
+
+    章号只补零到 4 位，超过 9999 章的书会出现 5 位名（`10000.md`）；
+    字典序会把 `10000.md` 排到 `1001.md` 前面，成品 JSON 的章序整段错乱。
+    """
+    stem = path.stem
+    try:
+        return (int(stem), stem)
+    except ValueError:
+        return (-1, stem)
+
+
 def book_json_exists(out_dir: str | Path, book_id: str) -> bool:
     """out_dir 下是否已有以 `{book_id}_` 开头的 json（不依赖书名是否变化）。"""
     root = Path(out_dir)
@@ -219,7 +232,10 @@ def load_chapters_from_export_dir(book_dir: str | Path) -> list[tuple[str, str]]
     if not md_dir.is_dir():
         return []
 
-    files = sorted(p for p in md_dir.iterdir() if p.is_file() and p.suffix == ".md")
+    files = sorted(
+        (p for p in md_dir.iterdir() if p.is_file() and p.suffix == ".md"),
+        key=chapter_file_order,
+    )
     result: list[tuple[str, str]] = []
     for md_path in files:
         md_text = md_path.read_text(encoding="utf-8")

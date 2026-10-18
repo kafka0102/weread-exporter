@@ -1678,11 +1678,36 @@ def disk_chapter_titles(md_dir) -> list[str]:
         return []
     raw_dir = os.path.join(os.path.dirname(md_dir), "raw")
     titles: list[str] = []
-    for fn in sorted(f for f in os.listdir(md_dir) if f.endswith(".md")):
+    for fn in list_chapter_files(md_dir):
         title = _md_chapter_title(os.path.join(md_dir, fn), raw_dir)
         if title:
             titles.append(title)
     return titles
+
+
+def chapter_file_number(name: str) -> int:
+    """章文件名（`0007.md`）→ 章号；非纯数字名返回 -1（排在正常章之前）。"""
+    base = name[:-3] if name.endswith(".md") else name
+    try:
+        return int(base)
+    except ValueError:
+        return -1
+
+
+def list_chapter_files(md_dir) -> list[str]:
+    """按章号数值升序列出 `.md` 章文件。
+
+    章号只补零到 4 位，超过 9999 章的书会出现 5 位名（`10000.md`）。
+    字典序会把 `10000.md` 排到 `1001.md` 前面，于是「最后一章」被认成
+    `9999.md`：续传锚点回退到书中部、目录对齐整段错位（历史事故：全宋词
+    12260 章被判成 9999 章，续传从目录 10039 项起把全书回放一遍）。
+    """
+    if not md_dir or not os.path.isdir(md_dir):
+        return []
+    return sorted(
+        (f for f in os.listdir(md_dir) if f.endswith(".md")),
+        key=chapter_file_number,
+    )
 
 
 # 回退重抓比对用的压缩：去空白/零宽字符/缺字占位符（□ 之类渲染差异不算改动）
@@ -1717,7 +1742,7 @@ def exported_chapter_texts(md_dir) -> dict[str, dict]:
     if not md_dir or not os.path.isdir(md_dir):
         return out
     raw_dir = os.path.join(os.path.dirname(md_dir), "raw")
-    for fn in sorted(f for f in os.listdir(md_dir) if f.endswith(".md")):
+    for fn in list_chapter_files(md_dir):
         path = os.path.join(md_dir, fn)
         key = compact_title_key(_md_chapter_title(path, raw_dir))
         if not key:
@@ -1802,6 +1827,30 @@ def count_repeated_chapter(state: dict, title: str) -> int:
         state["hits"] = 0
     state["hits"] = int(state.get("hits", 0)) + 1
     return state["hits"]
+
+
+# 连续跳过这么多「已导出章」就认定阅读器在整段回放：线性翻页只会把整本书空跑一遍
+REPLAY_EXPORTED_SKIP_LIMIT = 12
+# 单个会话里最多为「整段回放」点几次目录重新定位，避免反复点目录把位置点乱
+MAX_REPLAY_RESYNCS = 1
+
+
+def count_replay_skip_streak(state: dict, title: str) -> int:
+    """累计「连续跳过已导出章」次数；落盘过新章才清零（见 reset_replay_skip_streak）。
+
+    回退重抓只回放刚过去的几章，跑完就回到新内容；连续十几章全是已导出章，
+    说明续传锚点落后于阅读器位置（或目录跳转没落地），此时应重新定位续传点，
+    而不是把已导出的正文一章章空翻过去。
+    """
+    state["last_title"] = title or ""
+    state["hits"] = int(state.get("hits", 0)) + 1
+    return state["hits"]
+
+
+def reset_replay_skip_streak(state: dict) -> None:
+    """落盘新章后清零「连续跳过已导出章」计数。"""
+    state["hits"] = 0
+    state["last_title"] = ""
 
 
 def split_rewind_blocks(blocks, back_title) -> tuple[list, list]:
@@ -1943,10 +1992,9 @@ def match_disk_chapters_to_catalog(md_dir, catalog_titles) -> list[tuple[int, in
     cat_keys = [chapter_title_match_key(t) for t in catalog_titles]
     out: list[tuple[int, int | None]] = []
     cursor = 0
-    for fn in sorted(f for f in os.listdir(md_dir) if f.endswith(".md")):
-        try:
-            idx = int(fn[:-3])
-        except ValueError:
+    for fn in list_chapter_files(md_dir):
+        idx = chapter_file_number(fn)
+        if idx < 0:
             continue
         key = chapter_title_match_key(_md_chapter_title(os.path.join(md_dir, fn), raw_dir))
         hit = None
@@ -2050,8 +2098,7 @@ def merged_titles_in_dominant_chapter(md_dir, catalog_titles) -> list[str]:
         return []
     paths = [
         os.path.join(md_dir, f)
-        for f in sorted(os.listdir(md_dir))
-        if f.endswith(".md")
+        for f in list_chapter_files(md_dir)
     ]
     sizes = {}
     for path in paths:
@@ -2839,10 +2886,10 @@ async def wait_stable(page, prev_count=0, timeout=8):
 def get_last_chapter_title(md_dir):
     if not os.path.exists(md_dir):
         return None, 0
-    files = sorted(f for f in os.listdir(md_dir) if f.endswith(".md"))
+    files = list_chapter_files(md_dir)
     if not files:
         return None, 0
-    idx = int(files[-1].replace(".md", ""))
+    idx = max(chapter_file_number(files[-1]), 0)
     # 优先 raw json 的 title（避免空标题 md 首行变成「#」）
     title = _md_chapter_title(
         os.path.join(md_dir, files[-1]), os.path.join(os.path.dirname(md_dir), "raw")
@@ -4179,6 +4226,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         # 重复章计数状态：只有「同一章反复出现」才算死循环，
         # 回退重抓时逐章回放（标题在变）不能累加成死循环
         dup_chapter_state: dict = {}
+        # 连续跳过「已导出章」的计数（落盘新章清零）：整段回放的识别依据
+        replay_skip_state: dict = {}
+        replay_resync_needed = False
+        replay_resync_used = 0
         # 已导出章正文摘要（磁盘 + 本会话）：识别回退重抓，见 commit_chapter
         exported_texts = exported_chapter_texts(md_dir)
         # 最近一次实际落盘的章号：章间等待日志里显示「刚完成第 N/总 章」
@@ -4207,9 +4258,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             )
         # 跨会话也识别「同一章同一正文」：续传重开后避免附录重复落盘
         try:
-            for name in sorted(
-                f for f in os.listdir(md_dir) if f.endswith(".md")
-            )[-12:]:
+            for name in list_chapter_files(md_dir)[-12:]:
                 md_path = os.path.join(md_dir, name)
                 with open(md_path, encoding="utf-8") as mf:
                     body = mf.read()
@@ -4583,6 +4632,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             """
             nonlocal total_chars, total_imgs, chapters_this_session, reached_end
             nonlocal last_saved_idx
+            nonlocal replay_resync_needed
             # 回退重抓防护：同名章已在磁盘导出且正文高度重合（或本章没抓到正文）
             # → 阅读器退回了已导出章节，不能占新章号，否则成品出现重复章、
             # 章号与目录错位，最后还会被去重计数误判成死循环。
@@ -4592,6 +4642,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     f"  ↩  已导出章重复出现「{(title or '')[:32]}」"
                     f"（{repeat_why}），跳过落盘、不占章号"
                 )
+                streak = count_replay_skip_streak(replay_skip_state, title)
+                if streak >= REPLAY_EXPORTED_SKIP_LIMIT and not replay_resync_needed:
+                    replay_resync_needed = True
+                    print(
+                        f"  ↩  连续 {streak} 章都是已导出内容（整段回放），"
+                        f"停止线性翻页，准备重新定位续传点"
+                    )
                 return 0, [], False
             # 同名占位空章（「顶栏超前且无正文」时先写的）补到真正文：直接覆盖原文件，
             # 不新增章号，免得同一章在成品里出现「空章 + 正文章」两份。
@@ -4645,6 +4702,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             saved_chapter_fps.add(fp)
             # 本章正文登记进摘要，后续回退重抓到同一章时按重抓跳过
             remember_exported_text(title, blocks)
+            # 有新章落盘说明已经走出回放，连续跳过计数清零
+            reset_replay_skip_streak(replay_skip_state)
             total_chars += n
             total_imgs += len(imgs)
             last_saved_idx = ch_idx
@@ -4816,6 +4875,49 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         break
 
         while not reached_end:
+            # 整段回放已导出内容（续传锚点落后/目录跳转没落地）：
+            # 继续线性翻页只会把整本书空翻一遍，改为重新定位到续传点。
+            if replay_resync_needed:
+                replay_resync_needed = False
+                streak = int(replay_skip_state.get("hits", 0))
+                reset_replay_skip_streak(replay_skip_state)
+                anchor_title, _anchor_idx = get_last_chapter_title(md_dir)
+                target = (
+                    next_catalog_title(catalog_titles, anchor_title)
+                    if anchor_title else None
+                )
+                if target and replay_resync_used < MAX_REPLAY_RESYNCS:
+                    replay_resync_used += 1
+                    print(
+                        f"    … 回放纠偏：连续 {streak} 章已导出内容，"
+                        f"目录重新定位到续传点「{target[:24]}」"
+                    )
+                    landed = await jump_catalog_and_reanchor(
+                        target,
+                        reason="回放已导出章，重定位续传点",
+                        clear_buffer=True,
+                    )
+                    if landed and compact_title_key(landed) != compact_title_key(
+                            current_chapter):
+                        current_chapter = landed
+                        page_num = 0
+                        stale = 0
+                        turn_method_idx = 0
+                        empty_page_streak = 0
+                        empty_header_resync = 0
+                        header_multi_ahead_hits = 0
+                        await capture_current_page()
+                        while await split_if_next_chapter_started():
+                            if reached_end:
+                                break
+                        continue
+                # 续传点已是最新（或重定位没推进）：线性翻页没有可抓的新内容，
+                # 结束本会话，交给外层按已有产物收尾（缺口由补漏阶段处理）。
+                print(
+                    f"    … 回放结束：续传点「{(target or anchor_title or '')[:24]}」"
+                    f"已是已导出内容，结束本会话（按已有产物收尾）"
+                )
+                break
             # 搜索框/目录开着时方向键不会翻页，且会把字打进搜索
             await dismiss_reader_search(page)
             catalog_blocking = False
@@ -5807,7 +5909,7 @@ async def export_one_book(
                 "成品 JSON 缺这些章，建议用 detect_merged_chapters 复检后重抓。"
             )
 
-    total_files = sorted(f for f in os.listdir(md_dir) if f.endswith(".md"))
+    total_files = list_chapter_files(md_dir)
     if not total_files:
         raise RuntimeError(f"章节目录为空，无法写 JSON：{md_dir}")
     if not book_title:

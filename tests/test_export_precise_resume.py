@@ -46,6 +46,77 @@ class TestDiskChapterTitles(unittest.TestCase):
             )
 
 
+class TestChapterFileOrdering(unittest.TestCase):
+    """超过 9999 章的书章号是 5 位（`10000.md`），不能按字典序排。
+
+    全宋词 12260 章的历史事故：字典序把 `9999.md` 当成最后一章，续传锚点
+    回退到书中部（目录第 10039 项），随后把已导出的两千多章整段回放。
+    """
+
+    def write_wide_book(self, tmp, chapters):
+        """造 5 位章号的产物目录；chapters 为 [(章号, 章名)]。"""
+        md_dir = Path(tmp) / "chapters"
+        raw_dir = Path(tmp) / "raw"
+        md_dir.mkdir(parents=True, exist_ok=True)
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        for idx, title in chapters:
+            (md_dir / f"{idx:04d}.md").write_text(
+                f"# {title}\n\n正文。\n", encoding="utf-8"
+            )
+            (raw_dir / f"{idx:04d}.json").write_text(
+                json.dumps({"title": title, "images": [], "text_len": 3}),
+                encoding="utf-8",
+            )
+        return str(md_dir)
+
+    def test_list_chapter_files_sorts_by_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = self.write_wide_book(
+                tmp, [(1, "潘阆"), (1001, "陌上郎"), (9999, "踏莎行·秋思"),
+                      (10000, "刘珙"), (12260, "曹休齐")]
+            )
+            self.assertEqual(
+                export_precise.list_chapter_files(md_dir),
+                ["0001.md", "1001.md", "9999.md", "10000.md", "12260.md"],
+            )
+
+    def test_last_chapter_is_largest_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = self.write_wide_book(
+                tmp, [(9999, "踏莎行·秋思"), (12260, "曹休齐")]
+            )
+            self.assertEqual(
+                export_precise.get_last_chapter_title(md_dir), ("曹休齐", 12260)
+            )
+
+    def test_disk_titles_follow_chapter_numbers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = self.write_wide_book(
+                tmp, [(1, "潘阆"), (1001, "陌上郎"), (10000, "刘珙")]
+            )
+            self.assertEqual(
+                export_precise.disk_chapter_titles(md_dir),
+                ["潘阆", "陌上郎", "刘珙"],
+            )
+
+    def test_catalog_alignment_does_not_cascade(self):
+        """字典序会把 5 位章号排到最前，贪心对齐后整段对不上（9033 章误报缺失）。"""
+        catalog = ["潘阆", "陌上郎", "踏莎行·秋思", "刘珙", "曹休齐"]
+        chapters = [
+            (1, "潘阆"), (1001, "陌上郎"), (9999, "踏莎行·秋思"),
+            (10000, "刘珙"), (12260, "曹休齐"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = self.write_wide_book(tmp, chapters)
+            self.assertEqual(
+                export_precise.match_disk_chapters_to_catalog(md_dir, catalog),
+                [(1, 0), (1001, 1), (9999, 2), (10000, 3), (12260, 4)],
+            )
+            self.assertEqual(
+                export_precise.missing_catalog_positions(md_dir, catalog), []
+            )
+
+
 class TestStaleChapterArtifacts(unittest.TestCase):
     def test_healthy_export_is_not_flagged(self):
         catalog = ["扉页", "版权信息", "第一卷 起源", "第二卷 发展", "后记"]

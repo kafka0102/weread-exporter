@@ -456,9 +456,22 @@ def analyze_book_json(
     return result
 
 
+def chapter_md_order(path: Path) -> tuple[int, str]:
+    """章文件排序键：按章号数值升序。
+
+    章号只补零到 4 位，超过 9999 章的书会出现 5 位名（`10000.md`）；
+    字典序会把 `10000.md` 排到 `1001.md` 前面，体检出的章序与占比都会错位。
+    """
+    stem = path.stem
+    try:
+        return (int(stem), stem)
+    except ValueError:
+        return (-1, stem)
+
+
 def analyze_chapter_mds(chapter_dir: Path, **kwargs) -> dict | None:
     """体检中间产物目录 output/<id>/chapters 下的 md（用于没有成品 JSON 的书）。"""
-    paths = sorted(chapter_dir.glob("*.md"))
+    paths = sorted(chapter_dir.glob("*.md"), key=chapter_md_order)
     if not paths:
         return None
     body = []
