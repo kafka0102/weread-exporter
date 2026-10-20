@@ -22,6 +22,7 @@
 - **books 目录（books dir）**：默认 `~/data/weixin/books/`（环境变量 `BOOKS_DIR` / CLI `--out-dir` 可覆盖），存放已成功导出的 book json。判断“已导出”时按文件名 `book_id_` 前缀匹配，不依赖书名是否变化。
 - **章间动态 sleep（chapter sleep）**：一章抓取完成后，按该章纯文本字数计算等待秒数：`clamp(ceil(chars/2000)*SLEEP_CHAPTER_PER_2K_CHARS, SLEEP_CHAPTER_MIN, SLEEP_CHAPTER_MAX)`，再开始下一章。
 - **书间间隔（book interval）**：批量导出相邻两本书之间的固定等待，配置项 `SLEEP_BOOK_INTERVAL`（默认 60 秒）。
+- **目录对齐进度（disk catalog progress）**：把 `output/<id>/chapters` 的章文件按**章号数值序**与 `_catalog.json` 做保序贪心对齐（`match_disk_chapters_to_catalog`），取最后一条对齐到的目录项当作「已抓进度」。续传锚点、回放纠偏、停滞前进、外层收尾一律按它取「下一章」，**不用** `catalog_index` 的「同名第一项」：目录里同名章（组诗，如两组乐章都有「迎神/迎俎/亚献终献/送神」）会把进度读回开头，锚点退到已导出章上，会话只能整段空翻、连续重开直到 RuntimeError（李纾诗全集事故，见 `docs/reports/repeated-chapter-titles-2026-10-20.md`）。实现：`disk_catalog_progress` / `disk_next_catalog_target` / `is_disk_export_complete` / `disk_resume_target`；对齐不出进度（还没有章文件、目录与产物完全不同名）时退回同名查找。注意目录抓取阶段仍按标题去重，重名项不会进 `_catalog.json`（遗留见该报告第五节）。
 
 ## 关键决策
 
