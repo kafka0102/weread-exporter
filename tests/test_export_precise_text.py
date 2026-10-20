@@ -143,11 +143,48 @@ class TestCatalogTitleCleaning(unittest.TestCase):
         )
         self.assertEqual(export_precise.normalize_catalog_title("#"), "")
 
-    def test_clean_catalog_titles_dedupes(self):
+    def test_clean_catalog_titles_keeps_repeats(self):
+        """同名章是真章不是噪声：只清洗，不按标题去重。
+
+        去重按**条目位置**做（`merge_catalog_harvest`）：李纾诗全集两组乐章都有
+        「迎神」，全宋词 17305 项里有 5007 项与前面某章同名。按标题去重会让
+        续传、补漏把这些真章当成已抓过而静默跳过。
+        """
         titles = export_precise.clean_catalog_titles(
-            ["版权信息", "版权信息", "导言", "王国维当前读到 99%", ""]
+            ["迎神", "奠币", "迎神", "王国维当前读到 99%", ""]
         )
-        self.assertEqual(titles, ["版权信息", "导言", "王国维"])
+        self.assertEqual(titles, ["迎神", "奠币", "迎神", "王国维"])
+
+    def test_dedupe_catalog_titles_for_legacy_heuristics(self):
+        """旧启发式（下一章/末章/正文越章）用去重视图，位置类判断用完整目录。"""
+        full = ["扉页", "迎神", "奠币", "迎神", "送神", "送神"]
+        self.assertEqual(
+            export_precise.dedupe_catalog_titles(full),
+            ["扉页", "迎神", "奠币", "送神"],
+        )
+
+    def test_catalog_title_occurrences(self):
+        """同名章计数：>1 时按标题跳转必然可能跳错（要按序号点）。"""
+        catalog = ["扉页", "迎神", "奠币", "迎神", "送神", "送神"]
+        self.assertEqual(
+            export_precise.catalog_title_occurrences(catalog, "迎神"), 2)
+        self.assertEqual(
+            export_precise.catalog_title_occurrences(catalog, "奠币"), 1)
+        self.assertEqual(
+            export_precise.catalog_title_occurrences(catalog, "不存在"), 0)
+
+    def test_catalog_index_progress_window(self):
+        """目录序号 → 阅读进度区间：并章/同名页的落地兜底判定。"""
+        self.assertEqual(
+            export_precise.catalog_index_progress_window(0, 17), (0.0, 15.0))
+        low, high = export_precise.catalog_index_progress_window(11, 17)
+        self.assertLess(low, 68.75)
+        self.assertGreater(high, 68.75)
+        # 单项目录 / 非法入参退化为全区间，不误判
+        self.assertEqual(
+            export_precise.catalog_index_progress_window(0, 1), (0.0, 100.0))
+        self.assertEqual(
+            export_precise.catalog_index_progress_window(None, 0), (0.0, 100.0))
 
     def test_catalog_index_fuzzy(self):
         catalog = ["导言", "李白", "张志和"]
@@ -158,6 +195,64 @@ class TestCatalogTitleCleaning(unittest.TestCase):
         self.assertEqual(export_precise.display_chapter_title("", 3), "0003")
         self.assertEqual(export_precise.display_chapter_title("李白", 3), "李白")
 
+
+
+class TestCatalogHarvestMerge(unittest.TestCase):
+    """目录按**条目位置**去重：重复 harvest 合并，真的重名章保留。
+
+    目录面板全量渲染（全宋词 17305 项一次全在 DOM，行高固定 54px），
+    条目在滚动内容里的偏移就是它的身份。
+    """
+
+    def test_repeated_harvest_collapses(self):
+        positions: dict = {}
+        batch = [
+            {"pos": 0, "title": "扉页"},
+            {"pos": 54, "title": "迎神"},
+            {"pos": 108, "title": "送神"},
+        ]
+        export_precise.merge_catalog_harvest(batch, positions)
+        export_precise.merge_catalog_harvest(batch, positions)
+        self.assertEqual([positions[k] for k in sorted(positions)],
+                         ["扉页", "迎神", "送神"])
+
+    def test_same_title_at_different_positions_is_kept(self):
+        """同名章位置不同 = 两章，必须都留下（按标题去重会吞掉后者）。"""
+        positions: dict = {}
+        export_precise.merge_catalog_harvest(
+            [
+                {"pos": 54, "title": "迎神"},
+                {"pos": 594, "title": "迎神"},
+                {"pos": 648, "title": "送神"},
+                {"pos": 864, "title": "送神"},
+            ],
+            positions,
+        )
+        self.assertEqual(
+            [positions[k] for k in sorted(positions)],
+            ["迎神", "迎神", "送神", "送神"],
+        )
+
+    def test_jitter_and_bad_rows_are_ignored(self):
+        positions: dict = {}
+        export_precise.merge_catalog_harvest(
+            [
+                {"pos": 100, "title": "浣溪沙"},
+                {"pos": 101, "title": "浣溪沙"},   # 同一项的亚像素抖动
+                {"pos": 9999, "title": ""},         # 空标题
+                {"pos": None, "title": "坏数据"},    # 位置缺失
+                "not-a-dict",
+            ],
+            positions,
+        )
+        self.assertEqual([positions[k] for k in sorted(positions)], ["浣溪沙"])
+
+    def test_titles_are_normalized(self):
+        positions: dict = {}
+        export_precise.merge_catalog_harvest(
+            [{"pos": 0, "title": "王国维当前读到 99%"}], positions
+        )
+        self.assertEqual(positions[0], "王国维")
 
 
 class TestChapterOrdinalPrefixAlignment(unittest.TestCase):

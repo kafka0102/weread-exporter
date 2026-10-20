@@ -1387,7 +1387,65 @@ def split_chapter_ordinal_prefix(text: str) -> tuple[str, str]:
 
 
 def clean_catalog_titles(titles) -> list[str]:
-    """清洗目录列表：去进度污染、去空、保序去重。"""
+    """清洗目录列表：去进度污染、去空、保序。
+
+    **不按标题去重**：目录里同名章是常态而不是噪声——全宋词真实目录 17305 项
+    里有 5007 项与前面某章同名（「浣溪沙」出现 178 次、「菩萨蛮」143 次），
+    李纾诗全集两组乐章都有「迎神/迎俎/亚献终献/送神」。按标题去重会让续传、
+    补漏把这些真章当成已抓过而静默跳过，成品悄悄少章。
+    重复渲染由 `scrape_catalog_titles` 按条目位置去重解决（见
+    `merge_catalog_harvest`）。
+    """
+    out: list[str] = []
+    for raw in titles or []:
+        title = normalize_catalog_title(str(raw or ""))
+        if not title:
+            continue
+        out.append(title)
+    return out
+
+
+# 目录条目位置容差（像素）：同一项多次 harvest 的偏移抖动不超过这个范围
+CATALOG_POSITION_JITTER = 2
+
+
+def merge_catalog_harvest(rows, positions: dict) -> None:
+    """把一次目录 harvest 并入「条目位置 → 章名」表（就地更新）。
+
+    目录面板是**全量渲染**（全宋词 17305 项一次全在 DOM 里，行高固定 54px），
+    每个条目在滚动内容里的偏移固定，所以位置就是条目的身份：
+
+    - 滚动/重复 harvest 拿到的同一项 → 位置相同 → 合并掉，不产生重复项；
+    - 真的重名章（全宋词 5007 项、李纾诗全集「迎神/迎俎」等）→ 位置不同 →
+      两个都留下，不会被「按标题去重」吞掉。
+
+    rows 为 `[{pos, title}]`（见 `CATALOG_HARVEST_JS`）；位置抖动按
+    `CATALOG_POSITION_JITTER` 容差合并。
+    """
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            pos = int(row.get("pos"))
+        except (TypeError, ValueError):
+            continue
+        title = normalize_catalog_title(str(row.get("title") or ""))
+        if not title:
+            continue
+        jitter = range(pos - CATALOG_POSITION_JITTER, pos + CATALOG_POSITION_JITTER + 1)
+        if any(probe in positions for probe in jitter):
+            continue
+        positions[pos] = title
+
+
+def dedupe_catalog_titles(titles) -> list[str]:
+    """按标题保序去重（旧式视图）。
+
+    目录里同名章是真实的，但会话里大量**按标题**的旧启发式（下一章、末章判定、
+    正文越章切分）都假定章名唯一——喂进同名项会互相打转（实测：李纾诗全集
+    重导时「正文越章：逻辑「迎神」→「迎神」」空转）。所以位置类判断用完整目录
+    （`catalog_positions`），旧启发式继续用这份去重视图。
+    """
     out: list[str] = []
     seen: set[str] = set()
     for raw in titles or []:
@@ -1397,6 +1455,18 @@ def clean_catalog_titles(titles) -> list[str]:
         seen.add(title)
         out.append(title)
     return out
+
+
+def catalog_title_occurrences(catalog_titles, title: str) -> int:
+    """目录里同名项的个数。
+
+    大于 1 时**不能**按标题跳转——按标题只会命中第一个同名项（两组乐章都有
+    「迎神/送神」，全宋词「浣溪沙」出现 178 次），跳到别的章去了。
+    """
+    key = compact_title_key(normalize_catalog_title(title))
+    if not key:
+        return 0
+    return sum(1 for t in (catalog_titles or []) if compact_title_key(t) == key)
 
 
 def catalog_index(catalog_titles, title: str):
@@ -1775,6 +1845,55 @@ def exported_chapter_texts(md_dir) -> dict[str, dict]:
     return out
 
 
+def disk_covered_lines(md_dir) -> set[str]:
+    """磁盘所有章正文行的压缩集合（去标题行/图片行）。
+
+    用于「这段正文是不是已经在别的章里」的判定——补漏按目录跳到某个同名项时，
+    阅读器常常把邻章的正文再渲染一遍，落盘就会在成品里插进重复章。
+    """
+    covered: set[str] = set()
+    if not md_dir or not os.path.isdir(md_dir):
+        return covered
+    for fn in list_chapter_files(md_dir):
+        try:
+            with open(os.path.join(md_dir, fn), encoding="utf-8") as f:
+                body = f.read()
+        except OSError:
+            continue
+        for line in body.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("!["):
+                continue
+            covered.add(repeat_compare_text(line))
+    return covered
+
+
+def blocks_already_covered(blocks, covered_lines) -> str:
+    """正文是否已在别的章里出现过 → 返回原因（如「正文 100% 已抓过」）；否则空串。
+
+    与 `repeat_exported_chapter_evidence`（同名章比对）互补：这里比的是**全书
+    任意章**，用于识别「目录项被并进邻章」——那种目录项跳过去抓到的就是邻章
+    正文，落盘只会多出一份重复章。
+    """
+    if not covered_lines:
+        return ""
+    lines = []
+    for block in blocks or []:
+        if block.get("type") != "text":
+            continue
+        for raw in (block.get("text") or "").splitlines():
+            norm = repeat_compare_text(raw.strip())
+            if len(norm) >= REPEAT_EXPORTED_MIN_LINE_LEN:
+                lines.append(norm)
+    if len(lines) < REPEAT_EXPORTED_MIN_LINE_COUNT:
+        return ""
+    hit = sum(1 for line in lines if line in covered_lines)
+    ratio = hit / len(lines)
+    if ratio >= REPEAT_EXPORTED_COVER_RATIO:
+        return f"正文 {int(ratio * 100)}% 已在其他章里"
+    return ""
+
+
 def repeat_exported_chapter_evidence(title, blocks, exported_texts) -> str:
     """当前章是否是「已导出章的回退重抓」→ 返回原因；不是则返回空串。
 
@@ -2098,6 +2217,32 @@ def disk_resume_target(md_dir, catalog_titles, fallback_title: str = ""):
     if not nxt:
         return None, None
     return catalog_index(catalog_titles, nxt), nxt
+
+
+def split_fill_candidates(md_dir, missing) -> tuple[list, list]:
+    """把补漏候选分成 (真缺口, 疑似并章项)。
+
+    - **真缺口**：磁盘上根本没有同名章 → 值得目录跳过去补抓；
+    - **疑似并章项**：同名章已在磁盘、只是没有独立章文件 → 多半是短篇被阅读器
+      并进邻章（李纾诗全集「迎神/迎俎」并进「让皇帝庙乐章/奠币」，全宋词
+      「词牌·副题」并进「词牌」章）。跳过去抓只会把邻章正文重复落盘，因此
+      只报告、不自动补抓（要判并章请跑 detect_merged_chapters.py）。
+    """
+    disk_keys: set[str] = set()
+    for disk_title in disk_chapter_titles(md_dir):
+        key = chapter_title_match_key(disk_title)
+        if key:
+            disk_keys.add(key)
+    real: list = []
+    merged: list = []
+    for item in missing or []:
+        cat_idx, title = item
+        key = chapter_title_match_key(title)
+        if key and key in disk_keys:
+            merged.append((cat_idx, title))
+        else:
+            real.append((cat_idx, title))
+    return real, merged
 
 
 def insertion_file_index(md_dir, catalog_titles, target_catalog_idx: int) -> int:
@@ -3631,25 +3776,34 @@ async def open_reader_catalog(page) -> bool:
 
 
 
+CATALOG_HARVEST_JS = r"""() => {
+    const sc = document.querySelector(
+        '.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]'
+    );
+    const scRect = sc ? sc.getBoundingClientRect() : null;
+    return Array.from(document.querySelectorAll('.readerCatalog_list_item')).map((el) => {
+        const titleEl = el.querySelector(
+            '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
+        );
+        const r = el.getBoundingClientRect();
+        return {
+            title: ((titleEl && titleEl.textContent) || el.textContent || '').trim(),
+            pos: Math.round(scRect ? (r.top - scRect.top + sc.scrollTop) : r.top),
+        };
+    });
+}"""
+
+
 async def scrape_catalog_titles(page) -> list[str]:
-    """打开目录后尽量滚完整表，抓取并清洗全部章名。"""
-    raw_titles: list[str] = []
-    seen: set[str] = set()
+    """打开目录后尽量滚完整表，按条目位置抓取全部章名（保留重名章）。
+
+    位置是条目的身份（见 `merge_catalog_harvest`），所以同名章一个都不会丢；
+    返回顺序即目录顺序。
+    """
+    positions: dict[int, str] = {}
 
     async def harvest():
-        batch = await page.evaluate(
-            """() => Array.from(document.querySelectorAll('.readerCatalog_list_item')).map(el => {
-                const titleEl = el.querySelector(
-                    '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
-                );
-                return ((titleEl && titleEl.textContent) || el.textContent || '').trim();
-            })"""
-        )
-        for t in batch or []:
-            nt = normalize_catalog_title(t)
-            if nt and nt not in seen:
-                seen.add(nt)
-                raw_titles.append(nt)
+        merge_catalog_harvest(await page.evaluate(CATALOG_HARVEST_JS), positions)
 
     await harvest()
     # 虚拟列表：向下滚几次尽量收全
@@ -3682,7 +3836,7 @@ async def scrape_catalog_titles(page) -> list[str]:
         }"""
     )
     await asyncio.sleep(SLEEP_READER_CATALOG_SCROLL)
-    return clean_catalog_titles(raw_titles)
+    return clean_catalog_titles([positions[k] for k in sorted(positions)])
 
 
 async def goto_first_chapter(page, catalog_path=None):
@@ -3716,6 +3870,15 @@ async def goto_first_chapter(page, catalog_path=None):
             await close_reader_catalog(page)
     except Exception as e:
         print(f"  ⚠️  目录跳转异常: {e}")
+    # 阅读器可能停在「上次读到」的位置：点首项后画布抓取缓冲里还留着旧页文本，
+    # 直接抓会把上一页正文并进首页（历史现象：首页混进「版权信息」重复块，或
+    # 中段某章的正文，成品里凭空多出一章重复内容）。先清缓冲再重绘一次。
+    try:
+        await page.evaluate("() => window.__wr_reset && window.__wr_reset()")
+        await force_reader_repaint(page)
+        await wait_stable(page, 0, timeout=2.0)
+    except Exception:
+        pass
     # 顶栏可能滞后/读空：多读几次，仍空则用目录首项
     header = ""
     for _ in range(5):
@@ -3963,9 +4126,179 @@ async def click_catalog_list_item(page, target_title: str = "") -> str:
     return raw
 
 
-async def goto_catalog_chapter(page, target_title: str, catalog_titles=None) -> str:
+async def scroll_catalog_to_index(page, index) -> bool:
+    """按目录序号把目标项滚进视口（列表全量渲染，序号即目录序号）。
+
+    滚动断言两遍：面板刚打开时会自己平滑滚到「当前章」，一次滚动可能被它的
+    动画覆盖，随后按坐标点击就会点到当前章那一行（看起来像「点了没反应」）。
+    """
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        return False
+    try:
+        for _ in range(2):
+            moved = await page.evaluate(
+                """(index) => {
+                    const sc = document.querySelector(
+                        '.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]'
+                    );
+                    const el = Array.from(
+                        document.querySelectorAll('.readerCatalog_list_item')
+                    )[index];
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (sc) {
+                        const cr = sc.getBoundingClientRect();
+                        sc.scrollTop = sc.scrollTop + (r.top - cr.top)
+                            - Math.max(0, (sc.clientHeight - r.height) / 2);
+                    } else {
+                        el.scrollIntoView({block: 'center'});
+                    }
+                    return true;
+                }""",
+                index,
+            )
+            if not moved:
+                return False
+            await asyncio.sleep(max(0.15, float(SLEEP_READER_CATALOG_SCROLL) * 0.3))
+        return True
+    except Exception:
+        return False
+
+
+# 目录序号 ↔ 阅读进度百分比的容差（兜底落地判定用）
+CATALOG_INDEX_PROGRESS_TOLERANCE = 15.0
+
+
+def catalog_index_progress_window(cat_idx, total) -> tuple[float, float]:
+    """目录序号大致对应的阅读进度区间。
+
+    并章页（李纾诗全集「让皇帝庙乐章」页里含「迎神/奠币/迎俎」）与同名章页
+    的顶栏常显示卷/组名、正文首屏也不含目标章名，标题式落地校验会误判；
+    进度百分比与目录序号近似线性，可作粗判兜底。
+    """
+    try:
+        cat_idx = int(cat_idx)
+        total = int(total)
+    except (TypeError, ValueError):
+        return 0.0, 100.0
+    if total <= 1:
+        return 0.0, 100.0
+    expected = 100.0 * max(0, min(cat_idx, total - 1)) / (total - 1)
+    return (
+        max(0.0, expected - CATALOG_INDEX_PROGRESS_TOLERANCE),
+        min(100.0, expected + CATALOG_INDEX_PROGRESS_TOLERANCE),
+    )
+
+
+async def reader_progress_in_catalog_window(
+    page, catalog_titles, cat_idx, *, exclude_pct=None
+) -> bool:
+    """阅读进度是否落在该目录序号对应的区间（且位置确实动过）。"""
+    if cat_idx is None:
+        return False
+    pct = await read_reader_progress_percent(page)
+    if pct is None:
+        return False
+    if exclude_pct is not None and pct == exclude_pct:
+        return False
+    low, high = catalog_index_progress_window(cat_idx, len(catalog_titles or []))
+    return low <= pct <= high
+
+
+async def click_catalog_item_at_index(page, index, expect_title: str = "") -> str:
+    """真实鼠标点目录里第 index 项（0-based）；标题对不上返回空串。
+
+    同名章必须按序号点：两组乐章都有「迎神/送神」、全宋词「浣溪沙」出现 178 次，
+    按标题只会命中**第一个**同名项——续传就落到已导出章上，随后整段空翻。
+    目录序号与 DOM 顺序一一对应（目录全量渲染，抓取时按位置排序，见
+    `merge_catalog_harvest`）；序号对不上（目录文件来自旧版按标题去重的抓取）
+    时返回空串——调用方只在标题**唯一**时才允许退回按标题找。
+    """
+    target = normalize_catalog_title(expect_title)
+    try:
+        index = int(index)
+    except Exception:
+        return ""
+    last_info = None
+    for _ in range(5):
+        try:
+            info = await page.evaluate(
+                r"""(args) => {
+                    const strip = (s) => String(s || '')
+                        .replace(/[\u200b\u200c\u200d\ufeff\u2060]/g, '')
+                        .replace(/(当前读到|已读到|读到)\s*\d+\s*%?\s*$/g, '')
+                        .replace(/\s*\d+\s*%\s*$/g, '')
+                        .trim();
+                    const sc = document.querySelector(
+                        '.readerCatalog_list_scroll_area, [class*="readerCatalog_list_scroll"]'
+                    );
+                    const el = Array.from(
+                        document.querySelectorAll('.readerCatalog_list_item')
+                    )[args.index];
+                    if (!el) return null;
+                    const titleEl = el.querySelector(
+                        '[class*="title"], .readerCatalog_list_item_title, .chapterItem_title'
+                    );
+                    const raw = strip(
+                        (titleEl && titleEl.textContent) || el.textContent || ''
+                    );
+                    const r = el.getBoundingClientRect();
+                    const cr = sc ? sc.getBoundingClientRect() : null;
+                    const visible = cr
+                        ? (r.top >= cr.top - 2 && r.bottom <= cr.bottom + 2)
+                        : true;
+                    if (r.width < 20 || r.height < 10) return null;
+                    return {
+                        raw,
+                        visible,
+                        x: r.x + Math.min(Math.max(r.width / 2, 20), 120),
+                        y: r.y + r.height / 2,
+                    };
+                }""",
+                {"index": index},
+            )
+        except Exception:
+            return ""
+        if not info:
+            return ""
+        raw = normalize_catalog_title(str(info.get("raw") or ""))
+        if target and compact_title_key(raw) != compact_title_key(target):
+            return ""
+        if not info.get("visible"):
+            # 先按容器偏移滚进来再点：scrollIntoView 是平滑滚动，
+            # 紧接着读 rect 会拿到旧坐标，点到别的章上去。
+            await scroll_catalog_to_index(page, index)
+            await asyncio.sleep(max(0.15, float(SLEEP_READER_CATALOG_SCROLL) * 0.3))
+            last_info = None
+            continue
+        # 目录面板打开时会自己滚到当前章（平滑动画）：坐标连着两次一致才点，
+        # 动画途中的坐标会把点击落到隔壁章上。
+        if last_info and abs(last_info["y"] - info["y"]) <= 1 and abs(
+                last_info["x"] - info["x"]) <= 1:
+            try:
+                await page.mouse.click(float(info["x"]), float(info["y"]))
+            except Exception:
+                return ""
+            return raw
+        last_info = info
+        await asyncio.sleep(max(0.1, float(SLEEP_READER_CATALOG_SCROLL) * 0.25))
+    if last_info:
+        try:
+            await page.mouse.click(float(last_info["x"]), float(last_info["y"]))
+        except Exception:
+            return ""
+        return normalize_catalog_title(str(last_info.get("raw") or ""))
+    return ""
+
+
+async def goto_catalog_chapter(page, target_title: str, catalog_titles=None,
+                               cat_idx=None) -> str:
     """打开目录并点击目标章名；成功返回实际点到的清洗标题，失败返回空串。
 
+    cat_idx 给出目标在目录里的序号时优先**按序号点**：同名章按标题只会命中
+    第一个同名项。序号对不上或没给序号时才按标题找。
     点击后必须校验顶栏/正文已落到目标章，避免“点了但还在上一章”。
     失败时务必关闭目录，避免侧栏常开挡住翻页。
     """
@@ -3979,6 +4312,94 @@ async def goto_catalog_chapter(page, target_title: str, catalog_titles=None) -> 
             return ""
 
         land_fails = 0
+
+        def title_ok(hit: str) -> bool:
+            return bool(
+                hit == target
+                or (
+                    hit and target
+                    and (hit in target or target in hit)
+                    and min(len(hit), len(target)) >= 2
+                    and abs(len(hit) - len(target)) <= 12
+                )
+            )
+
+        async def verify_landed(hit: str) -> str:
+            """点击后的落地校验；返回 'ok' / 'retry' / 'giveup'。"""
+            nonlocal land_fails
+            await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
+            await dismiss_reader_search(page)
+            await close_reader_catalog(page)
+            await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
+            for _ in range(4):
+                if not await is_reader_catalog_open(page):
+                    break
+                await close_reader_catalog(page)
+                await asyncio.sleep(0.12)
+            # 点击成功 ≠ 真正跳转成功：必须校验顶栏/正文
+            try:
+                await page.evaluate("() => window.__wr_reset && window.__wr_reset()")
+            except Exception:
+                pass
+            await force_reader_repaint(page)
+            await recover_reader_text_after_nav(page, allow_nudge=False)
+            if await verify_reader_on_chapter(page, target, catalog_titles, retries=3):
+                return "ok"
+            header = await read_chapter_title(page, catalog_titles)
+            land_fails += 1
+            print(
+                f"    … 目录点击后未落到「{target[:20]}」"
+                f"（顶栏「{(header or '空')[:20]}」），"
+                f"关闭目录后重试（{land_fails}/3）"
+            )
+            await close_reader_catalog(page)
+            await asyncio.sleep(0.2)
+            if land_fails >= 3:
+                print(f"  ⚠️  目录跳转「{target[:20]}」连续未落地，放弃并关闭目录")
+                return "giveup"
+            await open_reader_catalog(page)
+            return "retry"
+
+        # 同名章优先按序号点（按标题只会点到第一个同名项）
+        if cat_idx is not None:
+            before_pct = await read_reader_progress_percent(page)
+            for attempt in range(2):
+                if await scroll_catalog_to_index(page, cat_idx):
+                    await asyncio.sleep(
+                        max(0.05, float(SLEEP_READER_CATALOG_SCROLL) * 0.3))
+                hit = await click_catalog_item_at_index(page, cat_idx, target)
+                if not hit or not title_ok(hit):
+                    break
+                print(
+                    f"    … 目录按序号点第 {int(cat_idx) + 1} 项"
+                    f"「{hit[:24]}」{'（重试）' if attempt else ''}"
+                )
+                outcome = await verify_landed(hit)
+                if outcome == "ok":
+                    return hit or target
+                if await reader_progress_in_catalog_window(
+                        page, catalog_titles, cat_idx, exclude_pct=before_pct):
+                    print(
+                        f"    … 目录按序号 {int(cat_idx) + 1} 已落地："
+                        f"顶栏未对齐但阅读进度已进该区间（并章/同名页常见）"
+                    )
+                    return hit or target
+                if outcome == "giveup":
+                    break
+                if not await is_reader_catalog_open(page):
+                    await open_reader_catalog(page)
+            if catalog_title_occurrences(catalog_titles, target) > 1:
+                # 同名章退回按标题找必然跳到第一个同名项，等于跳错章
+                print(
+                    f"  ⚠️  目录「{target[:24]}」有多个同名项，按序号跳转未成功，"
+                    f"放弃按标题兜底（否则会跳到第一个同名项）"
+                )
+                return ""
+
+        if not await is_reader_catalog_open(page):
+            if not await open_reader_catalog(page):
+                print(f"  ⚠️  无法打开目录以跳转「{target}」")
+                return ""
         # 先按 DOM 偏移把目标项精确滚进视口（按索引比例估算会滚过头，目标就再也找不回来）
         scrolled_to = await scroll_catalog_to_title(page, target)
         if scrolled_to:
@@ -4010,57 +4431,16 @@ async def goto_catalog_chapter(page, target_title: str, catalog_titles=None) -> 
             clicked = await click_catalog_list_item(page, target)
             if clicked:
                 hit = normalize_catalog_title(clicked)
-                ok = (
-                    hit == target
-                    or (
-                        hit and target
-                        and (hit in target or target in hit)
-                        and min(len(hit), len(target)) >= 2
-                        and abs(len(hit) - len(target)) <= 12
-                    )
-                )
-                if not ok:
+                if not title_ok(hit):
                     print(
                         f"    … 目录点到「{(hit or '')[:24]}」≠目标「{target[:24]}」，继续滚找"
                     )
                 else:
-                    await asyncio.sleep(SLEEP_READER_CATALOG_CLICK)
-                    await dismiss_reader_search(page)
-                    await close_reader_catalog(page)
-                    await asyncio.sleep(SLEEP_READER_CATALOG_CLOSE)
-                    for _ in range(4):
-                        if not await is_reader_catalog_open(page):
-                            break
-                        await close_reader_catalog(page)
-                        await asyncio.sleep(0.12)
-                    # 点击成功 ≠ 真正跳转成功：必须校验顶栏/正文
-                    try:
-                        await page.evaluate("() => window.__wr_reset && window.__wr_reset()")
-                    except Exception:
-                        pass
-                    await force_reader_repaint(page)
-                    await recover_reader_text_after_nav(page, allow_nudge=False)
-                    landed = await verify_reader_on_chapter(
-                        page, target, catalog_titles, retries=3
-                    )
-                    if landed:
+                    outcome = await verify_landed(hit)
+                    if outcome == "ok":
                         return hit or target
-                    header = await read_chapter_title(page, catalog_titles)
-                    land_fails += 1
-                    print(
-                        f"    … 目录点击后未落到「{target[:20]}」"
-                        f"（顶栏「{(header or '空')[:20]}」），"
-                        f"关闭目录后重试（{land_fails}/3）"
-                    )
-                    await close_reader_catalog(page)
-                    await asyncio.sleep(0.2)
-                    if land_fails >= 3:
-                        print(
-                            f"  ⚠️  目录跳转「{target[:20]}」连续未落地，放弃并关闭目录"
-                        )
+                    if outcome == "giveup":
                         break
-                    if not await open_reader_catalog(page):
-                        continue
                     continue
 
             moved = await page.evaluate(
@@ -4098,7 +4478,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                       reader_width=None, reader_height=None,
                       force_single_page=None, prefer_largest=None):
     reached_end = False
-    catalog_titles = load_catalog_titles(catalog_path) if catalog_path else []
+    # catalog_positions：完整目录（含同名章），位置类判断（进度/下一章/按序号跳转）用；
+    # catalog_titles：按标题去重视图，会话里的旧启发式用（见 dedupe_catalog_titles）。
+    catalog_positions = load_catalog_titles(catalog_path) if catalog_path else []
+    catalog_titles = dedupe_catalog_titles(catalog_positions)
     last_cat_title = catalog_titles[-1] if catalog_titles else ""
     async with async_playwright() as p:
         viewport = reader_viewport(
@@ -4161,10 +4544,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         bootstrap_title = ""
         if goto_first:
             bootstrap_title = await goto_first_chapter(page, catalog_path) or ""
-            catalog_titles = load_catalog_titles(catalog_path) if catalog_path else catalog_titles
+            if catalog_path:
+                catalog_positions = load_catalog_titles(catalog_path)
+            catalog_titles = dedupe_catalog_titles(catalog_positions)
             last_cat_title = catalog_titles[-1] if catalog_titles else ""
         elif catalog_path and not catalog_titles:
-            catalog_titles = load_catalog_titles(catalog_path)
+            catalog_positions = load_catalog_titles(catalog_path)
+            catalog_titles = dedupe_catalog_titles(catalog_positions)
             last_cat_title = catalog_titles[-1] if catalog_titles else ""
 
         await focus_reader_for_keyboard(page)
@@ -4181,18 +4567,18 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             anchor = normalize_catalog_title(from_md_title or "")
             # 续传进度按目录对齐定位：同名章（两组乐章都有「迎神/送神」）不能用
             # 「同名第一项」，否则锚点退到已导出章上，只能整段空翻后重开失败。
-            progress = disk_catalog_progress(md_dir, catalog_titles)
+            progress = disk_catalog_progress(md_dir, catalog_positions)
             if progress:
                 anchor = progress[1]
             # 已导出正文末章后仅剩封底等无正文项：直接视为全书完成
             complete = (
-                is_disk_export_complete(md_dir, catalog_titles)
+                is_disk_export_complete(md_dir, catalog_positions)
                 if progress
                 else bool(anchor) and is_export_complete_after(anchor, catalog_titles)
             )
             if complete:
                 rest = (
-                    list(catalog_titles[progress[0] + 1 :])
+                    list(catalog_positions[progress[0] + 1 :])
                     if progress
                     else catalog_titles_after(catalog_titles, anchor)
                 )
@@ -4203,7 +4589,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 )
                 await page.close(); await ctx.close()
                 return book_title, book_author, 0, 0, start_idx, True, False
-            _nxt_idx, nxt = disk_resume_target(md_dir, catalog_titles, anchor)
+            _nxt_idx, nxt = disk_resume_target(md_dir, catalog_positions, anchor)
             if nxt and is_non_content_catalog_title(nxt):
                 print(
                     f"  … 下一章「{nxt[:24]}」为无正文目录项，视为全书抓取完成"
@@ -4220,7 +4606,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         f"（接在「{(anchor or '')[:24]}」后；"
                         f"顶栏曾是「{(current_chapter or '')[:20]}」）"
                     )
-                    jumped = await goto_catalog_chapter(page, nxt, catalog_titles)
+                    jumped = await goto_catalog_chapter(
+                        page, nxt, catalog_positions, cat_idx=_nxt_idx)
                     for _ in range(3):
                         await close_reader_catalog(page)
                         if not await is_reader_catalog_open(page):
@@ -4314,6 +4701,14 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         replay_resync_used = 0
         # 已导出章正文摘要（磁盘 + 本会话）：识别回退重抓，见 commit_chapter
         exported_texts = exported_chapter_texts(md_dir)
+        # 目录里有同名章时，续传可能跳进「被并进邻章」的目录项，把邻章正文
+        # 再抓一遍：备好全书正文行集合，落盘前挡住这种重复章（见 commit_chapter）。
+        # 目录没有同名章就不会出现这种并章项，不必付这份全量读取的开销。
+        covered_lines = (
+            disk_covered_lines(md_dir)
+            if len(catalog_positions) != len(set(catalog_positions))
+            else set()
+        )
         # 最近一次实际落盘的章号：章间等待日志里显示「刚完成第 N/总 章」
         last_saved_idx = ch_idx
 
@@ -4511,9 +4906,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
 
 
         async def jump_catalog_and_reanchor(
-            target_title: str, *, reason: str, clear_buffer: bool = True
+            target_title: str, *, reason: str, clear_buffer: bool = True,
+            cat_idx=None,
         ) -> str:
-            """有限次目录跳转并重建抓取锚点；成功返回规范章名。"""
+            """有限次目录跳转并重建抓取锚点；成功返回规范章名。
+
+            cat_idx 为目录序号时按序号点（同名章必须按序号，按标题只命中第一个）。
+            """
             nonlocal catalog_jump_count, catalog_jump_failures, page_num, stale
             nonlocal turn_method_idx, skip_first_turn
             target = resolve_chapter_title(target_title, catalog_titles) or normalize_catalog_title(target_title)
@@ -4527,7 +4926,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 f"    … 目录重定位「{target[:24]}」"
                 f"（{reason}；{catalog_jump_count}/{MAX_CATALOG_JUMPS}）"
             )
-            jumped = await goto_catalog_chapter(page, target, catalog_titles)
+            jumped = await goto_catalog_chapter(
+                page, target, catalog_positions, cat_idx=cat_idx)
             for _ in range(3):
                 await close_reader_catalog(page)
                 if not await is_reader_catalog_open(page):
@@ -4755,6 +5155,17 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         f"（编号 {placeholder.get('idx')}），不新增章号"
                     )
                     return n, imgs, False
+            # 同名目录项被阅读器并进邻章时，跳过去只会把邻章正文再抓一遍，
+            # 落盘就在成品里多出一份重复章（目录序号与章号随即错位）。
+            if covered_lines and catalog_title_occurrences(
+                    catalog_positions, title) > 1:
+                covered = blocks_already_covered(blocks, covered_lines)
+                if covered:
+                    print(
+                        f"  ⏭  「{(title or '')[:24]}」{covered}"
+                        f"（同名目录项已并进邻章），跳过落盘、不占章号"
+                    )
+                    return 0, [], False
             fp = chapter_blocks_fingerprint(title, blocks)
             # 停滞前进也用 allow_empty=True 落盘；若仍放行重复指纹，会把同一附录
             # 写成 0039/0040/... 无限编号。有正文时无论是否 allow_empty 都去重。
@@ -4966,7 +5377,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 anchor_title, _anchor_idx = get_last_chapter_title(md_dir)
                 # 续传点同样按目录对齐定位：同名章用「第一项」会把目标指回已导出章
                 _target_idx, target = disk_resume_target(
-                    md_dir, catalog_titles, anchor_title or "")
+                    md_dir, catalog_positions, anchor_title or "")
                 if target and replay_resync_used < MAX_REPLAY_RESYNCS:
                     replay_resync_used += 1
                     print(
@@ -4977,6 +5388,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         target,
                         reason="回放已导出章，重定位续传点",
                         clear_buffer=True,
+                        cat_idx=_target_idx,
                     )
                     if landed and compact_title_key(landed) != compact_title_key(
                             current_chapter):
@@ -5562,10 +5974,10 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     await sleep_between_chapters(n)
             adopt_chapter_blocks([])
             _advance_idx, target = disk_resume_target(
-                md_dir, catalog_titles, current_chapter or "")
+                md_dir, catalog_positions, current_chapter or "")
             if target:
                 advance_to = target
-            elif disk_catalog_progress(md_dir, catalog_titles):
+            elif disk_catalog_progress(md_dir, catalog_positions):
                 # 目录对齐已到末尾：本章就是末章，别再按同名查找回跳
                 advance_to = ""
             if advance_to:
@@ -5577,6 +5989,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                     advance_to,
                     reason="停滞前进到下一章",
                     clear_buffer=True,
+                    cat_idx=_advance_idx,
                 )
                 if landed:
                     current_chapter = landed
@@ -5648,18 +6061,30 @@ async def fill_missing_chapters(
     missing = missing_catalog_positions(md_dir, catalog_titles)
     if not missing:
         return []
-    hint = "、".join(t[:12] for _i, t in missing[:5])
+    real_gaps, merged_like = split_fill_candidates(md_dir, missing)
+    if merged_like:
+        hint = "、".join(t[:12] for _i, t in merged_like[:5])
+        print(
+            f"\n  补漏：{len(merged_like)} 个目录项的同名章已在磁盘"
+            f"（{hint}），正文多半已并进邻章，只报告不补抓"
+            f"（要确认请跑 python detect_merged_chapters.py）"
+        )
+    if not real_gaps:
+        return []
+    hint = "、".join(t[:12] for _i, t in real_gaps[:5])
     print(
-        f"\n  补漏：目录里 {len(missing)} 个正文项没有章文件"
+        f"\n  补漏：目录里 {len(real_gaps)} 个正文项没有章文件"
         f"（{hint}），目录跳转逐章补抓（上限 {max_chapters} 章）"
     )
-    todo = chapters_to_fill(missing, max_chapters)
-    if len(todo) < len(missing):
+    todo = chapters_to_fill(real_gaps, max_chapters)
+    if len(todo) < len(real_gaps):
         print(
-            f"  ⚠️  缺口 {len(missing)} 章超过单次上限 {max_chapters}，"
+            f"  ⚠️  缺口 {len(real_gaps)} 章超过单次上限 {max_chapters}，"
             f"本次按目录顺序先补最前面 {len(todo)} 章；"
-            f"剩余 {len(missing) - len(todo)} 章建议整本重抓"
+            f"剩余 {len(real_gaps) - len(todo)} 章建议整本重抓"
         )
+    # 全书正文行集合：跳过去抓到的内容若已经在别的章里，就别再插一份重复章
+    covered_lines = disk_covered_lines(md_dir)
     seen_imgs: set[str] = set()
     filled = 0
     async with async_playwright() as p:
@@ -5687,7 +6112,8 @@ async def fill_missing_chapters(
                 catalog_titles[cat_idx + 1]
                 if cat_idx + 1 < len(catalog_titles) else ""
             )
-            landed = await goto_catalog_chapter(page, title, catalog_titles)
+            landed = await goto_catalog_chapter(
+                page, title, catalog_titles, cat_idx=cat_idx)
             for _ in range(3):
                 await close_reader_catalog(page)
                 if not await is_reader_catalog_open(page):
@@ -5745,6 +6171,13 @@ async def fill_missing_chapters(
                     f"（顶栏「{(reader_title or '空')[:16]}」），跳过"
                 )
                 continue
+            covered = blocks_already_covered(blocks, covered_lines)
+            if covered:
+                print(
+                    f"  ⏭  补漏「{title[:24]}」{covered}，"
+                    f"不再插入重复章（正文已并进邻章）"
+                )
+                continue
             target_k = insertion_file_index(md_dir, catalog_titles, cat_idx)
             shift_chapter_files(md_dir, raw_dir, target_k)
             n, imgs = save_chapter(title, blocks, target_k, md_dir, raw_dir)
@@ -5759,7 +6192,10 @@ async def fill_missing_chapters(
     renumbered = renumber_chapter_files(md_dir, raw_dir)
     if filled and renumbered:
         print(f"  章号已重排为连续 0001-{renumbered:04d}")
-    rest = [t for _i, t in missing_catalog_positions(md_dir, catalog_titles)]
+    # 并章项不算缺口（正文已在邻章），只有真缺口才算「仍缺」
+    rest_real, _rest_merged = split_fill_candidates(
+        md_dir, missing_catalog_positions(md_dir, catalog_titles))
+    rest = [t for _i, t in rest_real]
     if rest:
         hint = "、".join(t[:12] for t in rest[:5])
         print(f"  补漏结束：补上 {filled} 章，仍缺 {len(rest)} 章（{hint}）")

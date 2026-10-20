@@ -376,5 +376,74 @@ class TestCatalogAlignedProgress(unittest.TestCase):
             )
 
 
+class TestFillCandidates(unittest.TestCase):
+    """补漏候选分类：同名章已在磁盘的当「并章项」，不自动补抓。
+
+    目录里同名章被并进邻章是常态（李纾诗全集「迎神」并进「让皇帝庙乐章」、
+    全宋词「词牌·副题」并进「词牌」章）；按序号跳过去抓只会把邻章正文
+    再落一份，所以这类只在日志里报告。
+    """
+
+    def test_merged_titles_are_split_out(self):
+        catalog = ["扉页", "迎神", "让皇帝庙乐章", "迎神", "送神", "送神"]
+        chapters = [("迎神", "甲"), ("让皇帝庙乐章", "乙"), ("送神", "丙")]
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = write_book_dir(tmp, chapters, catalog)
+            missing = export_precise.missing_catalog_positions(md_dir, catalog)
+            self.assertEqual(
+                [(i, t) for i, t in missing], [(3, "迎神"), (5, "送神")]
+            )
+            real, merged = export_precise.split_fill_candidates(md_dir, missing)
+            self.assertEqual(real, [])
+            self.assertEqual([t for _i, t in merged], ["迎神", "送神"])
+
+    def test_absent_title_is_a_real_gap(self):
+        catalog = ["序", "甲篇", "乙篇"]
+        chapters = [("序", "一")]
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = write_book_dir(tmp, chapters, catalog)
+            missing = export_precise.missing_catalog_positions(md_dir, catalog)
+            real, merged = export_precise.split_fill_candidates(md_dir, missing)
+            self.assertEqual([t for _i, t in real], ["甲篇", "乙篇"])
+            self.assertEqual(merged, [])
+
+
+class TestFillContentCoverage(unittest.TestCase):
+    """补漏抓到的正文若已在别的章里，就别再插一份重复章。"""
+
+    def test_content_already_in_neighbour_chapter(self):
+        chapters = [
+            (
+                "让皇帝庙乐章",
+                "迎神\n\n皇矣天宗，德先王季。\n因心则友，克让以位。\n爰命有司，式尊前志。",
+            ),
+            ("奠币", "惟帝时若，去而上仙。"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = write_book_dir(tmp, chapters, ["让皇帝庙乐章", "奠币"])
+            covered = export_precise.disk_covered_lines(md_dir)
+            blocks = [{
+                "type": "text",
+                "text": "迎神\n\n皇矣天宗，德先王季。\n因心则友，克让以位。",
+            }]
+            self.assertIn(
+                "已在其他章里",
+                export_precise.blocks_already_covered(blocks, covered),
+            )
+
+    def test_new_content_is_not_flagged(self):
+        chapters = [("让皇帝庙乐章", "迎神\n\n皇矣天宗，德先王季。\n因心则友，克让以位。")]
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = write_book_dir(tmp, chapters, ["让皇帝庙乐章"])
+            covered = export_precise.disk_covered_lines(md_dir)
+            blocks = [{
+                "type": "text",
+                "text": "迎神\n\n元尊九德，佐尧光宅。\n烈祖太宗，方周作伯。",
+            }]
+            self.assertEqual(
+                export_precise.blocks_already_covered(blocks, covered), ""
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
