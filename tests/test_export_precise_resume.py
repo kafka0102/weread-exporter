@@ -251,5 +251,130 @@ class TestStaleChapterArtifacts(unittest.TestCase):
             )
 
 
+class TestCatalogAlignedProgress(unittest.TestCase):
+    """续传/收尾进度按目录对齐定位，不能用「同名第一项」。
+
+    李纾诗全集（09032110813ab9f4cg012d20）现场：两组乐章都有
+    「迎神/迎俎/亚献终献/送神」，同名去重后目录只剩 13 项；已导出末章
+    「送神」被同名查找认成第 10 项，于是续传目标退回已导出的
+    「让皇帝庙乐章」——整段空翻、连续重开 7 次后 RuntimeError 收场。
+    """
+
+    def test_tail_beyond_catalog_is_not_replayed(self):
+        """已导出末章落在目录之外（目录被同名去重截断）→ 视为完成，不回跳。"""
+        catalog = [
+            "扉页", "版权信息", "唐德明兴圣庙乐章", "迎神", "送神",
+            "让皇帝庙乐章", "奠币", "酌献",
+        ]
+        chapters = [
+            ("版权信息", "甲"),
+            ("唐德明兴圣庙乐章", "乙"),
+            ("迎神", "丙"),
+            ("送神", "丁"),
+            ("让皇帝庙乐章", "戊"),
+            ("奠币", "己"),
+            ("酌献", "庚"),
+            ("亚献终献", "辛"),
+            ("送神", "壬"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = write_book_dir(tmp, chapters, catalog)
+            self.assertEqual(
+                export_precise.disk_catalog_progress(md_dir, catalog), (7, "酌献")
+            )
+            self.assertEqual(
+                export_precise.disk_resume_target(md_dir, catalog, "送神"),
+                (None, None),
+            )
+            self.assertTrue(
+                export_precise.is_disk_export_complete(md_dir, catalog)
+            )
+            # 对照：同名查找把末章认成第 5 项 → 目标退回已导出的「让皇帝庙乐章」
+            self.assertFalse(
+                export_precise.is_export_complete_after("送神", catalog)
+            )
+            self.assertEqual(
+                export_precise.next_catalog_title(catalog, "送神"), "让皇帝庙乐章"
+            )
+
+    def test_repeated_names_follow_catalog_order(self):
+        """目录里同名章按顺序一一对齐，进度不退回第一项。"""
+        catalog = ["扉页", "迎神", "奠币", "迎神", "送神", "送神"]
+        chapters = [("迎神", "甲"), ("奠币", "乙"), ("迎神", "丙")]
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = write_book_dir(tmp, chapters, catalog)
+            self.assertEqual(
+                export_precise.disk_catalog_progress(md_dir, catalog), (3, "迎神")
+            )
+            self.assertEqual(
+                export_precise.disk_resume_target(md_dir, catalog), (4, "送神")
+            )
+            self.assertFalse(
+                export_precise.is_disk_export_complete(md_dir, catalog)
+            )
+
+    def test_last_repeated_name_counts_as_complete(self):
+        """末章名与前面某章同名时，按对齐位置判完成，而不是同名第一项。"""
+        catalog = ["扉页", "迎神", "送神", "送神"]
+        chapters = [("迎神", "甲"), ("送神", "乙"), ("送神", "丙")]
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = write_book_dir(tmp, chapters, catalog)
+            self.assertEqual(
+                export_precise.disk_catalog_progress(md_dir, catalog), (3, "送神")
+            )
+            self.assertTrue(
+                export_precise.is_disk_export_complete(md_dir, catalog)
+            )
+            self.assertEqual(
+                export_precise.disk_resume_target(md_dir, catalog, "送神"),
+                (None, None),
+            )
+
+    def test_incomplete_progress_still_points_forward(self):
+        catalog = ["导言", "李白", "张志和", "刘禹锡"]
+        chapters = [("导言", "甲"), ("李白", "乙")]
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = write_book_dir(tmp, chapters, catalog)
+            self.assertEqual(
+                export_precise.disk_catalog_progress(md_dir, catalog), (1, "李白")
+            )
+            self.assertEqual(
+                export_precise.disk_resume_target(md_dir, catalog, "李白"),
+                (2, "张志和"),
+            )
+            self.assertFalse(
+                export_precise.is_disk_export_complete(md_dir, catalog)
+            )
+
+    def test_middle_gap_keeps_parity_with_title_check(self):
+        """中间缺项（短章被合并进邻章）仍按「已推进到目录末项」收尾。"""
+        catalog = ["序", "甲", "乙", "丙"]
+        chapters = [("序", "一"), ("乙", "二"), ("丙", "三")]
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = write_book_dir(tmp, chapters, catalog)
+            self.assertTrue(
+                export_precise.is_disk_export_complete(md_dir, catalog)
+            )
+            self.assertTrue(
+                export_precise.is_export_complete_after("丙", catalog)
+            )
+
+    def test_falls_back_to_title_lookup_without_disk_chapters(self):
+        """产物与目录完全对不上（还没有章文件）时退回同名查找。"""
+        catalog = ["导言", "李白", "张志和"]
+        with tempfile.TemporaryDirectory() as tmp:
+            md_dir = write_book_dir(tmp, [], catalog)
+            self.assertIsNone(
+                export_precise.disk_catalog_progress(md_dir, catalog)
+            )
+            self.assertFalse(
+                export_precise.is_disk_export_complete(md_dir, catalog)
+            )
+            self.assertEqual(
+                export_precise.disk_resume_target(md_dir, catalog, "李白"),
+                (2, "张志和"),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

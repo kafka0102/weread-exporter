@@ -2032,6 +2032,74 @@ def missing_catalog_positions(md_dir, catalog_titles) -> list[tuple[int, str]]:
     return out
 
 
+def disk_catalog_progress(md_dir, catalog_titles):
+    """已落盘章在目录里推进到的位置 → (目录序号, 目录章名)；无法对齐时 None。
+
+    按**保序贪心对齐**定位（`match_disk_chapters_to_catalog`），而不是
+    `catalog_index` 的「同名第一项」：目录里同名章（组诗，如两组乐章都有
+    「迎神/送神」）时，第一项会把进度读回开头，续传锚点便退到已导出章上，
+    会话只能整段空翻、反复重开。章文件多过目录（目录抓漏）时，进度停在
+    最后一条对齐项上。
+    """
+    if not catalog_titles:
+        return None
+    last = None
+    for _file_idx, cat_idx in match_disk_chapters_to_catalog(md_dir, catalog_titles):
+        if cat_idx is not None:
+            last = cat_idx
+    if last is None:
+        return None
+    return last, catalog_titles[last]
+
+
+def disk_next_catalog_target(md_dir, catalog_titles):
+    """磁盘进度之后的下一章 → (目录序号, 章名)；已到目录末尾返回 None。"""
+    progress = disk_catalog_progress(md_dir, catalog_titles)
+    if not progress:
+        return None
+    pos = progress[0]
+    if pos + 1 >= len(catalog_titles):
+        return None
+    return pos + 1, catalog_titles[pos + 1]
+
+
+def is_disk_export_complete(md_dir, catalog_titles) -> bool:
+    """已落盘产物是否已推进到目录末尾（其后仅剩无正文项也算完成）。
+
+    与 `is_export_complete_after` 同义，区别是按目录对齐定位进度：末章名
+    与前面某章同名时，不会被「同名第一项」判成「还没抓到」，也就不会把
+    已完成的书拖进反复重开。
+    """
+    progress = disk_catalog_progress(md_dir, catalog_titles)
+    if not progress:
+        return False
+    rest = catalog_titles[progress[0] + 1 :]
+    if not rest:
+        return True
+    return all(is_non_content_catalog_title(t) for t in rest)
+
+
+def disk_resume_target(md_dir, catalog_titles, fallback_title: str = ""):
+    """续传目标章 → (目录序号, 章名)；没有下一章时返回 (None, None)。
+
+    优先按目录对齐取「磁盘进度之后」的下一章；对齐不出进度（还没有章文件、
+    或目录与产物完全不同名）时退回同名查找（`next_catalog_title`）。
+    """
+    if not catalog_titles:
+        return None, None
+    pair = disk_next_catalog_target(md_dir, catalog_titles)
+    if pair:
+        return pair
+    if disk_catalog_progress(md_dir, catalog_titles):
+        # 对齐得到进度且已到目录末尾：确实没有下一章
+        return None, None
+    title = normalize_catalog_title(fallback_title or "")
+    nxt = next_catalog_title(catalog_titles, title) if title else None
+    if not nxt:
+        return None, None
+    return catalog_index(catalog_titles, nxt), nxt
+
+
 def insertion_file_index(md_dir, catalog_titles, target_catalog_idx: int) -> int:
     """补漏章该插到哪个章号之前（1-based）；返回章号，没有更早章时返回 1。"""
     k = 1
@@ -4111,9 +4179,23 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
         if (not goto_first) and start_idx > 1 and catalog_titles:
             from_md_title, _ = get_last_chapter_title(md_dir)
             anchor = normalize_catalog_title(from_md_title or "")
+            # 续传进度按目录对齐定位：同名章（两组乐章都有「迎神/送神」）不能用
+            # 「同名第一项」，否则锚点退到已导出章上，只能整段空翻后重开失败。
+            progress = disk_catalog_progress(md_dir, catalog_titles)
+            if progress:
+                anchor = progress[1]
             # 已导出正文末章后仅剩封底等无正文项：直接视为全书完成
-            if anchor and is_export_complete_after(anchor, catalog_titles):
-                rest = catalog_titles_after(catalog_titles, anchor)
+            complete = (
+                is_disk_export_complete(md_dir, catalog_titles)
+                if progress
+                else bool(anchor) and is_export_complete_after(anchor, catalog_titles)
+            )
+            if complete:
+                rest = (
+                    list(catalog_titles[progress[0] + 1 :])
+                    if progress
+                    else catalog_titles_after(catalog_titles, anchor)
+                )
                 rest_hint = "、".join((t[:12] for t in rest[:3])) if rest else "目录末"
                 print(
                     f"  … 上次「{anchor[:24]}」后仅剩非正文目录项"
@@ -4121,7 +4203,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 )
                 await page.close(); await ctx.close()
                 return book_title, book_author, 0, 0, start_idx, True, False
-            nxt = next_catalog_title(catalog_titles, anchor) if anchor else None
+            _nxt_idx, nxt = disk_resume_target(md_dir, catalog_titles, anchor)
             if nxt and is_non_content_catalog_title(nxt):
                 print(
                     f"  … 下一章「{nxt[:24]}」为无正文目录项，视为全书抓取完成"
@@ -4882,10 +4964,9 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 streak = int(replay_skip_state.get("hits", 0))
                 reset_replay_skip_streak(replay_skip_state)
                 anchor_title, _anchor_idx = get_last_chapter_title(md_dir)
-                target = (
-                    next_catalog_title(catalog_titles, anchor_title)
-                    if anchor_title else None
-                )
+                # 续传点同样按目录对齐定位：同名章用「第一项」会把目标指回已导出章
+                _target_idx, target = disk_resume_target(
+                    md_dir, catalog_titles, anchor_title or "")
                 if target and replay_resync_used < MAX_REPLAY_RESYNCS:
                     replay_resync_used += 1
                     print(
@@ -5459,30 +5540,39 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             advance_to = resolve_stale_advance_target(
                 current_chapter, catalog_titles
             )
+            delta = catalog_index_delta(
+                catalog_titles, current_chapter, new_chapter
+            )
+            why = (
+                f"顶栏超前「{(new_chapter or '')[:16]}」"
+                if delta is not None and delta > 0
+                else "翻页无新内容"
+            )
+            # 先落盘本章，再按「磁盘进度之后的目录项」定前进目标：同名章
+            # （两组乐章都有「迎神/送神」）用同名查找会把目标指回已导出章。
+            n, _imgs, saved = await commit_chapter(
+                current_chapter,
+                ch_blocks,
+                note_suffix=" [停滞前进]",
+                allow_empty=True,
+            )
+            if saved:
+                ch_idx += 1
+                if chapter_saved(n, _imgs):
+                    await sleep_between_chapters(n)
+            adopt_chapter_blocks([])
+            _advance_idx, target = disk_resume_target(
+                md_dir, catalog_titles, current_chapter or "")
+            if target:
+                advance_to = target
+            elif disk_catalog_progress(md_dir, catalog_titles):
+                # 目录对齐已到末尾：本章就是末章，别再按同名查找回跳
+                advance_to = ""
             if advance_to:
-                delta = catalog_index_delta(
-                    catalog_titles, current_chapter, new_chapter
-                )
-                why = (
-                    f"顶栏超前「{(new_chapter or '')[:16]}」"
-                    if delta is not None and delta > 0
-                    else "翻页无新内容"
-                )
                 print(
                     f"    … 停滞前进：{why}，「{(current_chapter or '')[:20]}」"
                     f"→「{advance_to[:20]}」（落盘后目录跳转，避免同章反复重开）"
                 )
-                n, _imgs, saved = await commit_chapter(
-                    current_chapter,
-                    ch_blocks,
-                    note_suffix=" [停滞前进]",
-                    allow_empty=True,
-                )
-                if saved:
-                    ch_idx += 1
-                    if chapter_saved(n, _imgs):
-                        await sleep_between_chapters(n)
-                adopt_chapter_blocks([])
                 landed = await jump_catalog_and_reanchor(
                     advance_to,
                     reason="停滞前进到下一章",
@@ -5516,10 +5606,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 f"    … 翻页停滞且无下一章「{(current_chapter or '')[:20]}」，"
                 f"按全书末尾收尾"
             )
-            await commit_chapter(
-                current_chapter, ch_blocks, note_suffix=" [全书末尾]",
-                allow_empty=True)
-            adopt_chapter_blocks([])
+            # 本章已在上面落盘（缓冲已采用新章），这里只收尾，别重复落盘
             reached_end = True
             break
 
@@ -5812,21 +5899,46 @@ async def export_one_book(
         start_idx = last_idx + 1 if last_idx > 0 else 1
         # 已落盘目录最后一章，或其后仅剩封底等无正文项：视为全书完成
         pre_catalog = load_catalog_titles(catalog_path) if os.path.isfile(catalog_path) else []
-        if last_title and pre_catalog and is_export_complete_after(last_title, pre_catalog):
+        # 进度按目录对齐定位：末章与前面某章同名（组诗）时，「同名第一项」会把
+        # 已完成的书判成没抓完，续传锚点退回已导出章，白开阅读器空翻到失败。
+        progress = disk_catalog_progress(md_dir, pre_catalog) if pre_catalog else None
+        if progress:
+            complete = is_disk_export_complete(md_dir, pre_catalog)
+            done_title = progress[1]
+            rest = list(pre_catalog[progress[0] + 1 :])
+        else:
+            complete = bool(
+                last_title and pre_catalog
+                and is_export_complete_after(last_title, pre_catalog)
+            )
+            done_title = last_title or ""
+            rest = catalog_titles_after(pre_catalog, last_title) if pre_catalog else []
+        if complete:
             assert_resume_artifacts_trustworthy(book_id, md_dir, pre_catalog)
             print(f"\n--- 会话 {session} ---")
-            if is_last_catalog_chapter(last_title, pre_catalog):
-                print(
-                    f"  上次已是目录末章「{last_title[:32]}」(编号 {last_idx})，"
-                    f"全书导出完成。"
-                )
+            if not rest:
+                if last_title and compact_title_key(last_title) != compact_title_key(
+                        done_title):
+                    # 目录同名去重后末项与产物末章可能不同名（组诗）：两个都报出来
+                    print(
+                        f"  上次已按目录对齐推进到末项「{done_title[:32]}」，"
+                        f"产物末章「{last_title[:24]}」(编号 {last_idx})，"
+                        f"全书导出完成。"
+                    )
+                else:
+                    print(
+                        f"  上次已是目录末章「{done_title[:32]}」(编号 {last_idx})，"
+                        f"全书导出完成。"
+                    )
             else:
-                rest = catalog_titles_after(pre_catalog, last_title)
-                rest_hint = "、".join((t[:12] for t in rest[:3])) if rest else ""
+                rest_hint = "、".join((t[:12] for t in rest[:3]))
                 print(
-                    f"  上次「{last_title[:32]}」(编号 {last_idx}) 后仅剩"
+                    f"  上次「{done_title[:32]}」(编号 {last_idx}) 后仅剩"
                     f"非正文目录项（{rest_hint}），全书导出完成。"
                 )
+            # 没开过阅读器就没读到书名，用书架/成品元数据补齐（别把 ID 当书名写进 JSON）
+            if not book_title:
+                book_title, book_author = load_shelf_meta(book_id, out_dir)
             break
         print(f"\n--- 会话 {session} ---")
         print(f"  上次: {last_title or '(无)'}, 编号: {last_idx}")
@@ -5846,13 +5958,25 @@ async def export_one_book(
             print("\n  ✅ 已到全书最后一章，导出完成。")
             break
         if need_reopen:
-            # 重开前再读一次末章：若已是目录最后一项，勿再空转重开
+            # 重开前再核一次进度：已覆盖到目录末尾就别再空转重开
             check_title, _check_idx = get_last_chapter_title(md_dir)
             check_cat = load_catalog_titles(catalog_path) if os.path.isfile(catalog_path) else []
-            if check_title and check_cat and is_export_complete_after(check_title, check_cat):
+            check_progress = (
+                disk_catalog_progress(md_dir, check_cat) if check_cat else None
+            )
+            if check_progress:
+                check_complete = is_disk_export_complete(md_dir, check_cat)
+                check_done = check_progress[1]
+            else:
+                check_complete = bool(
+                    check_title and check_cat
+                    and is_export_complete_after(check_title, check_cat)
+                )
+                check_done = check_title or ""
+            if check_complete:
                 assert_resume_artifacts_trustworthy(book_id, md_dir, check_cat)
                 print(
-                    f"\n  ✅ 已导出「{check_title[:32]}」且无更多正文目录项，"
+                    f"\n  ✅ 已导出「{check_done[:32]}」且无更多正文目录项，"
                     f"停止重开，全书完成。"
                 )
                 break
