@@ -1457,6 +1457,81 @@ def dedupe_catalog_titles(titles) -> list[str]:
     return out
 
 
+# 目录里「整段重复前文」的后段：双语/双栏选集常见——前半「译文」卷把 81 篇逐章排
+# 一遍，后半「原文」卷用同一批篇名再排一遍（《苏东坡说：苏东坡诗文中的故事》
+# 168 项 = 前 86 项 + 重排的 81 项）。后段至少这么多行才当整段重复处理，避免把
+# 书末恰好同名的两三项（词牌重复的曲选、后记的小节）误当新卷。
+REPEAT_SECTION_MIN_ROWS = 3
+
+
+def repeat_section_start(catalog_titles, *, min_rows=REPEAT_SECTION_MIN_ROWS):
+    """目录里「整段重复前文」的后段起点下标；没有这样的后段返回 None。
+
+    从下标 p 起（p 及其后全部项）都能在 p 之前找到同名项、且不少于 min_rows 项时，
+    p 就是后段起点：p 本身通常是卷名（「原文」），其后是同名重排的篇名。
+    同名判定用 `chapter_title_match_key`（与续传对齐同一口径）。
+    """
+    titles = list(catalog_titles or [])
+    if len(titles) < min_rows + 1:
+        return None
+    keys = [chapter_title_match_key(t) for t in titles]
+    seen: set[str] = set()
+    for p, key in enumerate(keys):
+        rest = keys[p + 1 :]
+        if key and len(rest) >= min_rows and all(k in seen for k in rest):
+            return p
+        if key:
+            seen.add(key)
+    return None
+
+
+def session_anchor_index(md_dir, catalog_positions):
+    """本会话要续传的那一章在**完整目录**里的序号（从头导出时为 0）。
+
+    给 `session_catalog_view` 选段用：磁盘进度之后的下一章落在后段里，视图就取后段。
+    """
+    if not catalog_positions:
+        return 0
+    pair = disk_next_catalog_target(md_dir, catalog_positions)
+    if pair:
+        return pair[0]
+    progress = disk_catalog_progress(md_dir, catalog_positions)
+    if progress:
+        return progress[0] + 1
+    return 0
+
+
+def session_catalog_view(catalog_positions, anchor_idx=0):
+    """会话里按标题的旧启发式用的目录视图（标题必须唯一，见 `dedupe_catalog_titles`）。
+
+    目录分成「主段 + 整段重复前文的后段」时（`repeat_section_start`），按标题去重会
+    把后段整段吞掉：《苏东坡说：苏东坡诗文中的故事》的「原文」于是被当成目录末项，
+    「越位灌末章」防护与末章收尾把正常翻页判成「章节失同步」，重开 7 次后
+    RuntimeError；正文里也找不到「后面的章名」，照旧启发式只会把后段整段灌进单章。
+    这里按**锚点所在段落**取视图：
+
+    - 锚点落在后段 → 视图 = 后段（段内标题唯一，旧启发式照常工作，末章判定落在段末）；
+    - 锚点落在主段 → 视图 = 主段（后段卷名不再被当成「下一章」，主段末尾正常收尾）；
+    - 没有后段、或后段标题不唯一（词牌大量重复的曲选）→ 保持原有去重视图。
+    """
+    positions = list(catalog_positions or [])
+    if not positions:
+        return []
+    start = repeat_section_start(positions)
+    if start:
+        try:
+            anchor = int(anchor_idx or 0)
+        except (TypeError, ValueError):
+            anchor = 0
+        if anchor >= start:
+            section = positions[start:]
+            if len({chapter_title_match_key(t) for t in section}) == len(section):
+                return section
+        else:
+            return dedupe_catalog_titles(positions[:start])
+    return dedupe_catalog_titles(positions)
+
+
 def catalog_title_occurrences(catalog_titles, title: str) -> int:
     """目录里同名项的个数。
 
@@ -4479,9 +4554,12 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                       force_single_page=None, prefer_largest=None):
     reached_end = False
     # catalog_positions：完整目录（含同名章），位置类判断（进度/下一章/按序号跳转）用；
-    # catalog_titles：按标题去重视图，会话里的旧启发式用（见 dedupe_catalog_titles）。
+    # catalog_titles：会话里的旧启发式用的视图（标题唯一），按本次续传锚点所在段落取
+    # ——目录若整段重复（译文卷 + 原文卷），后段会被按标题去重整段吞掉（见
+    # session_catalog_view）。
     catalog_positions = load_catalog_titles(catalog_path) if catalog_path else []
-    catalog_titles = dedupe_catalog_titles(catalog_positions)
+    session_anchor_idx = session_anchor_index(md_dir, catalog_positions)
+    catalog_titles = session_catalog_view(catalog_positions, session_anchor_idx)
     last_cat_title = catalog_titles[-1] if catalog_titles else ""
     async with async_playwright() as p:
         viewport = reader_viewport(
@@ -4546,11 +4624,13 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             bootstrap_title = await goto_first_chapter(page, catalog_path) or ""
             if catalog_path:
                 catalog_positions = load_catalog_titles(catalog_path)
-            catalog_titles = dedupe_catalog_titles(catalog_positions)
+            catalog_titles = session_catalog_view(
+                catalog_positions, session_anchor_idx)
             last_cat_title = catalog_titles[-1] if catalog_titles else ""
         elif catalog_path and not catalog_titles:
             catalog_positions = load_catalog_titles(catalog_path)
-            catalog_titles = dedupe_catalog_titles(catalog_positions)
+            catalog_titles = session_catalog_view(
+                catalog_positions, session_anchor_idx)
             last_cat_title = catalog_titles[-1] if catalog_titles else ""
 
         await focus_reader_for_keyboard(page)
