@@ -24,6 +24,7 @@
 - **书间间隔（book interval）**：批量导出相邻两本书之间的固定等待，配置项 `SLEEP_BOOK_INTERVAL`（默认 60 秒）。
 - **目录对齐进度（disk catalog progress）**：把 `output/<id>/chapters` 的章文件按**章号数值序**与 `_catalog.json` 做保序贪心对齐（`match_disk_chapters_to_catalog`），取最后一条对齐到的目录项当作「已抓进度」。续传锚点、回放纠偏、停滞前进、外层收尾一律按它取「下一章」，**不用** `catalog_index` 的「同名第一项」：目录里同名章（组诗，如两组乐章都有「迎神/迎俎/亚献终献/送神」，全宋词 17305 项里 5007 项与前面某章同名）会把进度读回开头，锚点退到已导出章上，会话只能整段空翻、连续重开直到 RuntimeError（李纾诗全集事故，见 `docs/reports/repeated-chapter-titles-2026-10-20.md`）。实现：`disk_catalog_progress` / `disk_next_catalog_target` / `is_disk_export_complete` / `disk_resume_target`；对齐不出进度（还没有章文件、目录与产物完全不同名）时退回同名查找。
 - **完整目录 vs 去重视图（catalog positions / deduped view）**：`_catalog.json` 由 `scrape_catalog_titles` 按**条目位置**去重生成（`merge_catalog_harvest`），因此**保留同名章**（同名是真章，不是噪声；目录面板全量渲染、行高固定，条目偏移稳定）。会话里两份视图并存：`catalog_positions`（完整）供位置类判断（进度/下一章/按序号跳转 `goto_catalog_chapter(..., cat_idx=...)`/进度区间落地校验），`catalog_titles = dedupe_catalog_titles(...)`（去重）供按标题的旧启发式（下一章、末章判定、正文越章切分）——旧启发式假定章名唯一，喂同名项会互相打转。并章项（同名章被阅读器并进邻章）在补漏阶段由 `split_fill_candidates` 只报告不补抓，真缺口补抓前用 `blocks_already_covered` 比对全书正文行避免插重复章。
+- **段视图（session catalog view）**：双语/双栏书常见「整段重复前文」的目录——《苏东坡说：苏东坡诗文中的故事》168 项 = 前 86 项（译文卷 10 个门类 + 71 篇）+ 后 82 项（原文卷：卷名 + 同样篇名重排）。按标题去重会把后段整段吞掉，后段卷名（「原文」）被当成目录末项，越位灌末章防护与末章收尾把正常翻页判成「章节失同步」，重开 7 次后 RuntimeError（见 `docs/reports/bilingual-section-2026-10-22.md`）。因此会话不再直接用去重视图，而是按**本次续传锚点所在段落**取视图（`repeat_section_start` / `session_anchor_index` / `session_catalog_view`）：锚点在后段取后段（段内标题唯一，旧启发式照常工作），锚点在主段取主段，没有后段或后段标题不唯一（词牌大量重复的曲选）时保持原去重视图。位置类判断与跳转序号始终用完整目录。
 
 ## 关键决策
 
