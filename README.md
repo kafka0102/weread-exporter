@@ -116,6 +116,7 @@ python fetch_shelf.py --author-interval 8
 - 本地 `shelf_books.txt` 已有的书按从上到下计数：当前屏里连续 10 本都已收录，或视口较小、跨屏把连续计数凑满 10，就不再往下滚。本次抓到的书和没翻到的旧书合并写回，避免半截结果覆盖整个书架。`--known-streak 0` 关闭该提前停止
 - 默认 `--max-no-new 5`；书特别多时可加大 `--max-scrolls`
 - 每本书提取 `id`、`title`、`author`，存为 `data/shelf_books.txt`（一行一条，逗号分隔：ID,书名,作者；书名/作者中的逗号替换为空格）
+- 文件里历史遗留的脏行（首字段不是 reader book_id，如早期格式残留的 `主编,,`）在读取时丢弃、落盘前清理，不会再被拿去打开无效的详情页
 - 书架页禁用 F12 不影响抓取：`id`/`title` 取自页面 DOM，`author` 优先取自拦截的书架接口；**仍为空时再打开阅读器详情补全**（已有作者的书不打开；相邻两本默认间隔 5s）
 - 参数：`--headless`、`--sleep` 滚动间隔、`--max-no-new`、`--known-streak`、`--out`、`--no-enrich-author`、`--author-interval`
 - 所有点击/跳转类等待见 `.env` / `AGENTS.md`（`SLEEP_*`）
