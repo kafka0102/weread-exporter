@@ -239,12 +239,8 @@ def parse_shelf_line(line):
     }
 
 
-def load_shelf_books(path):
-    """读取 shelf txt，返回 list[{id, title, author}]。文件不存在或失败返回 []。
-
-    只保留 id 是合法 reader book_id 的行：历史脏行（见 ``drop_invalid_books``）
-    不参与后续合并与作者补全，文件也会在下次抓取写回时自动清理掉。
-    """
+def read_shelf_rows(path):
+    """读取 shelf txt，返回全部可解析行（**含**历史脏行）。文件不存在或失败返回 []。"""
     if not path or not os.path.isfile(path):
         return []
     try:
@@ -252,12 +248,16 @@ def load_shelf_books(path):
             lines = [ln for ln in f.read().splitlines() if ln.strip()]
     except Exception:
         return []
-    books = []
-    for line in lines:
-        book = parse_shelf_line(line)
-        if is_reader_book_id(book["id"]):
-            books.append(book)
-    return books
+    return [parse_shelf_line(line) for line in lines]
+
+
+def load_shelf_books(path):
+    """读取 shelf txt，返回 list[{id, title, author}]。文件不存在或失败返回 []。
+
+    只保留 id 是合法 reader book_id 的行：历史脏行（见 ``drop_invalid_books``）
+    不参与后续合并与作者补全，文件也会在下次抓取写回时自动清理掉。
+    """
+    return drop_invalid_books(read_shelf_rows(path))[0]
 
 
 def load_existing_authors(path):
@@ -606,7 +606,11 @@ async def fetch_shelf(
         await page.goto(SHELF_URL, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(SLEEP_SHELF_AFTER_LOAD)
 
-        existing_books = load_shelf_books(out_path)
+        existing_books, dirty_rows = drop_invalid_books(read_shelf_rows(out_path))
+        if dirty_rows:
+            sample = "、".join(str(b.get("id") or "") for b in dirty_rows[:5])
+            print(f"  🧹 本地 {out_path} 有 {len(dirty_rows)} 条脏行"
+                  f"（首字段不是 reader book_id，如 {sample}）：已忽略，写回时清理")
         known_ids = {b["id"] for b in existing_books if b.get("id")}
         existing_authors = {
             b["id"]: b["author"]

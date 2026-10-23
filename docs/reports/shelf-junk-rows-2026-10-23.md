@@ -56,9 +56,10 @@
 ## 四、修复与验证
 
 - `drop_invalid_books`：按 `is_reader_book_id` 分离脏行（保持原顺序）
-- `load_shelf_books`：只保留合法 reader book_id —— 脏行不再进入合并与补全，
-  文件下次抓取写回即自愈
-- `fetch_shelf`：落盘前再清理一次并打印 `🧹 清理 N 条脏行…`
+- `read_shelf_rows` / `load_shelf_books`：前者读全部可解析行，后者只保留合法
+  reader book_id —— 脏行不再进入合并与补全，文件下次抓取写回即自愈
+- `fetch_shelf`：读取本地文件时提示 `🧹 …有 N 条脏行（…）：已忽略，写回时清理`，
+  落盘前再过滤一次兜底
 - `books_needing_author_lookup`：补全作者前再过滤，绝不打开非 reader URL
 - 回归测试：`tests/test_fetch_shelf.py` 新增 6 个用例（脏行分离、读写自愈、
   补全过滤）

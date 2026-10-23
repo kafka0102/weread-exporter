@@ -14,6 +14,7 @@ from fetch_shelf import (
     merge_books,
     merge_partial_shelf,
     observe_shelf_page,
+    read_shelf_rows,
     sanitize_csv_field,
     write_shelf_books,
     _total_unique,
@@ -416,6 +417,25 @@ class TestLoadShelfBooks(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(load_shelf_books(os.path.join(td, "nope.txt")), [])
+
+    def test_read_shelf_rows_keeps_raw_junk(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "shelf_books.txt")
+            self._write(path, [*self.JUNK, f"{_rid(4)},文学遗产（第1期）,编辑部"])
+            rows = read_shelf_rows(path)
+        self.assertEqual(len(rows), len(self.JUNK) + 1)
+        self.assertEqual(rows[0], {"id": "编", "title": "", "author": ""})
+        self.assertEqual(rows[-1]["id"], _rid(4))
+
+    def test_read_shelf_rows_missing_file(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(read_shelf_rows(os.path.join(td, "nope.txt")), [])
 
     def test_skips_legacy_junk_rows(self):
         import os
