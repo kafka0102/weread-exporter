@@ -39,7 +39,7 @@ DEFAULT_OUT = os.path.join(DATA_DIR, "shelf_books.txt")
 READER_URL_TMPL = "https://weread.qq.com/web/reader/{book_id}"
 # 当前屏内连续这么多本已在本地书架，就不再往下翻。
 # 视口不足该本数时，按从上到下首次出现的顺序跨屏累计。0 表示滚完全部。
-DEFAULT_KNOWN_STREAK = 10
+DEFAULT_KNOWN_STREAK = 120
 
 _READER_ID_RE = re.compile(r"/reader/([A-Za-z0-9]+)")
 

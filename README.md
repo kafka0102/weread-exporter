@@ -102,8 +102,8 @@ python fetch_shelf.py --headless
 # 调整滚动节奏（默认见 .env SLEEP_SHELF_SCROLL，连续 3 次无新书停止）
 python fetch_shelf.py --sleep 5 --max-no-new 6
 
-# 连续 10 本本地已有就停止翻页；0 表示滚完全部
-python fetch_shelf.py --known-streak 10
+# 连续 120 本本地已有就停止翻页；0 表示滚完全部
+python fetch_shelf.py --known-streak 120
 
 # 跳过「作者为空时打开详情补全」
 python fetch_shelf.py --no-enrich-author
@@ -113,7 +113,7 @@ python fetch_shelf.py --author-interval 8
 ```
 
 - 慢滚动触发懒加载（`/web/shelf/syncBook` 约每批 100 本），跨屏**累积** DOM reader id，避免只抓到首批
-- 本地 `shelf_books.txt` 已有的书按从上到下计数：当前屏里连续 10 本都已收录，或视口较小、跨屏把连续计数凑满 10，就不再往下滚。本次抓到的书和没翻到的旧书合并写回，避免半截结果覆盖整个书架。`--known-streak 0` 关闭该提前停止
+- 本地 `shelf_books.txt` 已有的书按从上到下计数：当前屏里连续 120 本都已收录，或视口较小、跨屏把连续计数凑满 120，就不再往下滚。本次抓到的书和没翻到的旧书合并写回，避免半截结果覆盖整个书架。`--known-streak 0` 关闭该提前停止
 - 默认 `--max-no-new 5`；书特别多时可加大 `--max-scrolls`
 - 每本书提取 `id`、`title`、`author`，存为 `data/shelf_books.txt`（一行一条，逗号分隔：ID,书名,作者；书名/作者中的逗号替换为空格）
 - 文件里历史遗留的脏行（首字段不是 reader book_id，如早期格式残留的 `主编,,`）在读取时丢弃（会打印 `🧹` 提示）、落盘前再清理一次，不会再被拿去打开无效的详情页
