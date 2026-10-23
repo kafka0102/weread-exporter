@@ -3,11 +3,14 @@ import unittest
 from fetch_shelf import (
     accumulate_dom_books,
     apply_existing_authors,
+    books_needing_author_lookup,
     books_missing_author,
     collect_books_from_json,
+    drop_invalid_books,
     extract_book_id_from_href,
     format_book_line,
     is_reader_book_id,
+    load_shelf_books,
     merge_books,
     merge_partial_shelf,
     observe_shelf_page,
@@ -379,6 +382,82 @@ class TestMergePartialShelf(unittest.TestCase):
         existing = [{"id": _rid(1), "title": "A", "author": "甲"}]
         self.assertEqual(merge_partial_shelf([], existing), existing)
         self.assertEqual(merge_partial_shelf(None, None), [])
+
+
+class TestDropInvalidBooks(unittest.TestCase):
+    def test_splits_legacy_junk_rows(self):
+        good = {"id": _rid(1), "title": "书", "author": "甲"}
+        junk = {"id": "主编", "title": "", "author": ""}
+        kept, dropped = drop_invalid_books([good, junk])
+        self.assertEqual(kept, [good])
+        self.assertEqual(dropped, [junk])
+
+    def test_numeric_short_id_is_dropped(self):
+        kept, dropped = drop_invalid_books([{"id": "3300215708", "title": "x"}])
+        self.assertEqual(kept, [])
+        self.assertEqual([b["id"] for b in dropped], ["3300215708"])
+
+    def test_empty_input(self):
+        self.assertEqual(drop_invalid_books([]), ([], []))
+        self.assertEqual(drop_invalid_books(None), ([], []))
+
+
+class TestLoadShelfBooks(unittest.TestCase):
+    # 线上文件里的历史脏行：旧「一行一书名」格式迁移成 ID,书名,作者 后的产物
+    JUNK = ["编,,", "著,,", "主编,,", "吴夏平 张巍 张之为,,", "副主编,,"]
+
+    def _write(self, path, lines):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def test_missing_file_returns_empty(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(load_shelf_books(os.path.join(td, "nope.txt")), [])
+
+    def test_skips_legacy_junk_rows(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "shelf_books.txt")
+            self._write(path, [
+                *self.JUNK[:2],
+                f"{_rid(1)},飞花令·菊（中国文化·古典诗词品鉴）,素心落雪 编著",
+                *self.JUNK[2:],
+                f"{_rid(2)},刘禹锡研究（第四辑）,戴伟华",
+            ])
+            books = load_shelf_books(path)
+        self.assertEqual([b["id"] for b in books], [_rid(1), _rid(2)])
+        self.assertEqual(books[1]["title"], "刘禹锡研究（第四辑）")
+
+    def test_write_back_cleans_junk_rows(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "shelf_books.txt")
+            self._write(path, [*self.JUNK, f"{_rid(3)},文学研究（第2卷·2）,徐兴无 王彬彬"])
+            # 抓取写回：读旧文件 → 合并 → 落盘，脏行不该再出现
+            merged = merge_partial_shelf([], load_shelf_books(path))
+            write_shelf_books(path, merged)
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+        self.assertEqual(content, f"{_rid(3)},文学研究（第2卷·2）,徐兴无 王彬彬\n")
+
+
+class TestBooksNeedingAuthorLookup(unittest.TestCase):
+    def test_skips_ids_that_cannot_open_reader(self):
+        books = [
+            {"id": "主编", "title": "", "author": ""},
+            {"id": _rid(1), "title": "A", "author": ""},
+            {"id": "3300215708", "title": "B", "author": ""},
+            {"id": _rid(2), "title": "C", "author": "乙"},
+        ]
+        self.assertEqual(
+            [b["id"] for b in books_needing_author_lookup(books)], [_rid(1)])
 
 
 if __name__ == "__main__":

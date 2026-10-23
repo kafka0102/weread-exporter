@@ -86,6 +86,22 @@ def is_reader_book_id(book_id):
     return len(bid) >= 16
 
 
+def drop_invalid_books(books):
+    """分离出 id 不是合法 reader book_id 的条目，返回 (保留, 丢弃)。
+
+    早期书架文件是「一行一个书名」的格式，卡片上的编者信息（「主编」「副主编」
+    「著」等）也会各自成行；迁移到 ``ID,书名,作者`` 后这些行变成 ``主编,,`` ——
+    首字段被当成 id、书名与作者都为空。它们打不开阅读器，却会被
+    ``load_shelf_books`` 原样读回、每轮再写回文件，所以必须显式清理。
+    """
+    kept = []
+    dropped = []
+    for book in books or []:
+        bid = (book or {}).get("id")
+        (kept if is_reader_book_id(bid) else dropped).append(book)
+    return kept, dropped
+
+
 def collect_books_from_json(obj, out=None):
     """递归遍历 shelf API 的 JSON，收集含 bookId 的对象到 out[id] = {title, author}。
 
@@ -181,6 +197,14 @@ def books_missing_author(books):
     return [b for b in books if not (b.get("author") or "").strip()]
 
 
+def books_needing_author_lookup(books):
+    """需要打开详情补全作者的书籍：author 为空且 id 能打开阅读器。
+
+    历史脏行的 id 不是 reader book_id，打开只会拿到 404 页面，直接跳过。
+    """
+    return [b for b in books_missing_author(books) if is_reader_book_id(b.get("id"))]
+
+
 def sanitize_csv_field(value):
     """将字段中的逗号替换为空格，避免破坏逗号分隔格式。"""
     return (value or "").replace(",", " ")
@@ -216,7 +240,11 @@ def parse_shelf_line(line):
 
 
 def load_shelf_books(path):
-    """读取 shelf txt，返回 list[{id, title, author}]。文件不存在或失败返回 []。"""
+    """读取 shelf txt，返回 list[{id, title, author}]。文件不存在或失败返回 []。
+
+    只保留 id 是合法 reader book_id 的行：历史脏行（见 ``drop_invalid_books``）
+    不参与后续合并与作者补全，文件也会在下次抓取写回时自动清理掉。
+    """
     if not path or not os.path.isfile(path):
         return []
     try:
@@ -227,7 +255,7 @@ def load_shelf_books(path):
     books = []
     for line in lines:
         book = parse_shelf_line(line)
-        if book["id"]:
+        if is_reader_book_id(book["id"]):
             books.append(book)
     return books
 
@@ -488,7 +516,7 @@ async def enrich_missing_authors(
     返回补全成功本数。
     """
     interval = SLEEP_BOOK_DETAIL_INTERVAL if interval is None else interval
-    missing = books_missing_author(books)
+    missing = books_needing_author_lookup(books)
     if not missing:
         print("  作者已齐，无需打开详情")
         return 0
@@ -644,6 +672,12 @@ async def fetch_shelf(
                   f"（本次新看到 {fresh} 本，未翻到的旧书仍保留）")
         elif scroll >= max_scrolls and no_new < max_no_new:
             print(f"  ⚠️  已达最大滚动次数 {max_scrolls}，提前结束懒加载")
+
+        merged, dropped = drop_invalid_books(merged)
+        if dropped:
+            sample = "、".join(str(b.get("id") or "") for b in dropped[:5])
+            print(f"  🧹 清理 {len(dropped)} 条脏行（首字段不是 reader book_id，"
+                  f"如 {sample}），不再写入 {out_path}")
 
         write_shelf_books(out_path, merged)
         with_author = sum(1 for b in merged if b["author"])
